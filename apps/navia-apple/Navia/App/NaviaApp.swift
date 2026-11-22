@@ -9,11 +9,10 @@ struct NaviaApp: App {
 
     init() {
         BundleMove.carrySettings() // Before anything reads a setting.
+        startLogging(subsystem: Log.subsystem) // before the shell starts the core.
         _shell = State(initialValue: ShellModel())
-        // The core's log and panics go to the unified log.
-        startLogging(subsystem: Log.subsystem)
         NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
-        _ = Motion.shared // Reads Reduce Motion before anything animates.
+        _ = Motion.shared // before anything animates.
     }
 
     var body: some Scene {
@@ -26,28 +25,7 @@ struct NaviaApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1400, height: 875)
-        .commands {
-            // Check for Updates under About. It opens Settings, where About shows the answer.
-            CommandGroup(after: .appInfo) {
-                Button(L("Check for Updates…")) {
-                    shell.openSettings()
-                    AppUpdates.shared.check()
-                }
-            }
-            CommandGroup(replacing: .appSettings) {
-                Button(L("Settings…")) { shell.openSettings() }.keyboardShortcut(",", modifiers: .command)
-            }
-            CommandGroup(after: .newItem) {
-                Button(L("Get Info")) { shell.infoShortcut() }.keyboardShortcut("i", modifiers: .command)
-            }
-            // Window > Mini Player, checked while it's up. ShellModel catches its keys before the menus, so AppKit's
-            // Minimize All, which has the same keys, never takes them.
-            CommandGroup(after: .windowArrangement) {
-                Divider()
-                Toggle(L("Mini Player"), isOn: Binding(get: { MiniPlayer.shared.isOpen }, set: { _ in MiniPlayer.shared.toggle(shell: shell) }))
-                    .keyboardShortcut("m", modifiers: [.command, .option])
-            }
-        }
+        .commands { NaviaCommands(shell: shell) }
     }
 }
 
@@ -124,7 +102,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    /// Whether the event is within the top bar's height, which also holds the sidebar header.
+    /// A row scrolled under the top bar: pressing there moves the window instead of picking up the row.
+    static func movesWindow(_ event: NSEvent) -> Bool {
+        guard event.clickCount == 1, let window = event.window, inTopBar(event, window) else { return false }
+        window.performDrag(with: event)
+        return true
+    }
+
+    /// also holds the sidebar header.
     static func inTopBar(_ event: NSEvent, _ window: NSWindow) -> Bool {
         guard let content = window.contentView, !window.styleMask.contains(.fullScreen) else { return false }
         return content.bounds.height - event.locationInWindow.y <= T.topbarH
@@ -220,6 +205,13 @@ struct WindowConfigurator: NSViewRepresentable {
                         let full = entering || window.styleMask.contains(.fullScreen)
                         if self.shell?.inFullScreen != full { self.shell?.inFullScreen = full }
                     }
+                })
+            }
+            // while the window is dragged to a new size, layout snaps to each size with no animation.
+            for name in [NSWindow.willStartLiveResizeNotification, NSWindow.didEndLiveResizeNotification] {
+                let starting = name == NSWindow.willStartLiveResizeNotification
+                observers.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.shell?.liveResizing = starting }
                 })
             }
             // Occlusion covers minimized, fully covered, another Space and a hidden app, and has the final say.

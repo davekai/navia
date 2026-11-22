@@ -11,7 +11,7 @@ struct GenresPage: View {
         let page = shell.library.genrePage
         let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
         let rows = needle.isEmpty ? page.all : page.all.filter { $0.name.lowercased().contains(needle) }
-        PageFrame(shell: shell, nav: .none, title: L("Genres"), hasRight: !page.all.isEmpty) {
+        PageFrame(shell: shell, nav: .none, title: L("Genres"), hasRight: !page.all.isEmpty, refresh: .library) {
             SearchPill(placeholder: L("Search Genres"), text: $query, accent: shell.theme.accent, width: pillSearchWidth(ctx))
         } content: {
             PageScroll {
@@ -47,7 +47,6 @@ struct GenresPage: View {
 /// CoreCheck's `genreQuery` and `genreReport`.
 @MainActor enum GenresDebug {
     static var setQuery: ((String) -> Void)?
-    /// Tiles whose tint has landed, as "name:hex".
     static var tinted: Set<String> = []
 }
 #endif
@@ -78,7 +77,7 @@ struct GenreFanTile: View {
                 fan(width: width, height: height)
                 VStack(alignment: .leading, spacing: T.px(2)) {
                     Text(genre.name).font(.navia(T.textFeature, .semibold)).tracking(-0.012 * T.textFeature)
-                        .foregroundStyle(T.tEm.color).lineLimit(2).truncationMode(.tail)
+                        .foregroundStyle(T.tEm.color).lineLimit(2).truncationMode(.tail).fullTextHelp(genre.name)
                     Text(albumCount(genre.albums)).font(.navia(T.textSM)).foregroundStyle((tint?.fgDim ?? T.t2).color).lineLimit(1)
                 }
                 .padding(.top, width * T.genreTilePadY)
@@ -87,12 +86,9 @@ struct GenreFanTile: View {
             .frame(width: width, height: height, alignment: .topLeading)
             .clipShape(RoundedRectangle(cornerRadius: T.rMD, style: .continuous))
             .contentShape(Rectangle())
-            .offset(y: hovering ? -T.cardLift : 0)
-            .animation(T.ease(T.med), value: hovering)
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .help(genre.name)
         .task(id: source) {
             if let known = PlaylistTints.shared.cached(source) { hex = known } else { hex = await PlaylistTints.shared.read(source) }
             #if DEBUG
@@ -133,8 +129,7 @@ struct GenreRows: View {
 
     var body: some View {
         let usable = max(T.genreChipW, (ctx.layoutWidth > 0 ? ctx.layoutWidth : ctx.pageWidth) - 2 * T.gutter)
-        let columns = max(1, Int((usable + T.tileGap) / (T.genreChipW + T.tileGap)))
-        let width = (usable - T.tileGap * CGFloat(columns - 1)) / CGFloat(columns)
+        let (columns, width) = gridFit(width: usable, cell: T.genreChipW, gap: T.tileGap)
         let lines = (genres.count + columns - 1) / columns
         LazyVStack(alignment: .leading, spacing: 0) {
             ForEach(0..<lines, id: \.self) { line in
@@ -161,7 +156,7 @@ private struct GenreRow: View {
                     .frame(width: T.thumb, height: T.thumb)
                     .clipShape(RoundedRectangle(cornerRadius: T.rXS, style: .continuous))
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(genre.name).font(.navia(T.textMD, .medium)).foregroundStyle(T.t1.color).lineLimit(2).truncationMode(.tail)
+                    Text(genre.name).font(.navia(T.textMD, .medium)).foregroundStyle(T.t1.color).lineLimit(2).truncationMode(.tail).fullTextHelp(genre.name)
                     Text(albumCount(genre.albums)).font(.navia(T.textSM)).foregroundStyle(T.t2.color).lineLimit(1)
                 }
                 Spacer(minLength: 0)
@@ -181,6 +176,5 @@ private struct GenreRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .help(genre.name)
     }
 }

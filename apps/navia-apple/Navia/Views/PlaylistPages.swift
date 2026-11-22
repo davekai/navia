@@ -47,10 +47,11 @@ struct PlaylistsPage: View {
                         LibraryEmptyState(library: shell.library, symbol: "music.note.list", title: L("No playlists yet"), hint: L("Playlists from the server show up here."))
                     }
                 } else if layout == "grid" {
-                    LazyCardGrid(count: lists.count) { index in
+                    LazyCardGrid(count: lists.count) { index, width in
                         if let playlist = lists.playlist(at: index) {
-                            PlaylistCard(playlist: playlist, shell: shell) { shell.go(.playlist(playlist.id)) }
-                                .songDropTarget(.playlist(playlistRef(playlist), place: "card"), shell: shell, pad: T.dropPad)
+                            PlaylistCard(playlist: playlist, width: width, shell: shell) { shell.go(.playlist(playlist.id)) }
+                                .rightClickMenu { PlaylistMenu.entries(playlist, shell: shell) }
+                                .songDropTarget(.playlist(playlistRef(playlist), place: "card"), shell: shell, pad: T.dropPadCard)
                         }
                     }
                 } else {
@@ -67,6 +68,7 @@ struct PlaylistsPage: View {
 
     private func row(_ playlist: PlaylistRow) -> some View {
         PlaylistListRow(playlist: playlist, shell: shell) { shell.go(.playlist(playlist.id)) }
+            .rightClickMenu { PlaylistMenu.entries(playlist, shell: shell) }
             .songDropTarget(.playlist(playlistRef(playlist), place: "row"), shell: shell)
     }
 }
@@ -83,7 +85,7 @@ private struct PlaylistListRow: View {
                 PlaylistCover(playlist: playlist, small: true)
                     .frame(width: T.thumb, height: T.thumb)
                     .frame(width: T.px(55), alignment: .leading)
-                Text(playlist.name).font(.navia(T.textMD, .medium)).foregroundStyle(T.t1.color).lineLimit(1)
+                Text(playlist.name).font(.navia(T.textMD, .medium)).foregroundStyle(T.t1.color).lineLimit(1).fullTextHelp(playlist.name)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .layoutPriority(3)
                 HStack(spacing: T.downloadMarkGap) {
@@ -212,6 +214,25 @@ struct PlaylistPage: View {
     }
 }
 
+/// A playlist-like page's head (a playlist, Liked Songs).
+struct CoverHead<Cover: View, Meta: View>: View {
+    let title: String
+    @ViewBuilder let cover: Cover
+    @ViewBuilder let meta: Meta
+
+    var body: some View {
+        HStack(alignment: .center, spacing: T.px(25)) {
+            cover
+                .frame(width: T.heroArt, height: T.heroArt)
+                .artShadow()
+            VStack(alignment: .leading, spacing: T.px(14)) {
+                Text(title).font(.navia(T.textTitle, .bold)).foregroundStyle(T.tEm.color).tracking(-0.024 * T.textTitle).lineLimit(2).truncationMode(.tail).fullTextHelp(title)
+                meta
+            }
+        }
+    }
+}
+
 private struct PlaylistHeader: View {
     let shell: ShellModel
     let playlist: PlaylistRow
@@ -221,21 +242,16 @@ private struct PlaylistHeader: View {
     var body: some View {
         let tracks = songs.entireList()
         VStack(alignment: .leading, spacing: T.sectionGap + T.px(6)) {
-            HStack(alignment: .center, spacing: T.px(25)) {
-                PlaylistCover(playlist: playlist)
-                    .frame(width: T.heroArt, height: T.heroArt)
-                    .artShadow()
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(playlist.name).font(.navia(T.textTitle, .bold)).foregroundStyle(T.tEm.color).tracking(-0.024 * T.textTitle).lineLimit(2).truncationMode(.tail)
-                    FlowChips(spacing: T.px(12), lineSpacing: T.px(6)) {
-                        Text("\(songsAndLength(playlist.songCount, seconds: playlist.duration)) • \(playlist.isPublic ? L("Public") : L("Private"))\(playlist.isMine || playlist.ownerName.isEmpty ? "" : " • " + L("By {name}", ["name": playlist.ownerName]))\(shell.library.synced?.status(.playlist, playlist.id).map { " • " + SyncedDownloads.statusText($0) } ?? "")")
-                            .font(.navia(T.textMD))
-                        if playlist.isSmart { SmartRulesPill(shell: shell, playlist: playlist) }
-                    }
-                    .padding(.top, T.px(14))
-                    if !playlist.summary.isEmpty {
-                        Text(playlist.summary).font(.navia(T.textMD)).foregroundStyle(T.t2.color).lineLimit(3).truncationMode(.tail).frame(maxWidth: T.px(520), alignment: .leading).padding(.top, T.px(14))
-                    }
+            CoverHead(title: playlist.name) {
+                PlaylistCover(playlist: playlist, animates: true)
+            } meta: {
+                FlowChips(spacing: T.px(12), lineSpacing: T.px(6)) {
+                    Text("\(songsAndLength(playlist.songCount, seconds: playlist.duration)) • \(playlist.isPublic ? L("Public") : L("Private"))\(playlist.isMine || playlist.ownerName.isEmpty ? "" : " • " + L("By {name}", ["name": playlist.ownerName]))\(shell.library.synced?.status(.playlist, playlist.id).map { " • " + SyncedDownloads.statusText($0) } ?? "")")
+                        .font(.navia(T.textMD))
+                    if playlist.isSmart { SmartRulesPill(shell: shell, playlist: playlist) }
+                }
+                if !playlist.summary.isEmpty {
+                    HeaderDescription(about: AboutText(title: playlist.name, subtitle: playlist.isMine || playlist.ownerName.isEmpty ? nil : L("By {name}", ["name": playlist.ownerName]), art: .cover(PlaylistCover(playlist: playlist)), text: playlist.summary), shell: shell)
                 }
             }
             VStack(alignment: .leading, spacing: T.orderNoteGap) {
@@ -248,7 +264,7 @@ private struct PlaylistHeader: View {
                         }
                         if playlist.isOwned {
                             MenuIconButton(symbol: "pencil", label: L("Edit")) {
-                                var items = [MenuEntry(title: L("Edit Details")) { shell.openEditPlaylist(playlist) }]
+                                var items = [PlaylistMenu.editDetails(playlist, shell: shell)]
                                 if playlist.isSmart {
                                     items.append(MenuEntry(title: L("Edit Rules")) { shell.go(.smartEditor(playlist.id)) })
                                 }
@@ -257,10 +273,11 @@ private struct PlaylistHeader: View {
                                     items.append(MenuEntry(title: L("Upload Image")) { pickPlaylistImage(playlist: playlist.id, shell: shell) })
                                     items.append(MenuEntry(title: L("Remove Image")) { removePlaylistImage(playlist: playlist.id, shell: shell) })
                                 }
+                                items += [.divider, PlaylistMenu.delete(playlist, shell: shell)]
                                 return items
                             }
                         }
-                        MenuIconButton(symbol: "ellipsis", label: L("More")) { [SongMenu.addToPlaylist(tracks, name: playlist.name, shell: shell), SongMenu.info(.playlist(playlist.id), shell: shell)] }
+                        MenuIconButton(symbol: "ellipsis", label: L("More")) { [SongMenu.addToPlaylist(tracks, name: playlist.name, shell: shell), SongMenu.info(.playlist(playlist.id), shell: shell)] + [shell.pinEntry(playlist.id)].compactMap { $0 } }
                     }
                     Spacer(minLength: 0)
                     GlassGroup {
@@ -279,7 +296,7 @@ private struct PlaylistHeader: View {
     }
 }
 
-/// Each playlist's sort, from the menu or a header click, is remembered for this account.
+/// remembered per playlist for this account.
 @MainActor enum PlaylistSortMemory {
     private static var key: String { AccountPrefs.key("playlistSorts") }
 
@@ -298,7 +315,7 @@ private struct PlaylistHeader: View {
     }
 }
 
-/// Shown on playlists that can be reordered while sorted or filtered: why songs can't be moved, and the way back.
+/// on a reorderable playlist that's sorted or filtered: why songs can't be moved, and the way back.
 private struct OrderNote: View {
     let songs: LocalSongsModel
 
@@ -384,7 +401,7 @@ private struct OrderNote: View {
 #if DEBUG
 @MainActor enum PlaylistOrderDebug {
     static var results: [String] = []
-    /// The open playlist's songs, for CoreCheck's `playlistSort` and `playlistQuery`.
+    /// for CoreCheck's `playlistSort` and `playlistQuery`.
     static weak var songs: LocalSongsModel?
 }
 #endif
@@ -417,7 +434,7 @@ private struct OrderNote: View {
         revision += 1
     }
 
-    /// The server's answer to Add: a saved suggestion leaves the list, a refused one comes back.
+    /// A saved suggestion leaves the list, a refused one comes back.
     func added(_ song: SongRow, saved: Bool) {
         pending.remove(song.id)
         if saved { songs.removeAll { $0.id == song.id } }

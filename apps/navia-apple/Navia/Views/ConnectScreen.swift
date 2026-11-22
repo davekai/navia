@@ -19,7 +19,7 @@ struct ConnectScreen: View {
                     if model.deezerStep { deezerStep } else { form }
                 }
                 .padding(T.connectCardPad)
-                .floatPanel(radius: T.rLG)
+                .floatPanel(radius: T.rLG, tinted: true)
                 footer.padding(.top, -T.sectionGap / 2)
             }
             .frame(width: T.connectW)
@@ -100,7 +100,7 @@ struct ConnectScreen: View {
         .padding(.trailing, T.iconW + T.fieldInset)
         .frame(height: T.controlH)
         .glassPill()
-        .focusRing(passwordFocused || model.problem(.account) != nil, model.problem(.account) != nil ? T.invalidRing : theme.accent, width: model.problem(.account) != nil ? T.invalidRingWidth : T.focusRingWidth)
+        .focusRing(passwordFocused || model.problem(.account) != nil, model.problem(.account) != nil ? T.invalidRing : theme.accent, width: model.problem(.account) != nil ? T.invalidRingW : T.focusRingWidth)
         .overlay(alignment: .trailing) {
             FieldAction(label: model.reveal ? L("Hide password") : L("Show password"), enabled: true) {
                 model.reveal.toggle()
@@ -112,9 +112,9 @@ struct ConnectScreen: View {
     }
 
     @ViewBuilder private var deezerStep: some View {
-        heading(L("Use Deezer for recommendations?"), L("Better Autoplay and Artist Radio, with suggestions from Deezer added to the server’s."))
+        heading(L("Use Deezer for recommendations?"), L("Better Autoplay and Artist Radio, with suggestions from Deezer and ListenBrainz added to the server’s, and a Heat column showing each album’s most popular songs."))
         VStack(alignment: .leading, spacing: T.statusGap) {
-            fact("paperplane", L("Sends artist and song names to Deezer from this computer."))
+            fact("paperplane", L("Sends artist and song names to Deezer and ListenBrainz from this computer."))
             fact("key", L("No Deezer account needed. Your login is never sent."))
         }
         .padding(T.statusPadX)
@@ -135,7 +135,6 @@ struct ConnectScreen: View {
         }
     }
 
-    /// "A Navidrome client", with Navidrome's logo.
     private var footer: some View {
         HStack(spacing: T.connectHeadingGap) {
             NavidromeLogo(size: T.textLG)
@@ -167,7 +166,6 @@ struct LabelledField<Field: View, Message: View>: View {
     }
 }
 
-/// An action inside a field's right end (Show password, Test): quiet ink that brightens on hover.
 struct FieldAction<Content: View>: View {
     let label: String
     let enabled: Bool
@@ -194,7 +192,6 @@ struct FieldAction<Content: View>: View {
     }
 }
 
-/// Navidrome's own logo, single-color: the sign-in screen's footer.
 struct NavidromeLogo: View {
     let size: CGFloat
 
@@ -210,7 +207,6 @@ struct NavidromeLogo: View {
     }
 }
 
-/// One result under the fields: checking, connected, a problem, or the HTTP warning.
 struct ConnectStatus: View {
     enum Kind { case bad, warn }
     let kind: Kind

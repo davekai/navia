@@ -17,7 +17,7 @@ struct ExplicitMark: View {
     }
 }
 
-/// A title on one line followed by its explicit mark, kept together so only the title truncates.
+/// title and explicit mark on one line, so only the title truncates.
 struct TitledText: View {
     let title: String
     let explicit: Bool
@@ -26,7 +26,7 @@ struct TitledText: View {
 
     var body: some View {
         HStack(spacing: size * 0.27) {
-            Text(title).font(.navia(size, weight)).lineLimit(1).truncationMode(.tail)
+            Text(title).font(.navia(size, weight)).lineLimit(1).truncationMode(.tail).fullTextHelp(title)
             if explicit { ExplicitMark(size: size) }
         }
     }

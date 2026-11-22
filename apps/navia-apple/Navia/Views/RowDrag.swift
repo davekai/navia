@@ -5,15 +5,13 @@ import SwiftUI
 /// as a card, the other rows part where they'd land, and the list scrolls near its edges. Release drops, Esc
 /// restores. Positions are row offsets.
 @MainActor @Observable final class RowDrag {
-    /// How rows slide to their new places.
     static var slide: Animation? { T.easeOut(T.dragSlide) }
 
     let rowHeight: CGFloat
-    /// The rows moving, in list order.
     private(set) var rows: [Int] = []
     /// The row under the pointer when it lifted, or nil when nothing is lifted.
     private(set) var pressed: Int?
-    /// Pointer and gap, in the list's own coordinates (top down).
+    /// in the list's own coordinates, top down.
     private(set) var pointerY: CGFloat = 0
     /// The rows land before this row.
     private(set) var before: Int?
@@ -49,13 +47,11 @@ import SwiftUI
 
     var isActive: Bool { pressed != nil }
 
-    /// How far the lifted row is drawn from its own place.
     var liftedOffset: CGFloat {
         guard let pressed else { return 0 }
         return pointerY - grab - rowTop(pressed)
     }
 
-    /// Where a row starts, in the list's own coordinates.
     func rowTop(_ row: Int) -> CGFloat {
         CGFloat(row) * rowHeight + (limit.map { row >= $0 } == true ? limitGap : 0) + (split.map { row >= $0 } == true ? splitGap : 0)
     }
@@ -66,10 +62,9 @@ import SwiftUI
     private var end: Int { min(count, limit ?? count) }
     private func movedAbove(_ row: Int) -> CGFloat { CGFloat(rows.filter { $0 < row }.count) * rowHeight }
     private var movingHeight: CGFloat { CGFloat(incoming ?? rows.count) * rowHeight }
-    /// Rows are lifted, or songs from another list are over the list.
     private var parting: Bool { pressed != nil || incoming != nil }
 
-    /// How far a row is drawn from its own place: rows close up over the moving ones and part at the gap.
+    /// rows close up over the moving ones and part at the gap.
     func shift(_ row: Int) -> CGFloat {
         guard let before, parting, !rows.contains(row) else { return 0 }
         return -movedAbove(row) + (row >= before ? movingHeight : 0)
@@ -87,7 +82,6 @@ import SwiftUI
         return -movedAbove(split) + (intoFirst ? movingHeight : 0)
     }
 
-    /// The empty slot the rows have opened, in the list's own coordinates.
     var slot: CGRect? {
         guard parting, let before else { return nil }
         let y: CGFloat
@@ -108,14 +102,12 @@ import SwiftUI
         return CGRect(x: 0, y: y, width: 0, height: movingHeight)
     }
 
-    /// Lifts `row`, with `rows` (which include it) moving together.
     func lift(row: Int, rows: [Int], at point: NSPoint) {
         guard pressed == nil, incoming == nil, let tracker, count > 1 || limit != nil || onLeave != nil else { return }
         let y = tracker.convert(point, from: nil).y
         grab = y - rowTop(row)
         windowPoint = point
         pointerY = y
-        // The other rows close up over the moving ones.
         withAnimation(Self.slide) {
             pressed = row
             self.rows = rows.sorted()
@@ -198,7 +190,6 @@ import SwiftUI
         return drop ? place : nil
     }
 
-    /// The pointer moved, in window coordinates.
     func follow(_ point: NSPoint) {
         guard pressed != nil, let tracker else { return }
         windowPoint = point
@@ -206,7 +197,6 @@ import SwiftUI
         findGap()
     }
 
-    /// Ends the drag. With `drop`, moves the rows if their place changed.
     func finish(drop: Bool) {
         guard pressed != nil else { return }
         let (moving, gap) = (rows, before)
@@ -272,7 +262,6 @@ struct RowDragTracker: NSViewRepresentable {
     }
 }
 
-/// The empty slot where the rows will land, under the rows, inside the list's side room.
 struct RowDragSlot: View {
     let drag: RowDrag
 
@@ -293,7 +282,6 @@ struct RowDragSlot: View {
     }
 }
 
-/// A count badge on the lifted card when several rows move.
 struct RowDragOverlay: View {
     let drag: RowDrag
     let accent: RGBA

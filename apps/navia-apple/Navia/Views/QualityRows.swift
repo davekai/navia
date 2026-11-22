@@ -11,12 +11,11 @@ struct QualityRow: View {
     let label: String
     let hint: String
     let slot: QualitySettings.Slot
-    var last = false
 
     var body: some View {
         if let quality = shell.library.quality {
             let choice = quality.choice(slot)
-            SettingsRow(label: label, hint: hint, last: last) {
+            SettingsRow(label: label, hint: hint) {
                 HStack(spacing: T.px(8)) {
                     GlassSelect(shell: shell, label: L("{label} format", ["label": label]), value: choice.format, options: formatOptions(quality), width: T.px(140)) { value in
                         quality.set(slot, format: value, kbps: value == "original" ? 0 : quality.defaultKbps(format: value))
@@ -33,7 +32,7 @@ struct QualityRow: View {
                 .onAppear { quality.checkServerOnce() }
             }
         } else {
-            SettingsRow(label: label, hint: L("Needs a connection to the server."), dim: true, last: last) { DisabledPill(value: L("Original")) }
+            SettingsRow(label: label, hint: L("Needs a connection to the server."), dim: true) { DisabledPill(value: L("Original")) }
         }
     }
 
@@ -62,11 +61,10 @@ struct MeteredQualityRow: View {
 
 struct DownloadQualityRow: View {
     let shell: ShellModel
-    var last = false
-    var body: some View { QualityRow(shell: shell, label: L("Download quality"), hint: downloadHint, slot: .download, last: last) }
+    var body: some View { QualityRow(shell: shell, label: L("Download quality"), hint: downloadHint, slot: .download) }
 }
 
-/// Off, Album or Track. Off plays every file unchanged.
+/// off plays every file unchanged.
 struct VolumeLevelingRow: View {
     let shell: ShellModel
 

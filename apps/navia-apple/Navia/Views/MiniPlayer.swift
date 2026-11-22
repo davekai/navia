@@ -365,13 +365,17 @@ private struct MiniCard: View {
         VStack(alignment: center ? .center : .leading, spacing: 0) {
             if let song = player.current {
                 let titleSize = center ? T.textLG : T.textMD
-                HStack(spacing: titleSize * 0.27) {
-                    LinkedText(pieces: player.station == nil ? [LinkPiece.title(song)] : LinkPiece.plain(song.title), shell: shell)
-                        .font(.navia(titleSize, .medium)).foregroundStyle(T.tOnArt.color)
-                    if song.isExplicit { ExplicitMark(size: titleSize) }
+                MarqueeText {
+                    HStack(spacing: titleSize * 0.27) {
+                        LinkedText(pieces: player.station == nil ? [LinkPiece.title(song)] : LinkPiece.plain(song.title), shell: shell)
+                            .font(.navia(titleSize, .medium)).foregroundStyle(T.tOnArt.color)
+                        if song.isExplicit { ExplicitMark(size: titleSize) }
+                    }
                 }
-                LinkedText(pieces: player.station == nil ? LinkPiece.artist(song) : LinkPiece.plain(song.artist), shell: shell)
-                    .font(.navia(T.textSM)).foregroundStyle(tint.playerFgDim.color)
+                MarqueeText {
+                    LinkedText(pieces: player.station == nil ? LinkPiece.artist(song) : LinkPiece.plain(song.artist), shell: shell)
+                        .font(.navia(T.textSM)).foregroundStyle(tint.playerFgDim.color)
+                }
                 if let lyricLine {
                     Text(lyricLine).font(.navia(T.textXS)).foregroundStyle(tint.playerFgDim.color)
                 }
@@ -398,7 +402,7 @@ private struct MiniCard: View {
         } else {
             let total = Double(player.current?.duration ?? 0)
             TrackSlider(value: player.position, total: total, rest: T.playerTrack, thin: true,
-                        chip: "\(clock(player.position)) / \(clock(total))") { player.seek(to: $0) }
+                        chip: "\(clock(player.position)) / \(ScrubTime.endText(shell))") { player.seek(to: $0) }
         }
     }
 

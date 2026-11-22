@@ -24,6 +24,6 @@ nonisolated func smartRuleSummary(_ raw: String?, playlists: [(id: String, name:
     return RuleSummary(sentence: s.sentence, match: s.matchWord, rules: s.rules, order: s.order)
 }
 
-/// Every field the editor offers, read once from the core.
+/// read once from the core.
 nonisolated let smartFieldList: [SmartFieldRow] = smartFields()
 nonisolated let smartSortRandom = "random"

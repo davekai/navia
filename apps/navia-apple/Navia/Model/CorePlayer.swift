@@ -14,7 +14,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
 @Observable final class CorePlayerModel: PlayerViewModel {
     /// Song rows kept for the queue's view. Past this, only rows still in the queue are kept.
     private let songCacheMax = 20000
-    /// A seek's position reports are ignored for this long, until the engine catches up.
+    /// seconds a seek ignores position reports, until the engine catches up.
     private let seekSettle = 1.5
 
     @ObservationIgnored private(set) var library: CoreLibraryModel
@@ -23,7 +23,6 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
     @ObservationIgnored private var entries: [QueueEntry] = [] {
         didSet { queueVersion &+= 1; scheduleAutoplayUpdate() }
     }
-    /// Bumped whenever the queue changes, so views reading it redraw.
     private var queueVersion = 0
     /// The queue's model. Every change goes through it, so its edits reach the player in order.
     /// `entries` and `queueIndex` mirror it for views.
@@ -47,14 +46,16 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
     /// The position views draw. It holds still while the window is hidden (`setViewsLive`), so position reports
     /// don't redraw anything. Everything else reads `heardPosition`.
     private(set) var position: Double = 0
-    /// The player's latest position, kept current whether or not the window shows.
+    /// kept current whether or not the window shows.
     @ObservationIgnored private(set) var heardPosition: Double = 0
     @ObservationIgnored private var viewsLive = true
     private(set) var lyrics: [LyricLine] = []
     private(set) var lyricsSynced = false
+    private(set) var lyricsPending = false
+
     private(set) var currentSong: SongRow?
     private(set) var status = "stopped"
-    /// The internet radio station playing instead of the queue, which waits underneath.
+    /// the queue waits underneath.
     private(set) var station: RadioStation? {
         didSet { queue?.setHolding(on: holdsPlayer) }
     }
@@ -64,7 +65,9 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
     /// The quality badge's facts. The file is fetched once per song.
     private(set) var quality: AudioQuality?
     @ObservationIgnored private var qualityFile: (id: String, file: AudioFileRow?)?
-    /// A newer queue on the server from another device, offered until answered.
+    /// the output device's own rate, where the output can tell; set as the output opens
+    @ObservationIgnored private var deviceRate: UInt32?
+    /// from another client or device, offered until answered (`queue_sync.rs`).
     private(set) var queueOffer: RemoteQueueRow?
     private(set) var queueSource: PlaySource?
     /// Names the next list played, when its starter knows better than the page.
@@ -85,7 +88,9 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
             return
         }
         if qualityFile?.id != song.id {
-            qualityFile = (song.id, song.rowid.flatMap { core.audioFile(rowid: $0) })
+            // A song that didn't come from a library list (radio, Autoplay, a restored queue) has no row number yet.
+            let rowid = song.rowid ?? core.songsById(ids: [song.id]).first?.rowid
+            qualityFile = (song.id, rowid.flatMap { core.audioFile(rowid: $0) })
         }
         guard let file = qualityFile?.file else {
             if quality != nil { quality = nil }
@@ -104,8 +109,10 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
             case .download: .download
             }
         }
+        // a bitrate of 0 leaves it to the server, so it's unknown.
         let next = AudioQuality(format: file.format, tier: tier, kbps: file.kbps.map(Int.init), bitDepth: file.bitDepth.map(Int.init), sampleRate: file.sampleRate.map(Int.init),
-                                channels: file.channels.map(Int.init), source: source, transcodeFormat: delivery?.transcodeFormat, transcodeKbps: delivery?.transcodeKbps.map(Int.init))
+                                channels: file.channels.map(Int.init), source: source, transcodeFormat: delivery?.transcodeFormat, transcodeKbps: delivery?.transcodeKbps.flatMap { $0 > 0 ? Int($0) : nil },
+                                outputRate: deviceRate.map(Int.init))
         if next != quality { quality = next }
     }
 
@@ -127,6 +134,14 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
 
     var shuffleStyle: ShuffleStyle {
         didSet { UserDefaults.standard.set(shuffleStyle == .standard ? "standard" : "fewer", forKey: "shuffleStyle") }
+    }
+
+    /// off keeps the system's output rate, which every app shares.
+    var matchSampleRate: Bool {
+        didSet {
+            UserDefaults.standard.set(matchSampleRate ? "follow" : "device", forKey: "outputPolicy")
+            player?.setOutputPolicy(policy: matchSampleRate ? .followTrack : .deviceDefault)
+        }
     }
 
     var autoplayEnabled: Bool {
@@ -181,24 +196,130 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         var held = false
         /// When the listener last changed playback while following.
         var ownChangeMs: UInt64?
-        var seen: (playing: Bool, at: UInt64)?
+        var seen: FollowSeen?
+        /// the listener chose this song or place; the host comes to it.
+        var lead = false
+        /// "Sending to <user>…" while the host hasn't taken the listener's change.
+        var sending = false
+        var twoWaySince: UInt64?
     }
 
     func followLocal() -> FollowLocal? {
         guard let along else { return nil }
         return FollowLocal(songId: along.entry?.song.id ?? "", positionMs: UInt64(max(0, heardPosition) * 1000), playing: isPlaying,
-                           held: along.held, ownChangeMs: along.ownChangeMs, seenPlaying: along.seen?.playing, seenMs: along.seen?.at)
+                           held: along.held, ownChangeMs: along.ownChangeMs, lead: along.lead, seen: along.seen, ended: status == "stopped",
+                           viewer: core?.username() ?? "", twoWaySince: along.twoWaySince, nowMs: listenNowMs())
     }
 
-    func noteSeen(_ playing: Bool?) {
+    func noteSeen(_ seen: FollowSeen?, twoWay: Bool) {
         guard var current = along else { return }
-        current.seen = playing.map { ($0, listenNowMs()) }
+        current.seen = seen
+        current.twoWaySince = twoWay ? (current.twoWaySince ?? listenNowMs()) : nil
         along = current
     }
 
     /// When this user last changed playback. With listener control, the last change wins.
     @ObservationIgnored private(set) var hostChangeMs: UInt64 = 0
-    private func noteHostChange() { hostChangeMs = listenNowMs() }
+    /// the listener whose song or place this host took, while it plays it.
+    @ObservationIgnored private var led: LedRow?
+    private func noteHostChange() {
+        hostChangeMs = listenNowMs()
+        led = nil
+    }
+
+    /// from asking the player to start a song mid-way to it playing, measured on the last start.
+    @ObservationIgnored private var startLatencyMs: UInt64 = 0
+    @ObservationIgnored private var startingSince: CFAbsoluteTime?
+
+    /// where a song started mid-way should start so it lands where the other side is by then.
+    private func catchUpMs(_ ms: UInt64, playing: Bool) -> UInt64 { playing && ms > 0 ? ms + startLatencyMs : ms }
+
+    // MARK: Listening session
+
+    /// who plays the next session song at a song's end.
+    @ObservationIgnored let handover = SessionHandover()
+    /// the player ends after the playing song: the other side's session song comes next.
+    @ObservationIgnored private var sessionHolding = false
+
+    var sessionOn: Bool { listen?.sessionOn ?? false }
+    var sessionTheirs: [String] { listen?.sessionTheirs ?? [] }
+    /// this side's session songs are its Next in Queue (the waiting queue's while following).
+    var sessionMine: Bool { (queueView?.queuedRun ?? 0) > 0 }
+    var sessionLeftMs: UInt64? {
+        guard let song = currentSong, song.duration > 0 else { return nil }
+        return UInt64(max(0, Double(song.duration) * 1000 - heardPosition * 1000))
+    }
+
+    /// each check: the turn for the coming end, the host's hold while it's the other side's, and the bounded wait.
+    func sessionCheck() {
+        guard sessionOn else {
+            setSessionHold(false)
+            handover.reset()
+            return
+        }
+        let host = along == nil
+        if !handover.waiting() {
+            let turn = handover.plan(mine: sessionMine, theirs: !sessionTheirs.isEmpty, host: host)
+            if host { setSessionHold(turn == .theirs) }
+        }
+        if handover.waitOver(), host {
+            // their song didn't come: the host's own queue carries on
+            setSessionHold(false)
+            player?.next()
+        }
+    }
+
+    private func setSessionHold(_ on: Bool) {
+        guard sessionHolding != on else { return }
+        sessionHolding = on
+        player?.setHoldAfterCurrent(on: on)
+    }
+
+    /// the host's song ended while holding for the other side's song: wait (bounded), or carry on.
+    private func sessionQueueEnded() {
+        if sessionOn, handover.atEnd(mine: sessionMine, theirs: !sessionTheirs.isEmpty, host: true) == .theirs {
+            listen?.checkNow()
+            return
+        }
+        setSessionHold(false)
+        player?.next()
+    }
+
+    /// the host moved to the next song: its own session song, when that was the turn.
+    private func sessionTrackChanged() {
+        guard along == nil, sessionOn else { return }
+        setSessionHold(false)
+        if queueView?.currentQueued == true, handover.turn() == .mine, let id = currentSong?.id {
+            handover.startedMine(songId: id)
+        } else if !handover.waiting() {
+            handover.songChanged()
+        }
+    }
+
+    /// the followed song ended here: on this side's turn its first queued song plays, and the host takes it.
+    private func sessionFollowedEnded() {
+        guard sessionOn, handover.atEnd(mine: sessionMine, theirs: !sessionTheirs.isEmpty, host: false) == .mine else { return }
+        guard let id = queue?.takeQueuedNext() else { return }
+        mirror()
+        guard let row = core?.songById(id: id), alongPlay(SongRow(core: row)) else { return }
+        handover.startedMine(songId: id)
+    }
+
+    /// a session song of this side's that didn't get played goes back to the front of its queue.
+    private func sessionPutBack(_ id: String) {
+        guard let row = core?.songById(id: id) else { return }
+        queueSongs([SongRow(core: row)], at: 0, queued: true)
+    }
+
+    /// the listener's change waits for a host that lets listeners control it.
+    private func markOwnChange(lead: Bool) {
+        guard var current = along else { return }
+        let controls = alongControls
+        current.ownChangeMs = controls ? listenNowMs() : nil
+        current.sending = controls
+        current.lead = controls && (lead || current.lead)
+        along = current
+    }
 
     /// Whether the followed person lets listeners control playback.
     var alongControls: Bool { along.map { lanyardFriendOf(player: $0.player) == nil && allowsControl(player: $0.player) } ?? false }
@@ -209,9 +330,9 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         guard var current = along, let player else { return false }
         let play = play ?? !isPlaying
         current.held = !play
-        // Only a host that allows listener control mirrors it. Otherwise play catches up with the host at once.
-        current.ownChangeMs = alongControls ? listenNowMs() : nil
         along = current
+        // only a host that lets listeners control playback mirrors it; otherwise play catches up with the host at once
+        markOwnChange(lead: false)
         if play { player.play() } else { player.pause() }
         isPlaying = play
         if play { listen?.checkNow() }
@@ -220,9 +341,8 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
 
     /// Seeks while following a host that allows listener control. Their Navia mirrors it.
     private func alongSeek(_ ms: UInt64) -> Bool {
-        guard alongControls, var current = along, let player else { return false }
-        current.ownChangeMs = listenNowMs()
-        along = current
+        guard alongControls, along != nil, let player else { return false }
+        markOwnChange(lead: true)
         player.seekMs(ms: ms)
         setPosition(Double(ms) / 1000)
         return true
@@ -233,9 +353,9 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         guard alongControls, var current = along, let row = core?.songById(id: song.id) else { return false }
         let entry = NowPlayingRow(user: current.user, player: current.player, song: row, state: .playing, positionMs: 0, canListenAlong: true)
         current.entry = entry
-        current.ownChangeMs = listenNowMs()
         current.held = false
         along = current
+        markOwnChange(lead: true)
         loadFollowed(entry)
         return true
     }
@@ -251,28 +371,42 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         return true
     }
 
-    /// Mirrors a listener's action on this host, when this Navia isn't following anyone.
-    func applyHostAction(_ action: HostAction) {
+    /// when this Navia isn't following anyone.
+    func applyHostMirror(_ mirror: HostMirror) {
         guard let player, along == nil else { return }
-        switch action {
-        case .pause: player.pause()
-        case .play: player.play()
-        case .seek(let ms):
+        led = mirror.led
+        let seek = { (ms: UInt64) in
             player.seekMs(ms: ms)
-            setPosition(Double(ms) / 1000)
+            self.setPosition(Double(ms) / 1000)
+        }
+        switch mirror.action {
+        case .pause(let place):
+            if let place { seek(place) }
+            player.pause()
+        case .play(let place):
+            if let place { seek(place) }
+            player.play()
+        case .seek(let ms): seek(ms)
         case .song(let id, let ms, let playing):
             guard let row = core?.songById(id: id) else { return }
-            // It plays now as a queued song, and the host's queue carries on after it.
+            let clash = handover.theirsArrived()
+            setSessionHold(false)
+            // it plays now, as a queued song; the host's queue carries on after it
             playNext(SongRow(core: row))
+            startingSince = CFAbsoluteTimeGetCurrent()
             player.next()
-            if ms > listenAlongTiming().resyncDriftMs { player.seekMs(ms: ms) }
+            let at = catchUpMs(ms, playing: playing)
+            if at > 0 { player.seekMs(ms: at) }
             if playing { player.play() } else { player.pause() }
+            // both sides started a session song at once: the listener's plays, the host's waits next
+            if let clash { sessionPutBack(clash) }
         }
     }
 
     func hostRow() -> HostRow? {
         guard along == nil, let song = currentSong, station == nil else { return nil }
-        return HostRow(songId: song.id, positionMs: UInt64(max(0, heardPosition) * 1000), playing: isPlaying, ownChangeMs: hostChangeMs)
+        return HostRow(songId: song.id, positionMs: UInt64(max(0, heardPosition) * 1000), playing: isPlaying, ownChangeMs: hostChangeMs,
+                       led: led?.songId == song.id ? led : nil)
     }
     private(set) var along: Along? {
         didSet { if (along == nil) != (oldValue == nil) { queue?.setHolding(on: holdsPlayer) } }
@@ -282,6 +416,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
     var followingFriend: String? { along.flatMap { lanyardFriendOf(player: $0.player) } }
     var followingWaiting: Bool { along?.waiting ?? false }
     var followingHeld: Bool { along?.held ?? false }
+    var followingSending: Bool { along?.sending ?? false }
     var waitingSong: SongRow? {
         _ = queueVersion
         return along != nil && entries.indices.contains(queueIndex) ? entries[queueIndex].song : nil
@@ -323,11 +458,10 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         autoplayMode = core?.autoplayMode() ?? .navia
         shareListening = defaults.bool(forKey: "shareListening")
         shuffleStyle = defaults.string(forKey: "shuffleStyle") == "standard" ? .standard : .fewerRepeats
+        matchSampleRate = defaults.string(forKey: "outputPolicy") != "device"
         guard let core else { return }
         autoplayCore = core.makeAutoplay()
-        // DeviceDefault keeps the system's output rate. Following the track would change the hardware rate for every
-        // app on the Mac.
-        let policy: OutputPolicy = defaults.string(forKey: "outputPolicy") == "follow" ? .followTrack : .deviceDefault
+        let policy: OutputPolicy = matchSampleRate ? .followTrack : .deviceDefault
         do {
             // AirPlay receivers are listed with the Mac's devices, except in test and capture runs.
             if let airplay = AirPlayModel.shared.startService(core: core) {
@@ -360,7 +494,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         }
     }
 
-    /// Stops playback and hands this account's player back. Runs before the next account's models are made.
+    /// runs before the next account's models are made.
     func shutdown() {
         generation &+= 1
         saveSessionNow()
@@ -385,7 +519,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
     @ObservationIgnored private let discord = makeDiscordStatus()
     @ObservationIgnored private var discordOn = false
 
-    /// Starts or stops Discord status. Never in a test run, and only reachable from Settings or launch.
+    /// never in a test run.
     func setDiscordStatus(_ on: Bool) {
         let enable = on && !CoreMode.isTestRun
         guard enable != discordOn else { return }
@@ -518,7 +652,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
     private func handle(_ event: PlayerEventRow) {
         switch event {
         case .trackChanged(let index, let item, let left):
-            // The station's own start. Anything else means a song took over and the station ended.
+            // anything else means a song took over and the station ended.
             if item.id == liveItemID { return }
             if along != nil { return }
             if station != nil { station = nil; liveItemID = nil; liveTitle = nil; songBeforeStation = nil }
@@ -538,11 +672,17 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
             setPosition(Double(player?.quickPositionMs() ?? 0) / 1000)
             queueEnded = false
             if let song = currentSong { autoplayCore?.heard(song: Self.autoplaySong(song)) }
+            sessionTrackChanged()
             publishNowPlaying()
             saveSession()
         case .statusChanged(let status):
             switch status {
-            case .playing: isPlaying = true; self.status = "playing"
+            case .playing:
+                isPlaying = true; self.status = "playing"
+                if let since = startingSince {
+                    startingSince = nil
+                    startLatencyMs = min(UInt64((CFAbsoluteTimeGetCurrent() - since) * 1000), listenAlongTiming().resyncDriftMs)
+                }
             case .buffering: isPlaying = true; self.status = "buffering"
             case .paused:
                 isPlaying = false; self.status = "paused"
@@ -562,10 +702,15 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
             refreshQuality()
             if station != nil { updateLiveTitle() }
             if CFAbsoluteTimeGetCurrent() - lastSaved > 5 { saveSession() }
+        case .queueEnded where sessionHolding:
+            isPlaying = false
+            status = "stopped"
+            sessionQueueEnded()
         case .queueEnded where along != nil:
             // The followed song ended here. Ask the server now so the next one follows at once.
             isPlaying = false
             status = "stopped"
+            sessionFollowedEnded()
             listen?.checkNow()
         case .queueEnded:
             // Autoplay only starts a late answer if it was on when the list ran out.
@@ -592,7 +737,10 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
             // Next or Previous during Repeat one switches the player to Repeat all.
             let next: PlayerRepeat = switch mode { case .off: .off; case .all: .all; case .one: .one }
             if repeatMode != next { repeatMode = next }
-        case .queueChanged, .outputChanged:
+        case .outputChanged(_, let rate, _):
+            deviceRate = rate
+            refreshQuality()
+        case .queueChanged:
             break
         }
     }
@@ -661,10 +809,12 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         guard let core else { return }
         let id = song.id
         lyricsFor = id
+        lyricsPending = true
         Task.detached(priority: .utility) { [weak self] in
             let found = try? await core.lyrics(songId: id, artist: song.artist, title: song.title)
             await MainActor.run {
                 guard let self, self.lyricsFor == id else { return }
+                self.lyricsPending = false
                 let lines = found?.lines.map { row in
                     LyricLine(start: row.startMs.map(Int.init), text: row.text, endMs: row.endMs.map(Int.init),
                               words: row.words.map { LyricWord(start: $0.start, end: $0.end, startMs: $0.startMs, endMs: $0.endMs) })
@@ -764,20 +914,42 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
             listen?.followingEnded(user: current.user)
         case .keep(_, let name):
             current.player = name
+            current.ownChangeMs = nil
+            current.sending = false
             along = current
+        case .sending(let name):
+            current.player = name
+            current.sending = true
+            along = current
+        case .lead(let user):
+            // they listen along with this Navia now; it keeps playing as their host
+            stopFollowing()
+            library.onNotice?(L("{user} is listening along with you", ["user": user]))
         case .notInLibrary(let key, let song, let artist):
             skipMissing(key: key, song: song, artist: artist)
+        case .notTaken(let entry, let name):
+            let mine = currentSong?.id
+            applyFollowStep(.resync(entry: entry, player: name))
+            if let mine, handover.theirsArrived() == mine { sessionPutBack(mine) }
+            library.onNotice?(L("{user} didn’t take your change", ["user": current.user]))
         case .resync(let entry, let name):
             let sameSong = entry.song.id == current.entry?.song.id
             current.player = name
             current.entry = entry
             current.waiting = false
             current.held = false
+            current.ownChangeMs = nil
+            current.lead = false
+            current.sending = false
             along = current
-            guard sameSong else { loadFollowed(entry); return }
-            // The follower's own moves go straight to the player, not through controls that end following.
-            let at = entry.positionMs ?? 0
+            guard sameSong else {
+                _ = handover.theirsArrived()
+                loadFollowed(entry)
+                return
+            }
+            // the follower's own moves go straight to the player, not through the controls that end following
             let playing = entry.state.map { $0 != .paused } ?? false
+            let at = catchUpMs(entry.positionMs ?? 0, playing: playing)
             if abs(heardPosition * 1000 - Double(at)) > Double(listenAlongTiming().resyncDriftMs) {
                 player.seekMs(ms: at)
                 setPosition(Double(at) / 1000)
@@ -791,8 +963,9 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         guard let player else { return }
         let song = SongRow(core: entry.song)
         let playing = entry.state.map { $0 != .paused } ?? false
-        let at = entry.positionMs ?? 0
-        // No crossfade while following, so the host's song changes cut in at once.
+        let at = catchUpMs(entry.positionMs ?? 0, playing: playing)
+        startingSince = CFAbsoluteTimeGetCurrent()
+        // no crossfade while following, so the followed song changes cut in at once.
         player.setFollowing(on: true)
         player.setQueue(items: [Self.item(song)], startIndex: 0, startMs: at, paused: !playing)
         setCurrent(song)
@@ -1004,6 +1177,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         case .album(let id): .album(id: id)
         case .playlist(let id): .playlist(id: id)
         case .artist(let id): .artist(id: id)
+        case .artistTop(let id): .artistTop(id: id)
         case .mix(let id): .mix(id: id)
         case .liked: .liked
         case .songs(let genre): genre.map { .genre(name: $0) } ?? .songs
@@ -1017,6 +1191,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         case .album(let id): .album(id)
         case .playlist(let id): .playlist(id)
         case .artist(let id): .artist(id)
+        case .artistTop(let id): .artistTop(id)
         case .mix(let id): .mix(id)
         case .liked: .liked
         case .genre(let name): .songs(genre: name)
@@ -1114,7 +1289,8 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
     /// Inserts songs at Up Next offset `at`, into Next in Queue when `queued` and into the list otherwise.
     func queueSongs(_ songs: [SongRow], at: Int, queued: Bool) {
         guard player != nil, !songs.isEmpty else { return }
-        guard !entries.isEmpty else { play(songs, at: 0, shuffle: nil); return }
+        // while following, songs go into the waiting queue rather than playing
+        guard !entries.isEmpty || along != nil else { play(songs, at: 0, shuffle: nil); return }
         remember(songs)
         edit { _ = $0.insert(songs: songs.map(Self.item), offset: UInt64(max(0, at)), queued: queued) }
         refreshAutoplaySongs()
@@ -1131,9 +1307,11 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         saveSession()
     }
 
-    func setCrossfade(ms: Int, smart: Bool) {
+    /// Internet radio isn't wired to the engine yet; nothing starts.
+    func setCrossfade(ms: Int, smart: Bool, mix: Bool) {
         player?.setCrossfadeMs(ms: UInt32(ms))
         player?.setSmartCrossfade(on: smart)
+        player?.setSmartTransitions(on: mix)
     }
 
     /// Sends the EQ chain to the player. Nil bypasses it, so off stays bit-exact.
@@ -1161,7 +1339,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
     @ObservationIgnored private var liveItemID: String?
     func setOutputDevice(_ id: String?) { player?.setOutputDevice(device: id) }
 
-    /// Plays a station in place of the queue. The song and queue stay ready underneath for when it ends.
+    /// the song and queue stay ready underneath for when it ends.
     func playStation(_ station: RadioStation) {
         guard let player else { return }
         dropAlong()
@@ -1174,6 +1352,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         lyrics = []
         lyricsSynced = false
         lyricsFor = nil
+        lyricsPending = false
         setPosition(0)
         isPlaying = true
         status = "buffering"
@@ -1213,7 +1392,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
     }
 
     /// Jumps to an Up Next song. Jumping down Next in Queue drops the queued songs above it, and jumping down the
-    /// list keeps them next, as Spotify does.
+    /// list keeps them next.
     func jump(toUpcoming offset: Int) {
         // When following, the queue comes back first with the followed song in it, so the target moves down one.
         if takeControlFromAlong() { jump(toUpcoming: offset + 1); return }
@@ -1475,7 +1654,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         var repeatMode: PlayerRepeat?
         var shuffle: Bool
         var queuedRun: Int?
-        /// The song playing was queued, so it leaves the queue once another plays.
+        /// leaves the queue once another song plays.
         var currentQueued: Bool?
         var source: SavedSource?
     }
@@ -1492,6 +1671,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
         case .album(let id): "album:\(id)"
         case .playlist(let id): "playlist:\(id)"
         case .artist(let id): "artist:\(id)"
+        case .artistTop(let id): "artist-top:\(id)"
         case .mix(let id): "mix:\(id)"
         case .liked: "liked"
         case .songs(let genre): genre.map { "genre:\($0)" } ?? "songs"
@@ -1508,6 +1688,7 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
             case "album": return .album(value)
             case "playlist": return .playlist(value)
             case "artist": return .artist(value)
+            case "artist-top": return .artistTop(value)
             case "mix": return .mix(value)
             case "liked": return .liked
             case "genre": return .songs(genre: value)
@@ -1591,7 +1772,6 @@ private nonisolated final class CorePlayerEvents: PlayerListener, @unchecked Sen
     }
 }
 
-/// System Now Playing and media keys.
 @MainActor final class NowPlayingBridge {
     private weak var player: CorePlayerModel?
     private var artwork: (songID: String, art: MPMediaItemArtwork)?

@@ -2,7 +2,7 @@ import Foundation
 import NaviaCoreFFI
 import Observation
 
-/// Rows loaded on demand by row id, off the main thread, so memory doesn't grow with the library.
+/// rows loaded on demand off the main thread, so memory doesn't grow with the library.
 @MainActor final class RowCache<Row: Sendable> {
     private var rows: [UInt32: (row: Row, used: UInt64)] = [:]
     private var inFlight = Set<UInt32>()
@@ -182,7 +182,7 @@ import Observation
     var allDownloaded: Bool { false }
     func setAllDownloaded(_ downloaded: Bool) {}
 
-    /// Every row in the current order, for lists small enough to hold. The Songs page never calls this.
+    /// for lists small enough to hold; the Songs page never calls this.
     func allSongs() -> [SongRow] {
         guard let core else { return [] }
         return core.songsByRowid(rowids: order).map { collection.apply(SongRow(core: $0)) }
@@ -236,7 +236,6 @@ import Observation
             var rowids: [UInt32]
             var totalSongs: Int
             if case .artist(let id, let section) = scope {
-                // One section of the artist's discography, in the chosen sort and filters.
                 let wanted = Set((try? await core.artistDiscography(artistId: id))?.sections.first { DiscographySection($0.section) == section }?.rowids ?? [])
                 rowids = core.albumOrder(order: Self.orderBy(sort), query: query, genre: genre, artistId: nil).rowids.filter { wanted.contains($0) }
                 totalSongs = core.albumsByRowid(rowids: rowids).reduce(0) { $0 + Int($1.songCount ?? 0) }
@@ -322,7 +321,6 @@ import Observation
             guard let core else { return }
             let found = filters.isEmpty ? core.rankedArtists(query: query.isEmpty ? nil : query, limit: nil) : core.rankedArtistsWithFilters(query: query.isEmpty ? nil : query, filters: filters)
             let list = found.map { ArtistRow(core: $0.artist) }
-            // Each artist's album and song counts for the split list, read once.
             let needCounts = await MainActor.run { self?.countsByID.isEmpty ?? false }
             let counts = needCounts ? core.artistCounts() : nil
             await MainActor.run {

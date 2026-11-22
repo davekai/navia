@@ -80,7 +80,7 @@ struct SyncCard: View {
         let p = progress
         VStack(alignment: .leading, spacing: T.px(8)) {
             VStack(alignment: .leading, spacing: 0) {
-                Text(L("Syncing your library")).font(.navia(T.textMD, .medium)).lineLimit(1)
+                Text(L("Syncing library")).font(.navia(T.textMD, .medium)).lineLimit(1)
                 if let detail = syncDetail(p) {
                     Text(detail).font(.navia(T.textXS)).foregroundStyle(T.t2.color).lineLimit(1)
                 }

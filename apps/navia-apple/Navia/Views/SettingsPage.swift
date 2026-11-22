@@ -3,16 +3,22 @@ import NaviaCoreFFI
 
 private let licenseURL = URL(string: "https://github.com/davekai/navia/blob/main/LICENSE")!
 
-/// Every Settings section. Rows the Mac can't back yet are disabled and say why.
+/// the Equalizer page's own settings, so the search finds them on its row.
+private let equalizerTerms = [N_("Equalizer mode"), N_("Graphic"), N_("Parametric"), N_("Preset"), N_("Preamp"), N_("Custom filters"), N_("Reset to Flat"), N_("Save as preset"), N_("Balance"), N_("Mono"), N_("Crossfeed"), N_("Crossfeed strength"), N_("Soft limiter"), N_("Headphone Correction"), N_("Headphone model")]
+
+/// rows without a backend on the Mac are disabled and say why.
 struct SettingsPage: View {
     let shell: ShellModel
     @Environment(\.pageContext) private var ctx
     @State private var openAtLogin = OpenAtLogin()
+    @State private var query = ""
 
     private var theme: Theme { shell.theme }
 
     var body: some View {
-        PageFrame(shell: shell, nav: .none, title: L("Settings")) {
+        PageFrame(shell: shell, nav: .none, title: L("Settings"), hasRight: true) {
+            SearchPill(placeholder: L("Search Settings"), text: $query, accent: theme.accent, width: pillSearchWidth(ctx))
+        } content: {
             PageScroll { content }
         }
         .onAppear {
@@ -21,34 +27,46 @@ struct SettingsPage: View {
         }
     }
 
+    /// sections the search leaves empty resolve to nothing, so none left means nothing matched.
     private var content: some View {
-        VStack(alignment: .leading, spacing: T.px(30)) {
-            playback
-            appearance
-            player
-            startup
-            library
-            StorageSection(shell: shell)
-            connections
-            if let listen = shell.player.listen { SpotifyFriendsSection(listen: listen, theme: theme) }
-            about
+        Group(subviews: sections) { found in
+            if found.isEmpty {
+                EmptyStateView(symbol: "magnifyingglass", title: L("No settings match"), hint: L("Nothing matches “{query}”.", ["query": query.trimmingCharacters(in: .whitespaces)]),
+                               compact: true, actionTitle: L("Clear Search")) { query = "" }
+            } else {
+                VStack(alignment: .leading, spacing: T.settingsSectionGap) { found }
+            }
         }
+        .environment(\.settingsQuery, settingsSearchWords(query))
         .padding(.horizontal, T.gutter)
-        .frame(maxWidth: T.px(780))
+        .frame(maxWidth: T.settingsMaxW)
         .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder private var sections: some View {
+        playback
+        appearance
+        player
+        startup
+        library
+        StorageSection(shell: shell)
+        connections
+        if let listen = shell.player.listen { SpotifyFriendsSection(listen: listen, theme: theme) }
+        about
     }
 
     // MARK: Playback
 
     private var playback: some View {
         SettingsSection(title: L("Playback")) {
-            SettingsRow(label: L("Between songs"), hint: L("Gapless keeps albums seamless. Smart crossfades between unrelated songs, and stays gapless within an album.")) {
+            SettingsRow(label: L("Between songs"), hint: L("Gapless keeps albums seamless. Smart crossfades between unrelated songs, and stays gapless within an album. Mix shapes each transition to the music.")) {
                 SegmentedChoice(look: .settings, value: shell.betweenSongs,
                                 options: [.init(value: .gapless, label: L("Gapless")), .init(value: .crossfade, label: L("Crossfade")),
-                                          .init(value: .smart, label: L("Smart"))],
+                                          .init(value: .smart, label: L("Smart")), .init(value: .mix, label: L("Mix"))],
                                 accent: theme.accent, label: L("Between songs")) { shell.betweenSongs = $0 }
             }
-            if shell.betweenSongs != .gapless {
+            // Mix chooses each transition's length itself.
+            if shell.betweenSongs == .crossfade || shell.betweenSongs == .smart {
                 SettingsRow(label: L("Crossfade length"), hint: Ln("{count} second", "{count} seconds", shell.crossfadeSeconds)) {
                     PlainSlider(label: L("Crossfade length"), value: Double(shell.crossfadeSeconds), min: 1, max: 12, look: .native(accent: theme.accent), valueText: Ln("{count} second", "{count} seconds", shell.crossfadeSeconds),
                                 onChange: { shell.crossfadeSeconds = Int($0) })
@@ -58,6 +76,9 @@ struct SettingsPage: View {
                 SegmentedChoice(look: .settings, value: shell.player.shuffleStyle,
                                 options: [.init(value: .fewerRepeats, label: L("Fewer Repeats")), .init(value: .standard, label: L("Standard"))],
                                 accent: theme.accent, label: L("Shuffle")) { shell.player.shuffleStyle = $0 }
+            }
+            SettingsRow(label: L("Match the song's sample rate"), hint: L("Switches your output device to each song's sample rate instead of converting the song.")) {
+                ToggleSwitch(isOn: Binding(get: { shell.player.matchSampleRate }, set: { shell.player.matchSampleRate = $0 }), accent: theme.accent, label: L("Match the song's sample rate"))
             }
             SettingsRow(label: L("Autoplay"), hint: L("When your music ends, keep playing similar songs. Starts only once nothing is left, so after every song of a shuffled list, and never while Repeat is on.")) {
                 ToggleSwitch(isOn: Binding(get: { shell.player.autoplayEnabled }, set: { shell.player.autoplayEnabled = $0 }), accent: theme.accent, label: L("Autoplay"))
@@ -71,32 +92,23 @@ struct SettingsPage: View {
             }
             // The Deezer switch is never dimmed.
             SettingsRow(label: L("Use Deezer for recommendations"),
-                        hint: L("Better Autoplay and Artist Radio. Sends artist and song names to Deezer from this computer. No account needed.")) {
+                        hint: L("Better Autoplay and Artist Radio, and a Heat column on albums. Sends artist and song names to Deezer and ListenBrainz from this computer. No account needed.")) {
                 ToggleSwitch(isOn: Binding(get: { shell.deezerChoice == true }, set: { shell.setDeezerChoice($0) }), accent: theme.accent, label: L("Use Deezer for recommendations"))
             }
             VolumeLevelingRow(shell: shell)
             StreamingQualityRow(shell: shell)
             MeteredQualityRow(shell: shell)
-            SettingsRow(label: L("Output device"), hint: shell.outputOptions.isEmpty ? L("Your system's default output.") : L("Where Navia plays. Applied to the player right away.")) {
-                GlassSelect(shell: shell, label: L("Output device"), value: shell.outputDevice ?? eqOutputDefault, options: outputOptions, width: T.px(240)) { value in
-                    shell.outputDevice = value == eqOutputDefault ? nil : value
-                }
-            }
-            SettingsLinkRow(label: L("Equalizer"), hint: shell.equalizer.summary(outputLabel: shell.outputLabel(shell.equalizer.state.output)), last: true) {
+            SettingsLinkRow(label: L("Equalizer"), hint: shell.equalizer.summary(outputLabel: shell.outputLabel(shell.equalizer.state.output)), terms: equalizerTerms.map { L($0) }) {
                 shell.go(.equalizer)
             }
         }
-    }
-
-    private var outputOptions: [SelectOption] {
-        [SelectOption(value: eqOutputDefault, label: L("System default"))] + shell.outputOptions.map { SelectOption(value: $0.id, label: $0.name) }
     }
 
     // MARK: Appearance
 
     private var appearance: some View {
         SettingsSection(title: L("Appearance")) {
-            SettingsRow(label: L("Accent color"), hint: nil) { AccentPicker(theme: theme) }
+            SettingsRow(label: L("Accent color"), hint: theme.followsSystem ? L("Matches your Mac's accent color.") : nil) { AccentPicker(theme: theme) }
             SettingsRow(label: L("Window translucency"), hint: translucencyHint, dim: shell.systemReduceTransparency) {
                 ToggleSwitch(isOn: Binding(get: { shell.windowTranslucency && !shell.systemReduceTransparency },
                                            set: { if !shell.systemReduceTransparency { shell.windowTranslucency = $0 } }),
@@ -107,7 +119,7 @@ struct SettingsPage: View {
                     .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { DiagnosticsRunner.translucencySwitchFrame = $0 }
                     #endif
             }
-            SettingsRow(label: L("Language"), hint: L("Follows your system's language unless you pick one."), last: true) {
+            SettingsRow(label: L("Language"), hint: L("Follows your system's language unless you pick one.")) {
                 GlassSelect(shell: shell, label: L("Language"), value: shell.language,
                             options: [SelectOption(value: "system", label: L("System"))] + Language.names.map { SelectOption(value: $0.code, label: $0.name) },
                             width: T.px(240)) { shell.language = $0 }
@@ -131,7 +143,16 @@ struct SettingsPage: View {
                 SegmentedChoice(look: .settings, value: shell.playerMode, options: [.init(value: .dock, label: L("Right Dock")), .init(value: .bar, label: L("Bottom Bar"))],
                                 accent: theme.accent, label: L("Player position")) { shell.playerMode = $0 }
             }
-            SettingsRow(label: L("Blur lyrics by distance"), hint: nil, last: true) {
+            SettingsRow(label: L("Lyric effects"), hint: L("Glow, rising words and moving lines. Off shows plain synced lyrics.")) {
+                ToggleSwitch(isOn: Binding(get: { shell.lyricEffects }, set: { shell.lyricEffects = $0 }), accent: theme.accent, label: L("Lyric effects"))
+            }
+            SettingsRow(label: L("Lyric sweep"), hint: L("Lights up the lyrics as they're sung. Off highlights the whole line.")) {
+                ToggleSwitch(isOn: Binding(get: { shell.lyricSweep }, set: { shell.lyricSweep = $0 }), accent: theme.accent, label: L("Lyric sweep"))
+            }
+            SettingsRow(label: L("Backing vocals on their own line"), hint: L("Moves words in parentheses to a smaller line under the lyric.")) {
+                ToggleSwitch(isOn: Binding(get: { shell.backingVocalsLine }, set: { shell.backingVocalsLine = $0 }), accent: theme.accent, label: L("Backing vocals on their own line"))
+            }
+            SettingsRow(label: L("Blur lyrics by distance"), hint: nil) {
                 ToggleSwitch(isOn: Binding(get: { shell.lyricBlur }, set: { shell.lyricBlur = $0 }), accent: theme.accent, label: L("Blur lyrics"))
             }
         }
@@ -145,7 +166,7 @@ struct SettingsPage: View {
             SettingsRow(label: L("Show the mini player when Navia is minimized"), hint: nil) {
                 ToggleSwitch(isOn: Binding(get: { shell.miniOnMinimize }, set: { shell.miniOnMinimize = $0 }), accent: theme.accent, label: L("Show the mini player when Navia is minimized"))
             }
-            SettingsRow(label: L("Open at login"), hint: openAtLogin.needsApproval ? L("Allow Navia in System Settings, under General > Login Items.") : nil, last: true) {
+            SettingsRow(label: L("Open at login"), hint: openAtLogin.needsApproval ? L("Allow Navia in System Settings, under General > Login Items.") : nil) {
                 ToggleSwitch(isOn: Binding(get: { openAtLogin.isOn }, set: { openAtLogin.set($0) }), accent: theme.accent, label: L("Open at login"))
             }
         }
@@ -181,12 +202,12 @@ struct SettingsPage: View {
     @ViewBuilder private var shareLinksRow: some View {
         if let links = shell.library.shareLinks, links.sharingOn {
             let count = links.links?.count ?? 0
-            SettingsLinkRow(label: L("Share Links"), hint: count > 0 ? Ln("{count} link", "{count} links", count) : L("Links to songs, albums and playlists that anyone can open."), last: true) {
+            SettingsLinkRow(label: L("Share Links"), hint: count > 0 ? Ln("{count} link", "{count} links", count) : L("Links to songs, albums and playlists that anyone can open.")) {
                 shell.go(.shares)
             }
             .task { if links.links == nil { links.refresh() } }
         } else {
-            SettingsRow(label: L("Share Links"), hint: L("Sharing is turned off on this server"), dim: true, last: true) { EmptyView() }
+            SettingsRow(label: L("Share Links"), hint: L("Sharing is turned off on this server"), dim: true) { EmptyView() }
         }
     }
 
@@ -212,8 +233,7 @@ struct SettingsPage: View {
         return L("{host}, signed in as {user}. Set by the environment, so it can't be changed here.", values)
     }
 
-    /// Settings > Autoplay mode's hints.
-    private let autoplayNaviaHint = N_("Picks from the server's suggestions, your plays and favorites, and Deezer when it's on.")
+    private let autoplayNaviaHint = N_("Picks from the server's suggestions, your plays and favorites, and Deezer and ListenBrainz when they're on.")
     private let autoplayServerHint = N_("The server's similar songs, as they come.")
 
     // MARK: Connections
@@ -274,7 +294,7 @@ struct SettingsPage: View {
             SettingsRow(label: L("Check for updates automatically"), hint: nil) {
                 ToggleSwitch(isOn: Binding(get: { updates.checkAutomatically }, set: { updates.checkAutomatically = $0 }), accent: theme.accent, label: L("Check for updates automatically"))
             }
-            SettingsRow(label: L("License"), hint: L("Licensed under GPL-3.0-or-later."), last: true) {
+            SettingsRow(label: L("License"), hint: L("Licensed under GPL-3.0-or-later.")) {
                 ActionButton(title: L("View License"), compact: true) { NSWorkspace.shared.open(licenseURL) }
             }
         }
@@ -303,7 +323,7 @@ struct SettingsPage: View {
                 DisabledPill(value: PlayThresholdSettings.percentLabel(percent))
             }
         }
-        SettingsRow(label: L("Or after 4 minutes"), hint: reason ?? L("Long songs also count once you've heard 4 minutes of them."), dim: reason != nil, last: true) {
+        SettingsRow(label: L("Or after 4 minutes"), hint: reason ?? L("Long songs also count once you've heard 4 minutes of them."), dim: reason != nil) {
             ToggleSwitch(isOn: Binding(get: { cap }, set: { settings?.setCap($0) }), accent: theme.accent, label: L("Or after 4 minutes"))
                 .disabled(reason != nil)
                 .opacity(reason != nil ? T.disabledOpacity : 1)
@@ -408,7 +428,7 @@ private struct SpotifyFriendsSection: View {
                     TextPillButton(symbol: "plus", title: L("Add"), disabled: parsed == nil || taken, action: add)
                 }
             }
-            SettingsRow(label: L("Lanyard address"), hint: addressOK ? L("Lanyard’s public service, or the address of your own.") : L("Enter the address as https://lanyard.example.org."), last: true) {
+            SettingsRow(label: L("Lanyard address"), hint: addressOK ? L("Lanyard’s public service, or the address of your own.") : L("Enter the address as https://lanyard.example.org.")) {
                 PillTextField(placeholder: lanyardPublicAddress(), text: Binding(get: { listen.lanyardAddress }, set: { listen.lanyardAddress = $0 }),
                               accent: theme.accent, width: T.px(240),
                               onSubmit: { listen.applyAddress() }, onBlur: { listen.applyAddress() })

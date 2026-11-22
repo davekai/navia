@@ -3,7 +3,6 @@ import SwiftUI
 /// What an artist's About sheet shows, from what the server has. Nil when there's nothing, which hides the
 /// header's info button.
 struct ArtistAbout {
-    /// How many genres the sheet names.
     static let genresShown = 3
 
     let facts: [(label: String, value: String)]
@@ -41,40 +40,32 @@ struct ArtistAboutLayer: View {
     var body: some View {
         if let artist = shell.library.artist(id: id) {
             let about = ArtistAbout.of(artist, shell: shell)
-            DialogCoverSheet(url: artist.photoURL, dismiss: { shell.closeAbout() }) {
-                VStack(alignment: .leading, spacing: T.sheetSectionGap) {
-                    Text(artist.name)
-                        .font(.navia(T.textTitle, .bold)).tracking(-0.026 * T.textTitle)
-                        .foregroundStyle(T.tEm.color)
-                        .shadow(T.heroTitleShadow)
-                        .frame(minHeight: artist.photoURL == nil ? T.controlH : nil)
-                        .padding(.leading, artist.photoURL == nil ? CoverSheet.headInset : 0)
-                    if let about {
-                        if !about.facts.isEmpty {
-                            Grid(alignment: .topLeading, horizontalSpacing: T.dialogPad, verticalSpacing: T.dialogGap) {
-                                ForEach(Array(stride(from: 0, to: about.facts.count, by: 2)), id: \.self) { i in
-                                    GridRow {
-                                        fact(about.facts[i])
-                                        if i + 1 < about.facts.count { fact(about.facts[i + 1]) } else { Color.clear.frame(height: 1) }
-                                    }
+            AboutSheet(title: artist.name, art: artist.photoURL.map { .artwork($0, .artist) }, shell: shell) {
+                if let about {
+                    if !about.facts.isEmpty {
+                        Grid(alignment: .topLeading, horizontalSpacing: T.dialogPad, verticalSpacing: T.dialogGap) {
+                            ForEach(Array(stride(from: 0, to: about.facts.count, by: 2)), id: \.self) { i in
+                                GridRow {
+                                    fact(about.facts[i])
+                                    if i + 1 < about.facts.count { fact(about.facts[i + 1]) } else { Color.clear.frame(height: 1) }
                                 }
                             }
                         }
-                        if !about.genres.isEmpty {
-                            VStack(alignment: .leading, spacing: T.sheetLabelGap) {
-                                Text(about.genres.count > 1 ? L("Genres") : L("Genre")).font(.navia(T.textSM)).foregroundStyle(T.t2.color)
-                                HStack(spacing: T.dialogActionsGap) {
-                                    ForEach(about.genres, id: \.self) { genre in
-                                        ActionButton(title: genre, small: true) { shell.go(.songs(genre: genre)) }
-                                    }
+                    }
+                    if !about.genres.isEmpty {
+                        VStack(alignment: .leading, spacing: T.sheetLabelGap) {
+                            Text(about.genres.count > 1 ? L("Genres") : L("Genre")).font(.navia(T.textSM)).foregroundStyle(T.t2.color)
+                            HStack(spacing: T.dialogActionsGap) {
+                                ForEach(about.genres, id: \.self) { genre in
+                                    ActionButton(title: genre, small: true) { shell.go(.songs(genre: genre)) }
                                 }
                             }
                         }
-                        if !about.bio.isEmpty {
-                            VStack(alignment: .leading, spacing: T.sheetLabelGap) {
-                                Text(L("About")).font(.navia(T.textSection, .semibold))
-                                Text(about.bio).font(.navia(T.textMD)).foregroundStyle(T.t1.color).lineSpacing(T.px(5)).fixedSize(horizontal: false, vertical: true)
-                            }
+                    }
+                    if !about.bio.isEmpty {
+                        VStack(alignment: .leading, spacing: T.sheetLabelGap) {
+                            Text(L("About")).font(.navia(T.textSection, .semibold))
+                            AboutBody(text: about.bio, ink: shell.theme.linkInk)
                         }
                     }
                 }

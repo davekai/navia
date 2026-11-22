@@ -36,7 +36,7 @@ struct EqualizerPage: View {
                         shell.applyEqualizer()
                     }), accent: theme.accent, label: L("Equalizer"))
                 }
-                SettingsRow(label: L("Output"), hint: L("Each output remembers its own settings on this page."), last: true) {
+                SettingsRow(label: L("Output"), hint: L("Each output remembers its own settings on this page.")) {
                     GlassSelect(shell: shell, label: L("Output"), value: state.output, options: outputOptions, width: T.px(210)) { value in
                         store.updateAndSave { $0.output = value }
                         shell.applyEqualizer()
@@ -50,12 +50,12 @@ struct EqualizerPage: View {
                         PlainSlider(label: L("Preamp"), value: profile.preamp, min: -eqRange, max: eqRange, step: 0.5, look: fillLook(origin: 0),
                                     onChange: { v in edit { $0.preamp = v } }, onEnd: saveAndApply)
                     }
-                    SettingsRow(label: L("Soft limiter"), hint: limiterHint, last: true) {
+                    SettingsRow(label: L("Soft limiter"), hint: limiterHint) {
                         ToggleSwitch(isOn: Binding(get: { profile.limiter }, set: { v in editAndSave { $0.limiter = v } }), accent: theme.accent, label: L("Soft limiter"))
                     }
                 }
                 section(L("Headphone Correction")) {
-                    SettingsRow(label: L("Headphone model"), hint: headphoneHint, last: true) { headphoneControls }
+                    SettingsRow(label: L("Headphone model"), hint: headphoneHint) { headphoneControls }
                 }
                 section(L("Stereo")) {
                     SettingsRow(label: L("Balance"), hint: eqBalanceText(profile.balance)) {
@@ -65,11 +65,11 @@ struct EqualizerPage: View {
                     SettingsRow(label: L("Mono"), hint: L("Plays both channels as one.")) {
                         ToggleSwitch(isOn: Binding(get: { profile.mono }, set: { v in editAndSave { $0.mono = v } }), accent: theme.accent, label: L("Mono"))
                     }
-                    SettingsRow(label: L("Crossfeed"), hint: L("Blends a little of each channel into the other, for easier listening on headphones."), last: !profile.crossfeed) {
+                    SettingsRow(label: L("Crossfeed"), hint: L("Blends a little of each channel into the other, for easier listening on headphones.")) {
                         ToggleSwitch(isOn: Binding(get: { profile.crossfeed }, set: { v in editAndSave { $0.crossfeed = v } }), accent: theme.accent, label: L("Crossfeed"))
                     }
                     if profile.crossfeed {
-                        SettingsRow(label: L("Crossfeed strength"), hint: "\(Int(profile.crossfeedAmount.rounded()))%", last: true) {
+                        SettingsRow(label: L("Crossfeed strength"), hint: "\(Int(profile.crossfeedAmount.rounded()))%") {
                             PlainSlider(label: L("Crossfeed strength"), value: profile.crossfeedAmount, min: 0, max: 100, look: fillLook(origin: nil),
                                         onChange: { v in edit { $0.crossfeedAmount = v } }, onEnd: saveAndApply)
                         }
@@ -108,7 +108,7 @@ struct EqualizerPage: View {
 
     private func fillLook(origin: Double?) -> PlainSlider.Look { .fill(origin: origin, accent: theme.accent) }
 
-    // Edits go through here so a profile's first change creates it with its own filter ids.
+    // so a profile's first change creates it with its own filter ids.
 
     private func edit(_ change: (inout EqProfile) -> Void) {
         store.update { s in
@@ -556,7 +556,7 @@ struct EqGraphView: View {
         .padding(.leading, scaleW)
     }
 
-    /// The band or filter under the pointer. In parametric mode a drag only starts on a filter's dot.
+    /// in parametric mode a drag only starts on a filter's dot.
     private func nearest(_ location: CGPoint, size: CGSize, radius: CGFloat) -> Int? {
         let x = min(1, max(0, location.x / max(1, size.width)))
         if parametric {

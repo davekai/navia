@@ -29,6 +29,7 @@ struct PlayerChipSlot: View {
         } else if let user = player.followingUser {
             let timing = player.listen?.timing
             let label = player.followingWaiting ? L("Waiting for a song you have from {user}", ["user": user])
+                : player.followingSending ? L("Sending to {user}…", ["user": user])
                 : player.followingHeld ? L("Listening along with {user} · paused", ["user": user])
                 : L("Listening along with {user}", ["user": user])
             PlayerChip(symbol: "headphones", label: label, overBar: overBar,
@@ -115,15 +116,9 @@ private extension PlayerChip {
 
 private struct OfferGlass: ViewModifier {
     let overBar: Bool
-    @Environment(\.isSnapshot) private var isSnapshot
     func body(content: Content) -> some View {
-        let tint = overBar ? T.barGlass.color : T.switcherGlass.color
-        Group {
-            if isSnapshot { content.background(Capsule().fill(tint)) } else {
-                content.glassEffect(.regular.tint(tint), in: Capsule())
-            }
-        }
-        .overlay(Capsule().strokeBorder(overBar ? T.glassEdge.color : T.switcherEdge.color, lineWidth: 1).allowsHitTesting(false))
-        .shadow(color: overBar ? .black.opacity(0.35) : .clear, radius: T.px(12), y: T.px(6))
+        content
+            .plainGlass(Capsule(), flat: overBar ? T.floatGlass : T.glassOn)
+            .shadow(color: overBar ? .black.opacity(0.35) : .clear, radius: T.px(12), y: T.px(6))
     }
 }

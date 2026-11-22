@@ -25,7 +25,7 @@ struct SongsPage: View {
             .padding(.trailing, T.gutter + ctx.dockUnder)
             .padding(.top, T.topbarH + T.chipGap)
             .padding(.bottom, T.filterRowGap)
-        PageFrame(shell: shell, nav: .none, title: L("Songs"), detail: narrowed ? Ln("{count} match", "{count} matches", songs.count) : Ln("{count} song", "{count} songs", songs.totalCount), edgeFade: true) {
+        PageFrame(shell: shell, nav: .none, title: L("Songs"), detail: narrowed ? Ln("{count} match", "{count} matches", songs.count) : Ln("{count} song", "{count} songs", songs.totalCount), edgeFade: true, refresh: .library) {
             GlassGroup {
                 SortButton(symbol: "arrow.up.arrow.down", label: L("Sort"), options: SongSort.librarySorts, title: \.label, current: songs.sort) { songs.sort = $0 }
             }

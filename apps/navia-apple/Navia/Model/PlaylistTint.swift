@@ -2,7 +2,7 @@ import AppKit
 import CoreGraphics
 import SwiftUI
 
-/// What a playlist's cover shows right now. When this changes, the page tint is read again.
+/// when this changes, the page tint is read again.
 nonisolated enum PlaylistCoverSource: Hashable, Sendable {
     case image(URL)
     case grid([URL])
@@ -140,7 +140,6 @@ nonisolated func dominantTintHex(rgba: [UInt8]) -> String {
 /// A playlist page's tint from the cover it shows. Neutral until known, then fades in, and cross-fades when the
 /// cover changes.
 struct PlaylistPageTint: View {
-    /// The page's playlist or mix, and what its cover shows.
     let id: String
     let source: PlaylistCoverSource
     /// The last tint this page showed, and for which playlist, so another playlist doesn't inherit it.

@@ -18,7 +18,7 @@ struct ArtistsPage: View {
             return model
         }
         let narrowed = !artists.query.isEmpty || filters.isFiltering
-        PageFrame(shell: shell, nav: .none, title: L("Artists"), detail: narrowed ? Ln("{count} match", "{count} matches", artists.count) : nil, hasRight: any) {
+        PageFrame(shell: shell, nav: .none, title: L("Artists"), detail: narrowed ? Ln("{count} match", "{count} matches", artists.count) : nil, hasRight: any, refresh: .library) {
             LayoutToggle(layout: $layout)
             SearchPill(placeholder: L("Search Artists"), text: Binding(get: { artists.query }, set: { artists.query = $0 }), accent: shell.theme.accent, width: pillSearchWidth(ctx))
         } content: {
@@ -91,9 +91,9 @@ struct ArtistsPage: View {
         } else if artists.count == 0 {
             LibraryEmptyState(library: shell.library, symbol: "music.microphone", title: L("No artists"), hint: L("Artists on the server show up here."))
         } else {
-            LazyCardGrid(count: artists.count) { index in
+            LazyCardGrid(count: artists.count) { index, width in
                 if let artist = artists.artist(at: index) {
-                    ArtistCard(artist: artist, width: T.gridCard) { shell.go(.artist(artist.id)) }
+                    ArtistCard(artist: artist, width: width) { shell.go(.artist(artist.id)) }
                 }
             }
         }
@@ -143,6 +143,7 @@ struct ArtistDetail: View {
             if !songs.isEmpty || latest != nil {
                 columns(songs: songs, latest: latest, needle: needle)
             }
+            if needle.isEmpty { UpcomingShelf(albums: library.upcoming(for: artist), shell: shell) }
             ForEach(parts) { part in
                 Shelf(title: part.section.title, action: needle.isEmpty ? { shell.openAlbums(.artist(artist.id, part.section), sort: .year) } : nil) {
                     let shared = part.albums.sharedNames
@@ -182,6 +183,7 @@ struct ArtistDetail: View {
                 .font(.navia(T.textTitle, .bold)).tracking(-0.026 * T.textTitle)
                 .foregroundStyle(T.tEm.color)
                 .lineLimit(2).truncationMode(.tail)
+                .fullTextHelp(artist.name)
                 .shadow(T.heroTitleShadow)
             actionBar(artist, current: current, radio: radio)
         }
@@ -200,12 +202,12 @@ struct ArtistDetail: View {
         let library = shell.library
         return ActionRow(spacing: T.px(10), pushTrailing: ctx.cssWidth > 900) {
             PlayActions(songs: library.playableSongs(for: artist), shell: shell) {
-                IconButton(symbol: "heart", label: L("Favorite"), active: current.isFavorite, inGlass: true) { shell.library.toggleFavorite(artist: artist.id) }
+                IconButton(symbol: "heart", label: L("Favorite"), active: current.isFavorite, inGlass: true, pop: true) { shell.library.toggleFavorite(artist: artist.id) }
                 if ArtistAbout.of(current, shell: shell) != nil {
                     IconButton(symbol: "info.circle", label: L("About {name}", ["name": artist.name]), inGlass: true) { shell.openAbout(artist.id) }
                 }
                 MenuIconButton(symbol: "ellipsis", label: L("More")) {
-                    [MenuEntry(title: L("Start Artist Radio"), enabled: !radio.isEmpty) { shell.startArtistRadio(artist) },
+                    [MenuEntry(title: L("Artist Radio"), enabled: !radio.isEmpty) { shell.startArtistRadio(artist) },
                      shell.shareEntry(artist: current),
                      SongMenu.info(.artist(artist.id), shell: shell)]
                 }
@@ -234,7 +236,7 @@ struct ArtistDetail: View {
     @ViewBuilder private func songsColumn(_ songs: [SongRow], _ needle: String) -> some View {
         if !songs.isEmpty {
             VStack(alignment: .leading, spacing: T.px(12)) {
-                SectionTitle(title: needle.isEmpty ? L("Top Songs") : L("Songs"))
+                SectionTitle(title: needle.isEmpty ? L("Top Songs") : L("Songs"), action: needle.isEmpty ? { shell.go(.artistTop(artist.id)) } : nil)
                 SongColumnsView(songs: songs, shell: shell, one: true, gutter: 0)
             }
         }
@@ -279,5 +281,62 @@ struct ArtistPhoto: View {
                 guard let url, let image = await ArtworkLoader.shared.load(url, pixels: 600), image.size.height > 0 else { aspect = 1; return }
                 aspect = image.size.width / image.size.height
             }
+    }
+}
+
+/// the server's top songs for an artist that are in the library, in the server's order.
+struct TopSongsPage: View {
+    let shell: ShellModel
+    let id: String
+
+    var body: some View {
+        if let artist = shell.library.artist(id: id) {
+            let top = shell.library.topSongs(for: artist)
+            PageFrame(shell: shell, nav: .icons, edgeFade: true) { TopSongsList(shell: shell, artist: artist, top: top).id(top.map(\.id)) }
+        } else {
+            PageFrame(shell: shell) {
+                PageScroll { EmptyStateView(symbol: "music.microphone", title: L("This artist isn't in your library")) }
+            }
+        }
+    }
+}
+
+/// rebuilt when the server's answer arrives, so its model holds the full list.
+private struct TopSongsList: View {
+    let shell: ShellModel
+    let artist: ArtistRow
+    let top: [SongRow]
+    @State private var holder = Once<any SongsViewModel>()
+    @Environment(\.pageContext) private var ctx
+    @Environment(\.isSnapshot) private var isSnapshot
+
+    var body: some View {
+        let songs = holder.get { shell.library.songs(forArtistTop: top) }
+        let summary = songsAndLength(top.count, seconds: top.reduce(0) { $0 + $1.duration })
+        let header = VStack(alignment: .leading, spacing: T.sectionGap + T.px(6)) {
+            CoverHead(title: L("Top Songs")) {
+                ArtworkView(url: artist.photoURL, kind: .artist, pixels: 600)
+                    .clipShape(RoundedRectangle(cornerRadius: T.rMD, style: .continuous))
+            } meta: {
+                LinkedText(pieces: [LinkPiece(id: 0, text: artist.name, route: .artist(artist.id)), LinkPiece(id: 1, text: " • \(summary)", route: nil)], shell: shell)
+                    .font(.navia(T.textMD))
+            }
+            HStack(spacing: T.px(8)) {
+                PlayActions(songs: top, shell: shell) { EmptyView() }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.leading, ctx.sidebarUnder + T.gutter)
+        .padding(.trailing, T.gutter + ctx.dockUnder)
+        .padding(.top, PagePadding.top)
+        .padding(.bottom, T.sectionGap)
+        .background(alignment: .top) { if let url = artist.photoURL { PageGlow(url: url, windowHeight: ctx.windowHeight) } }
+        if isSnapshot || top.isEmpty {
+            header.frame(maxHeight: .infinity, alignment: .top)
+        } else {
+            SongsTable(songs: songs, shell: shell, revision: songs.revision, editRevision: songs.editRevision,
+                       nowPlayingID: shell.player.current?.id, pageHeader: AnyView(header),
+                       bottomInset: PagePadding.bottom(hasBar: ctx.hasBar), sort: nil)
+        }
     }
 }

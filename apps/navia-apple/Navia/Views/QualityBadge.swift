@@ -16,11 +16,24 @@ nonisolated struct AudioQuality: Equatable, Sendable {
     var source: Source?
     /// The format and bitrate the server transcoded to. Nil for the original file.
     var transcodeFormat: String?
+    /// nil also when the server picks it.
     var transcodeKbps: Int?
+    /// the output device's own rate, where the output can tell
+    var outputRate: Int?
 
     var transcoded: Bool { transcodeFormat != nil }
 
-    /// The badge's text. The bar shortens Hi-Res Lossless to Hi-Res to save room.
+    /// a lossless file shows the wave once, a hi-res one twice; lossy and converted badges none
+    var waves: Int {
+        guard !transcoded else { return 0 }
+        return switch tier {
+        case .hiRes: 2
+        case .lossless: 1
+        case .lossy: 0
+        }
+    }
+
+    /// the bar says Hi-Res for Hi-Res Lossless, to save room.
     @MainActor func label(short: Bool) -> String {
         if let transcodeFormat { return "\(transcodeFormat) \(transcodeKbps.map(String.init) ?? "")".trimmingCharacters(in: .whitespaces) }
         switch tier {
@@ -30,17 +43,26 @@ nonisolated struct AudioQuality: Equatable, Sendable {
         }
     }
 
-    /// Every known fact in one line, like "FLAC · 24-bit · 96 kHz · 2,304 kbps · Stereo".
+    /// the file in one line, like "FLAC · 24-bit · 96 kHz · Stereo"; the bitrate only for lossy files
     @MainActor var detailLine: String {
         var parts = [format]
         if let bitDepth { parts.append(L("{n}-bit", ["n": String(bitDepth)])) }
         if let sampleRate { parts.append(Self.khz(sampleRate)) }
-        if let kbps { parts.append(L("{n} kbps", ["n": fmtInt(kbps)])) }
+        if let kbps, tier == .lossy { parts.append(L("{n} kbps", ["n": fmtInt(kbps)])) }
         if let channels { parts.append(Self.channelsLabel(channels)) }
         return parts.joined(separator: " · ")
     }
 
-    /// Formats a sample rate, such as "44.1 kHz".
+    /// what's heard, like "Original · 48 kHz output"
+    @MainActor var playingLine: String {
+        var parts = [transcodeFormat.map { format in
+            transcodeKbps.map { L("Converted to {format} {bitrate}", ["format": format, "bitrate": L("{n} kbps", ["n": fmtInt($0)])]) }
+                ?? L("Converted to {format}", ["format": format])
+        } ?? L("Original")]
+        if let outputRate { parts.append(L("{rate} output", ["rate": Self.khz(outputRate)])) }
+        return parts.joined(separator: " · ")
+    }
+
     @MainActor static func khz(_ hz: Int) -> String {
         let k = Double(hz) / 1000
         return L("{n} kHz", ["n": abs(k - k.rounded()) < 0.05 ? String(Int(k.rounded())) : String(format: "%.1f", k)])
@@ -71,6 +93,8 @@ struct QualityBadge: View {
     let shell: ShellModel
     /// The bar's smaller, dimmer one.
     var bar = false
+    /// where room is short: the wave stays and the words go
+    var glyphOnly = false
     @State private var probe = WindowFrameProbe()
     @State private var hovering = false
     @State private var hoverTask: Task<Void, Never>?
@@ -82,14 +106,16 @@ struct QualityBadge: View {
     var body: some View {
         if let quality = shell.player.quality {
             let open = shell.popups.quality != nil
+            let text = T.px(bar ? 11.5 : 12)
             HStack(spacing: T.px(4)) {
                 if quality.transcoded {
                     Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: T.px(9), weight: .bold)).opacity(0.75)
                 }
-                Text(quality.label(short: bar))
+                if quality.waves > 0 { LosslessGlyph(text: text, twin: quality.waves > 1) }
+                if !(glyphOnly && quality.waves > 0) { Text(quality.label(short: bar)) }
             }
-            .font(.navia(T.px(bar ? 11.5 : 12), .medium).monospacedDigit())
-            // The dock and expanded player's badge uses the time row's color.
+            .font(.navia(text, .medium).monospacedDigit())
+            // The dock and expanded player's badge takes the time row's own color.
             .foregroundStyle(bar ? AnyShapeStyle(open || hovering ? T.t1.color : T.t2.color) : AnyShapeStyle(.foreground))
             .padding(.horizontal, T.px(bar ? 5 : 6))
             .frame(height: T.px(bar ? 17 : 18))
@@ -130,8 +156,30 @@ struct QualityBadge: View {
     }
 }
 
-/// The badge's details in a float panel centered above the badge. A click outside or Esc closes a pinned one.
-/// One opened by hover closes when the pointer leaves both.
+/// the system's wave symbol at the badge text's weight; hi-res stacks the same wave twice
+private struct LosslessGlyph: View {
+    let text: CGFloat
+    let twin: Bool
+
+    var body: some View {
+        let size = text * T.qualityGlyph, gap = text * T.qualityGlyphTwinGap
+        ZStack {
+            if twin {
+                wave(size).offset(y: -gap / 2)
+                wave(size).offset(y: gap / 2)
+            } else {
+                wave(size)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func wave(_ size: CGFloat) -> some View {
+        Image(systemName: "alternatingcurrent").font(.system(size: size, weight: .medium))
+    }
+}
+
+/// A click outside or Esc closes a pinned one; one opened by hover closes when the pointer leaves both.
 struct QualityPopoverLayer: View {
     let shell: ShellModel
     let request: PopupCenter.QualityRequest
@@ -140,7 +188,7 @@ struct QualityPopoverLayer: View {
 
     var body: some View {
         if let quality = shell.player.quality {
-            let edge = T.px(10), gap = T.px(8)
+            let edge = T.qualityPopEdge, gap = T.qualityPopGap
             let x = max(edge, min(request.anchor.midX - size.width / 2, windowSize.width - size.width - edge))
             let above = request.anchor.minY - gap - size.height
             let y = above >= edge ? above : request.anchor.maxY + gap
@@ -164,33 +212,26 @@ struct QualityPopoverLayer: View {
 
     private func details(_ q: AudioQuality) -> some View {
         let from = q.source.map(AudioQuality.sourceLabel)
-        return Grid(alignment: .topLeading, horizontalSpacing: T.px(14), verticalSpacing: T.px(7)) {
-            if let format = q.transcodeFormat {
-                row(L("Playing"), "\(format) · \(L("{n} kbps", ["n": fmtInt(q.transcodeKbps ?? 0)]))", note: L("Transcoded by the server"))
-                row(L("Original"), q.detailLine)
-            } else {
-                row(L("Playing"), q.detailLine, note: L("The original file"))
-            }
+        return Grid(alignment: .topLeading, horizontalSpacing: T.qualityPopColGap, verticalSpacing: T.qualityPopRowGap) {
+            row(L("File"), q.detailLine)
+            row(L("Playing"), q.playingLine)
             if let from { row(L("From||where a song plays from"), from) }
         }
         .font(.navia(T.textXS).monospacedDigit())
         .foregroundStyle(T.t1.color)
-        .padding(.top, T.px(10))
-        .padding(.horizontal, T.px(14))
-        .padding(.bottom, T.px(11))
-        .frame(maxWidth: T.px(400), alignment: .leading)
+        .padding(.top, T.qualityPopPadTop)
+        .padding(.horizontal, T.qualityPopPadX)
+        .padding(.bottom, T.qualityPopPadBottom)
+        .frame(maxWidth: T.qualityPopMaxW, alignment: .leading)
         .floatPanel()
         .accessibilityElement(children: .combine)
         .accessibilityLabel(L("Audio details"))
     }
 
-    private func row(_ label: String, _ value: String, note: String? = nil) -> some View {
+    private func row(_ label: String, _ value: String) -> some View {
         GridRow {
             Text(label).foregroundStyle(T.t2.color)
-            VStack(alignment: .leading, spacing: T.px(1)) {
-                Text(value)
-                if let note { Text(note).foregroundStyle(T.t2.color) }
-            }
+            Text(value)
         }
     }
 }

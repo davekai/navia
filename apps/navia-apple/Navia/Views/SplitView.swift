@@ -73,8 +73,8 @@ struct SplitItem<Art: View>: View {
             HStack(spacing: T.splitRowGap) {
                 art.frame(width: T.splitArt, height: T.splitArt)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(title).font(.navia(T.textMD, .medium)).lineLimit(1)
-                    Text(subtitle).font(.navia(T.textMD)).foregroundStyle(T.t2.color).lineLimit(1)
+                    Text(title).font(.navia(T.textMD, .medium)).lineLimit(1).fullTextHelp(title)
+                    Text(subtitle).font(.navia(T.textMD)).foregroundStyle(T.t2.color).lineLimit(1).fullTextHelp(subtitle)
                 }
                 Spacer(minLength: 0)
             }

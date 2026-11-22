@@ -119,7 +119,6 @@ struct CachedSongsPage: View {
         }
     }
 
-    /// The selection when the row is in it, else the row.
     private func chosenOr(_ index: Int, _ rows: [CachedSong]) -> [CachedSong] {
         let picked = selection.selected.contains(index) ? selection.selected.sorted() : [index]
         return picked.filter { $0 < rows.count }.map { rows[$0] }

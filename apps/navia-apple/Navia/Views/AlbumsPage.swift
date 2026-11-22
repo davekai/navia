@@ -34,7 +34,7 @@ struct AlbumsPage: View {
             return model
         }
         let genres = shell.library.genres
-        PageFrame(shell: shell, nav: .none, title: heading, detail: ownerName, edgeFade: layout == PageLayout.split.rawValue && albums.count > 0) {
+        PageFrame(shell: shell, nav: .none, title: heading, detail: ownerName, edgeFade: layout == PageLayout.split.rawValue && albums.count > 0, refresh: .library) {
             GlassGroup {
                 SortButton(symbol: "arrow.up.arrow.down", label: L("Sort"), options: sorts, title: \.label, current: albums.sort) { albums.sort = $0 }
                 GlassDivider()
@@ -70,9 +70,9 @@ struct AlbumsPage: View {
 
     private func grid(_ albums: any AlbumsViewModel) -> some View {
         PageScroll {
-            LazyCardGrid(count: albums.count) { index in
+            LazyCardGrid(count: albums.count) { index, width in
                 if let album = albums.album(at: index) {
-                    AlbumCard(album: album, width: T.gridCard, byArtist: byArtist, shell: shell) { shell.go(.album(album.id)) }
+                    AlbumCard(album: album, width: width, byArtist: byArtist, shell: shell) { shell.go(.album(album.id)) }
                 }
             }
         }

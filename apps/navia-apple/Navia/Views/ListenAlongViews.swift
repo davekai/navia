@@ -62,7 +62,7 @@ struct PersonRow: View {
                             Text(entry.user).font(.navia(T.textMD, .medium)).foregroundStyle(T.tNav.color).lineLimit(1)
                             LiveMark(state: entry.state, accent: shell.theme.accent)
                         }
-                        Text("\(song.title) – \(song.artist)").font(.navia(T.textXS)).foregroundStyle(T.t3.color).lineLimit(1).truncationMode(.tail)
+                        Text("\(song.title) – \(song.artist)").font(.navia(T.textXS)).foregroundStyle(T.tNav.color).lineLimit(1).truncationMode(.tail)
                     }
                     Spacer(minLength: 0)
                 }
@@ -92,7 +92,15 @@ struct ListenAlongLayer: View {
     let shell: ShellModel
 
     var body: some View {
-        if let listen = shell.player.listen, let entry = listen.listing.first(where: { $0.user == user }) {
+        if let listen = shell.player.listen, listen.listensAlongWithMe(user) {
+            // following them back would make two people follow each other
+            DialogLayer(title: L("{user} is listening along with you", ["user": user]), dismiss: { shell.closeListenAlong() }) {
+                DialogText(text: L("{user} already hears what you play, so you’re listening together.", ["user": user]))
+                DialogActions {
+                    ActionButton(title: L("Done"), kind: .prominent(tint: shell.theme.accent)) { shell.closeListenAlong() }
+                }
+            }
+        } else if let listen = shell.player.listen, let entry = listen.listing.first(where: { $0.user == user }) {
             let song = SongRow(core: entry.song)
             let vars = ["user": user, "song": song.title, "artist": song.artist]
             let own = shell.player.followingUser == nil && shell.player.station == nil ? shell.player.current?.title : nil
@@ -178,7 +186,7 @@ struct FriendRow: View {
                             if song != nil { LiveMark(state: .playing, accent: shell.theme.accent) }
                         }
                         Text(song != nil ? line : "\(L("Not in your library")) · \(line)")
-                            .font(.navia(T.textXS)).foregroundStyle(T.t3.color).lineLimit(1).truncationMode(.tail)
+                            .font(.navia(T.textXS)).foregroundStyle(T.tNav.color).lineLimit(1).truncationMode(.tail)
                     }
                     Spacer(minLength: 0)
                 }

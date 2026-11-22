@@ -2,7 +2,7 @@ import AppKit
 import NaviaCoreFFI
 import SwiftUI
 
-/// One choice in a `GlassSelect`. Groups show as headings, in the order of the options.
+/// groups show as headings, in the order of the options.
 struct SelectOption: Identifiable, Equatable {
     var value: String
     var label: String
@@ -10,13 +10,13 @@ struct SelectOption: Identifiable, Equatable {
     var id: String { value }
 }
 
-/// The floating list a `GlassSelect` opens, drawn by `RootView` above every page.
+/// drawn by `RootView` above every page.
 @Observable final class PopupCenter {
     struct Request {
         let label: String
         let value: String
         let options: [SelectOption]
-        /// The pill's frame in window coordinates, from the top left.
+        /// window coordinates, from the top left.
         let anchor: CGRect
         let choose: (String) -> Void
     }
@@ -207,6 +207,7 @@ struct SelectPopupLayer: View {
                         .onKeyPress(.downArrow) { step(1) }
                         .onKeyPress(.return) { commit() }
                         .onKeyPress(.escape) { center.close(); return .handled }
+                    SearchClearButton(text: $query, size: T.searchClearSM)
                 }
                 .padding(.horizontal, T.px(11))
                 .frame(height: T.px(34))

@@ -44,10 +44,16 @@ enum AccountMenu {
         header.view = AccountHeaderView(name: user, host: host)
         var privateMode = MenuEntry(title: L("Private Mode"), checked: shell.player.privateMode) { shell.player.privateMode.toggle() }
         privateMode.isSwitch = true
+        var offline = MenuEntry(title: L("Offline"), checked: shell.library.offlineSwitch) {
+            let on = !shell.library.offlineSwitch
+            shell.library.setOfflineSwitch(on)
+            if !on { shell.player.retryServer() }
+        }
+        offline.isSwitch = true
         var settings = MenuEntry(title: L("Settings…")) { shell.openSettings() }
         settings.shortcut = ","
         return [
-            header, .divider, privateMode, .divider, settings,
+            header, .divider, privateMode, offline, .divider, settings,
             MenuEntry(title: L("Change Server"), enabled: switchable, reason: reason) { shell.expanded = false; shell.openChangeServer() },
             MenuEntry(title: L("Sign Out"), enabled: switchable, reason: reason) { shell.requestSignOut() },
         ]
@@ -57,7 +63,7 @@ enum AccountMenu {
 /// The menu's first row: the initial in a small circle, the username, and the host.
 private final class AccountHeaderView: NSView {
     init(name: String, host: String) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 260, height: 48))
+        super.init(frame: NSRect(x: 0, y: 0, width: T.menuHeaderW, height: T.menuHeaderH))
         let hosting = NSHostingView(rootView: AccountHeader(name: name, host: host))
         hosting.translatesAutoresizingMaskIntoConstraints = false
         addSubview(hosting)
@@ -77,19 +83,19 @@ private struct AccountHeader: View {
     let host: String
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: T.menuGap) {
             Text(name.trimmingCharacters(in: .whitespaces).first.map { String($0).uppercased() } ?? "?")
-                .font(.system(size: 13, weight: .semibold))
-                .frame(width: 30, height: 30)
+                .font(.system(size: T.menuText, weight: .semibold))
+                .frame(width: T.menuAvatar, height: T.menuAvatar)
                 .background(Circle().fill(Color.primary.opacity(0.12)))
                 .overlay(Circle().strokeBorder(Color.primary.opacity(0.16), lineWidth: 1))
             VStack(alignment: .leading, spacing: 1) {
-                Text(name).font(.system(size: 13, weight: .semibold)).lineLimit(1).truncationMode(.tail)
-                Text(host).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Text(name).font(.system(size: T.menuText, weight: .semibold)).lineLimit(1).truncationMode(.tail)
+                Text(host).font(.system(size: T.menuDetailText)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 14)
-        .frame(width: 260, height: 48, alignment: .leading)
+        .padding(.horizontal, T.menuContentInset)
+        .frame(width: T.menuHeaderW, height: T.menuHeaderH, alignment: .leading)
     }
 }

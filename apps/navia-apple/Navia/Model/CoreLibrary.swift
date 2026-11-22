@@ -36,8 +36,9 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
     @ObservationIgnored private let songsModel: CoreSongsModel
     @ObservationIgnored private var memo: [String: Any] = [:]
     @ObservationIgnored private var loading = Set<String>()
-    /// Bumped whenever `memo` is emptied, so a value still loading from before is dropped when it lands.
-    @ObservationIgnored private var memoGeneration = 0
+    /// keys whose load was started before the data changed (`forgetMemo`, `refreshMemo`): the value shows when it
+    /// lands, and is loaded again on the next read.
+    @ObservationIgnored private var outdated = Set<String>()
     @ObservationIgnored private var bumpPending = false
     @ObservationIgnored private var liveLists = NSHashTable<AnyObject>.weakObjects()
     @ObservationIgnored private var albumCache: [String: AlbumRow] = [:]
@@ -55,19 +56,22 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
     }
     private(set) var synced: SyncedDownloads?
     private var syncFailed = false
-    /// From `NaviaCore.syncProgress`, refreshed on each `syncMeter` event.
+    /// refreshed on each `syncMeter` event.
     private(set) var syncProgress: SyncProgressRow?
     private var syncMeterViews = 0
     var syncMeterOnPage: Bool { syncMeterViews > 0 }
     func syncMeterVisible(_ on: Bool) { syncMeterViews = max(0, syncMeterViews + (on ? 1 : -1)) }
     private func refreshSyncProgress() {
+        let running = core?.syncProgress(showAfterMs: 0) != nil
+        if running != syncRunning { syncRunning = running }
         let next = core?.syncProgress(showAfterMs: UInt64(T.syncShowAfter * 1000))
         if next?.stage != syncProgress?.stage || next?.done != syncProgress?.done || next?.total != syncProgress?.total || (next == nil) != (syncProgress == nil) {
             syncProgress = next
         }
     }
 
-    var isOffline: Bool { core != nil && connected == false }
+    var isOffline: Bool { core != nil && (connected == false || offlineSwitch) }
+    private(set) var offlineSwitch = false
 
     var state: LibraryState {
         _ = songsModel.totalCount
@@ -192,6 +196,9 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
             Task { @MainActor in self?.onDownloadEvent(event) }
         })
         refreshDownloads()
+        // before the background starts, so a launch with the switch on never tries the server
+        offlineSwitch = UserDefaults.standard.bool(forKey: AccountPrefs.key("offline"))
+        opened.setOffline(on: offlineSwitch)
         opened.startBackground(listener: CoreBackgroundEvents { [weak self] event in
             Task { @MainActor in self?.onCoreEvent(event) }
         })
@@ -221,6 +228,39 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
 
     func retryConnection() async -> Bool { await probe() }
 
+    private var refreshing = false
+    /// any library sync runs, shown on the meter or not.
+    private var syncRunning = false
+
+    func refreshNow() {
+        guard let core, !refreshing else { return }
+        refreshing = true
+        Task {
+            // a change sends `syncDone`, which reloads everything built from the library
+            do { _ = try await core.checkForChanges() } catch { Log.library.error("refresh failed: \(String(describing: error), privacy: .public)") }
+            refreshMemo("stations")
+            scheduleBump()
+            refreshing = false
+        }
+    }
+
+    func isRefreshing(library: Bool) -> Bool { refreshing || library && syncRunning }
+
+    func setOfflineSwitch(_ on: Bool) {
+        guard let core, on != offlineSwitch else { return }
+        offlineSwitch = on
+        UserDefaults.standard.set(on, forKey: AccountPrefs.key("offline"))
+        core.setOffline(on: on)
+        if on {
+            retryTask?.cancel()
+            retryTask = nil
+            if connected != false { refreshCachedSongs() }
+            connected = false
+        } else {
+            Task { await probe() }
+        }
+    }
+
     @discardableResult private func probe() async -> Bool {
         guard let core, !probing else { return connected != false }
         probing = true
@@ -239,9 +279,9 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
         return ok
     }
 
-    /// While offline, keeps checking so the row clears by itself when the server returns.
+    /// so the row clears by itself when the server returns.
     private func scheduleRetry() {
-        guard retryTask == nil else { return }
+        guard retryTask == nil, !offlineSwitch else { return }
         retryTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(15))
@@ -280,6 +320,9 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
             syncFailed = true
         case .loginRejected:
             onLoginRejected?()
+        case .forYouChanged:
+            refreshMemo("forYou:\(Self.localDay())")
+            scheduleBump()
         case .syncDone:
             refreshSyncProgress()
             AppTimeline.mark("syncDone")
@@ -326,7 +369,7 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
         }
     }
 
-    /// Remembers a star that couldn't reach the server. With reporting on, the server holds it.
+    /// with reporting on, the server holds it.
     private func noteLocalStar(_ key: String, _ on: Bool) {
         guard core?.reportsPlays() == false else { return }
         localStars[key] = on
@@ -357,31 +400,30 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
         let fallback = (stale[key] as? T) ?? fallback
         guard let core, loading.insert(key).inserted else { return fallback }
         _ = core
-        let generation = memoGeneration
         Task.detached(priority: .utility) { [weak self] in
             let value = load()
-            await MainActor.run { self?.memoLanded(key, value, generation: generation) }
+            await MainActor.run { self?.memoLanded(key, value) }
         }
         return fallback
     }
 
-    /// Values being reloaded after `refreshMemo`, shown until the new ones land.
     @ObservationIgnored private var stale: [String: Any] = [:]
 
     /// Reloads a cached value while the old one keeps showing. A playlist change must not empty the sidebar, even
     /// briefly, or its scroll jumps to the top.
     private func refreshMemo(_ key: String) {
         if let old = memo.removeValue(forKey: key) { stale[key] = old }
+        if loading.contains(key) { outdated.insert(key) }
     }
 
     private func memoizedRemote<T: Sendable>(_ key: String, fallback: T, _ load: @escaping @Sendable () async -> T) -> T {
         _ = dataRevision
         if let hit = memo[key] as? T { return hit }
+        let fallback = (stale[key] as? T) ?? fallback
         guard core != nil, loading.insert(key).inserted else { return fallback }
-        let generation = memoGeneration
         Task.detached(priority: .utility) { [weak self] in
             let value = await load()
-            await MainActor.run { self?.memoLanded(key, value, generation: generation) }
+            await MainActor.run { self?.memoLanded(key, value) }
         }
         return fallback
     }
@@ -389,17 +431,20 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
     /// Empties the cache after the library changes or the day turns. Loads already running are dropped when
     /// they land and asked again on the next read.
     private func forgetMemo() {
+        stale.merge(memo) { _, new in new }
         memo.removeAll()
-        loading.removeAll()
-        memoGeneration &+= 1
+        outdated.formUnion(loading)
     }
 
-    /// Stores a loaded value, unless it was started before the last `forgetMemo`.
-    private func memoLanded(_ key: String, _ value: Any, generation: Int? = nil) {
-        if let generation, generation != memoGeneration { return }
-        memo[key] = value
-        stale[key] = nil
+    /// stores a loaded value; one started before the data changed only stands in until it's loaded again.
+    private func memoLanded(_ key: String, _ value: Any) {
         loading.remove(key)
+        if outdated.remove(key) != nil {
+            stale[key] = value
+        } else {
+            memo[key] = value
+            stale[key] = nil
+        }
         scheduleBump()
     }
 
@@ -625,42 +670,15 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
         }
     }
 
-    /// Essentials ask the server one artist at a time, because each answer can mean an external lookup.
+    /// Essentials from the core (`library::essentials`): it asks the server about the top artists a few at once and
+    /// keeps each answer for the day, so a relaunch shows today's tiles at once.
     func essentialsArtists(limit: Int) -> [ArtistRow] {
-        guard !isTestRun else { return [] }
-        return essentials(limit: limit, minimum: 8)
-    }
-
-    private func essentials(limit: Int, minimum: Int) -> [ArtistRow] {
-        _ = dataRevision
-        let found = playedArtists(limit: 80).filter { candidate in
-            (memo["top:\(candidate.artist.id)"] as? [SongRow])?.count ?? 0 >= minimum
-        }
-        walkTopSongs(limit: limit, minimum: minimum, found: found.count)
-        return found.prefix(limit).map { applied($0.artist) }
-    }
-
-    @ObservationIgnored private var walkRunning = false
-
-    private func walkTopSongs(limit: Int, minimum: Int, found: Int) {
-        guard !walkRunning, found < limit, !isTestRun, let core else { return }
-        walkRunning = true
-        let candidates = playedArtists(limit: 80).map(\.artist)
-        Task { [weak self] in
-            for artist in candidates {
-                guard let self else { return }
-                let key = "top:\(artist.id)"
-                if self.memo[key] == nil {
-                    let rows = (try? await core.topSongs(artistId: artist.id, artistName: artist.name)) ?? []
-                    var seen = Set<String>()
-                    let songs = rows.map { SongRow(core: $0) }.filter { seen.insert($0.title.lowercased().trimmingCharacters(in: .whitespaces)).inserted }
-                    self.memoLanded(key, songs)
-                }
-                let done = self.playedArtists(limit: 80).filter { ($0.topCount(in: self.memo) ?? 0) >= minimum }.count
-                if done >= limit { break }
-            }
-            self?.walkRunning = false
-        }
+        guard !isTestRun, let core else { return [] }
+        let day = Self.localDay()
+        let stored = memoized("essentialsStored:\(day)", fallback: [String]()) { core.essentialArtists() }
+        let ids = memoizedRemote("essentials:\(day)", fallback: stored) { await core.refreshEssentialArtists() }
+        let byID = Dictionary(playedArtists(limit: 200).map { ($0.artist.id, $0.artist) }, uniquingKeysWith: { first, _ in first })
+        return ids.compactMap { byID[$0] }.prefix(limit).map(applied)
     }
 
     func essentialsSongs(for artist: ArtistRow) -> [SongRow] { topSongRows(artist).map { collection.apply($0) } }
@@ -758,8 +776,8 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
     /// day's mixes and similar artists. Test runs use only what's stored.
     func forYou() -> ForYouRows? {
         guard let core else { return nil }
-        // Not optional, because a missing memo entry would cast to nil and count as found.
-        var rows = memoizedRemote("forYou:\(Self.localDay())", fallback: ForYouRows(loaded: false)) { ForYouRows(core: await core.refreshForYou()) }
+        // Not an optional value: a missing memo entry casts to an optional's nil and would count as found.
+        var rows = memoized("forYou:\(Self.localDay())", fallback: ForYouRows(loaded: false)) { ForYouRows(core: core.forYou()) }
         guard rows.loaded else { return nil }
         rows.newToYou = rows.newToYou.map(applied)
         rows.unplayed = rows.unplayed.map(applied)
@@ -779,7 +797,14 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
         return model
     }
 
-    /// Recomputes rows keyed by the local day when the day changes, so they turn over together.
+    func songs(forArtistTop rows: [SongRow]) -> any SongsViewModel {
+        let model = LocalSongsModel(rows: rows, collection: collection, defaultSort: .order, sortable: false)
+        model.downloader = { [weak self] songs, on in self?.setDownloaded(songs: songs, on) }
+        model.toggle = { [weak self] id in self?.toggleStar(song: id) }
+        return model
+    }
+
+    /// day-keyed rows are worked out again when the day changes; the core's clock decides, so they turn over together.
     private func watchDay() {
         Task { [weak self] in
             var day = Self.localDay()
@@ -852,6 +877,63 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
         }
         guard let more = found.first else { return nil }
         return MoreBy(artist: applied(more.artist), albums: more.albums.map(applied), section: more.section)
+    }
+
+    func albumHeat(album: AlbumRow) -> [String: UInt64] {
+        guard let core, core.deezerRecommendations() == true else { return [:] }
+        let id = album.id
+        return memoizedRemote("albumHeat:\(id)", fallback: Self.ranks(core.keptAlbumHeat(albumId: id))) {
+            Self.ranks(await core.albumHeat(albumId: id))
+        }
+    }
+
+    func reaskMissingHeat(album: AlbumRow) {
+        let key = "albumHeat:\(album.id)"
+        guard (memo[key] as? [String: UInt64])?.isEmpty == true else { return }
+        memo[key] = nil
+        _ = albumHeat(album: album)
+    }
+
+    private nonisolated static func ranks(_ rows: [SongHeatRow]) -> [String: UInt64] {
+        Dictionary(rows.map { ($0.songId, $0.rank) }, uniquingKeysWith: max)
+    }
+
+    /// test runs only read what's kept.
+    func upcoming(for artist: ArtistRow) -> [UpcomingAlbum] {
+        guard let core, core.deezerRecommendations() == true else { return [] }
+        let id = artist.id
+        return memoizedRemote("upcoming:\(id)", fallback: [UpcomingAlbum]()) { await core.upcomingForArtist(artistId: id).map(UpcomingAlbum.init(core:)) }
+    }
+
+    func upcomingHome() -> [UpcomingAlbum] {
+        guard let core, core.deezerRecommendations() == true else { return [] }
+        return memoizedRemote("upcomingHome", fallback: [UpcomingAlbum]()) { await core.upcomingHome().map(UpcomingAlbum.init(core:)) }
+    }
+
+    func upcomingMatching(_ query: String) -> [UpcomingAlbum] {
+        guard let core, core.deezerRecommendations() == true else { return [] }
+        return core.upcomingMatching(query: query).map(UpcomingAlbum.init(core:))
+    }
+
+    func upcomingPage(_ id: UInt64) -> UpcomingPageState {
+        guard let core, core.deezerRecommendations() == true else { return .missing }
+        let page = memoizedRemote("upcomingPage:\(id)", fallback: UpcomingPageState.loading) {
+            switch await core.upcomingPage(id: id) {
+            case .upcoming(let album)?: .upcoming(UpcomingAlbum(core: album))
+            case .onServer(let albumId)?: .onServer(albumId)
+            case nil: .missing
+            }
+        }
+        guard case .upcoming(var album) = page else { return page }
+        album.tracks = album.tracks.map { album.unavailable.contains($0.id) ? $0 : collection.apply($0) }
+        return .upcoming(album)
+    }
+
+    func songs(forUpcoming album: UpcomingAlbum) -> any SongsViewModel {
+        let model = LocalSongsModel(rows: album.tracks, collection: collection, defaultSort: .order)
+        model.downloader = { [weak self] songs, on in self?.setDownloaded(songs: songs, on) }
+        model.toggle = { [weak self] id in self?.toggleStar(song: id) }
+        return model
     }
 
     func songs(by artist: ArtistRow, matching query: String) -> [SongRow] {
@@ -1029,6 +1111,7 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
     }
 
     func toggleFavorite(song: SongRow) { toggleStar(song: song.id) }
+    func isFavorite(song: SongRow) -> Bool { collection.favoriteSongs.contains(song.id) }
     func isDownloaded(song: SongRow) -> Bool { collection.downloadedSongs.contains(song.id) }
     func playsOffline(song: SongRow) -> Bool {
         isDownloaded(song: song) || cachedSongs.contains(song.id) || core?.isSongCached(id: song.id) == true
@@ -1138,6 +1221,31 @@ private nonisolated final class DownloadEvents: DownloadListener, @unchecked Sen
         return problem.map(Self.detailsProblem)
     }
 
+    func playlistSongsNow(id: String) -> [SongRow] { core?.playlistSongs(id: id).map { SongRow(core: $0) } ?? [] }
+
+    func playlistSongsToPlay(id: String) async -> [SongRow] {
+        guard let core else { return [] }
+        return await Task.detached(priority: .userInitiated) {
+            let stored = core.playlistSongs(id: id)
+            if !stored.isEmpty { return stored.map { SongRow(core: $0) } }
+            _ = try? await core.refreshPlaylist(id: id)
+            return core.playlistSongs(id: id).map { SongRow(core: $0) }
+        }.value
+    }
+
+    func deletePlaylist(id: String) async -> String? {
+        guard let core else { return L("Deleting a playlist needs the server.") }
+        let problem: String?
+        do { problem = try await core.deletePlaylist(id: id) } catch { problem = "\(error)" }
+        refreshMemo("playlists")
+        scheduleBump()
+        guard let problem else { return nil }
+        if problem.hasPrefix("Test and read-only") { return L("Test and read-only runs can't change playlists.") }
+        let prefix = "The server didn't delete it: "
+        return problem.hasPrefix(prefix) ? L("The server didn't delete it: {error}", ["error": String(problem.dropFirst(prefix.count))]) : problem
+    }
+
+    /// The core's English reasons, in the user's language.
     private static func detailsProblem(_ text: String) -> String {
         if text.hasPrefix("Test and read-only") { return L("Test and read-only runs can't change playlists.") }
         let prefix = "The server didn't save the change: "
@@ -1178,7 +1286,6 @@ nonisolated struct CoreRanked: Sendable {
     let plays: Int
     let ownAlbums: Int
 
-    func topCount(in memo: [String: Any]) -> Int? { (memo["top:\(artist.id)"] as? [SongRow])?.count }
     func similarCount(in memo: [String: Any]) -> Int? { (memo["similar:\(artist.id)"] as? [SongRow])?.count }
 }
 

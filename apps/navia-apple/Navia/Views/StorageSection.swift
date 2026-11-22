@@ -12,7 +12,7 @@ struct StorageSection: View {
             } else {
                 SettingsRow(label: L("Song cache"), hint: L("Needs a connection to the server."), dim: true) { DisabledPill(value: StorageSettings.limitLabel(2_000_000_000)) }
                 downloads(bytes: nil)
-                SettingsRow(label: L("Clear cache"), hint: L("Removes cached songs, artwork and lyrics. Downloads and your library stay."), dim: true, last: true) {
+                SettingsRow(label: L("Clear cache"), hint: L("Removes cached songs, artwork and lyrics. Downloads and your library stay."), dim: true) {
                     ActionButton(title: L("Clear Cache"), compact: true, enabled: false) {}
                 }
             }
@@ -31,7 +31,7 @@ struct StorageSection: View {
         SettingsRow(label: L("Artwork"), hint: nil) { value(usage.map { StorageSettings.sizeLabel($0.artworkBytes) } ?? "") }
         SettingsRow(label: L("Lyrics"), hint: nil) { value(usage.map { StorageSettings.sizeLabel($0.lyricsBytes) } ?? "") }
         downloads(bytes: usage?.downloadsBytes)
-        SettingsRow(label: L("Clear cache"), hint: L("Removes cached songs, artwork and lyrics. Downloads and your library stay."), last: true) {
+        SettingsRow(label: L("Clear cache"), hint: L("Removes cached songs, artwork and lyrics. Downloads and your library stay.")) {
             ActionButton(title: L("Clear Cache"), compact: true) {
                 shell.confirm(ConfirmRequest(title: L("Clear the cache?"), message: L("Cached songs, artwork and lyrics are removed from this device. Downloads and your library stay, and anything removed comes from the server again when it's needed."),
                                              confirmTitle: L("Clear Cache"), compact: true) { storage.clear() })

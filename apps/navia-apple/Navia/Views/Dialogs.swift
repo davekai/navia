@@ -41,8 +41,7 @@ extension View {
     /// shows, so the dialog's own color is laid inside it to keep the panel dark.
     func dialogPanel(_ shape: RoundedRectangle) -> some View {
         self
-            .glassPanel(radius: T.rLG, tint: T.dialogGlass, veil: T.dialogGlass)
-            .overlay(shape.strokeBorder(T.glassEdge.color, lineWidth: 1).allowsHitTesting(false))
+            .plainGlass(shape, flat: T.floatGlass)
             .shadow(T.shadowFloat)
             .contentShape(Rectangle())
             .onTapGesture {}
@@ -108,8 +107,8 @@ struct DialogSheet<Head: View, Content: View, Actions: View>: View {
 /// glass, with the text overlapping the fade, and it all scrolls together. A round close button floats at the top
 /// left. Without a picture the text starts the sheet, clear of the close button.
 struct DialogCoverSheet<Content: View>: View {
-    let url: URL?
-    var kind: ArtworkKind = .artist
+    /// fills the band at the top, already cropped to its focus.
+    let art: AnyView?
     let dismiss: () -> Void
     @ViewBuilder var content: Content
     @State private var bodyHeight: CGFloat = 0
@@ -124,15 +123,15 @@ struct DialogCoverSheet<Content: View>: View {
                 ZStack(alignment: .topLeading) {
                     ScrollView(.vertical) {
                         VStack(alignment: .leading, spacing: 0) {
-                            if let url {
-                                ArtworkView(url: url, kind: kind, pixels: 1200, focusY: T.sheetCoverFocusY)
+                            if let art {
+                                art
                                     .frame(height: T.sheetCoverH)
                                     .mask(LinearGradient(stops: [.init(color: .black, location: T.sheetCoverFadeFrom), .init(color: .clear, location: 1)], startPoint: .top, endPoint: .bottom))
                                     .padding(.bottom, -T.sheetCoverOverlap)
                             }
                             content
                                 .padding(.horizontal, T.dialogPad)
-                                .padding(.top, url == nil ? T.dialogGap : 0)
+                                .padding(.top, art == nil ? T.dialogGap : 0)
                                 .padding(.bottom, T.dialogPad)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -225,7 +224,7 @@ struct DialogPin: View {
             .frame(width: T.pinBoxW, height: T.pinBoxH)
             .background(shape.fill(T.glass.color))
             .overlay(shape.strokeBorder(T.glassEdge.color, lineWidth: 1))
-            .overlay(shape.strokeBorder((invalid ? T.invalidRing : accent).color, lineWidth: invalid ? T.invalidRingWidth : T.focusRingWidth).padding(invalid ? -T.invalidRingWidth : -T.focusRingWidth).opacity(invalid || current ? 1 : 0))
+            .overlay(shape.strokeBorder((invalid ? T.invalidRing : accent).color, lineWidth: invalid ? T.invalidRingW : T.focusRingWidth).padding(invalid ? -T.invalidRingW : -T.focusRingWidth).opacity(invalid || current ? 1 : 0))
             .opacity(disabled ? T.disabledOpacity : 1)
     }
 }
@@ -306,8 +305,16 @@ struct NewPlaylistLayer: View {
         self.shell = shell
         _name = State(initialValue: shell.newPlaylistSeed?.name ?? "")
         smartCriteria = shell.smartSaveAs
-        songs = smartCriteria == nil ? shell.newPlaylistSeed?.songs : nil
+        songs = smartCriteria == nil ? shell.newPlaylistSeed.flatMap { $0.songs.isEmpty ? nil : $0.songs } : nil
+        covers = smartCriteria == nil && shell.library.canChangePlaylistImages
+        _slot = State(initialValue: shell.coverSlotSeed ?? Self.slots.upload + 1)
     }
+    private static let slots = CoverSlots(current: false)
+    private let covers: Bool
+    @State private var slot: Int
+    @State private var picked: URL?
+    @State private var description = ""
+    @State private var isPublic = false
     @State private var creating = false
     @State private var problem: String?
 
@@ -316,8 +323,18 @@ struct NewPlaylistLayer: View {
     var body: some View {
         DialogLayer(title: smartCriteria == nil ? L("New Playlist") : L("Save As"), dismiss: { shell.closeNewPlaylist() }) {
             if smartCriteria != nil { DialogText(text: L("Saves these rules as a new smart playlist of your own. The original stays as it is.")) }
+            if covers {
+                CoverPicker(title: name.trimmingCharacters(in: .whitespaces).isEmpty ? L("Playlist Name") : name.trimmingCharacters(in: .whitespaces), slot: $slot, picked: $picked, accent: shell.theme.accent)
+                    .padding(.horizontal, -T.dialogPad)
+            }
             DialogBlock(label: L("Name")) {
                 PillTextField(placeholder: L("Playlist Name"), text: $name, accent: shell.theme.accent, onSubmit: create, onEscape: { shell.closeNewPlaylist() }, autoFocus: true)
+            }
+            if covers {
+                DialogBlock(label: L("Description")) {
+                    PillTextField(placeholder: L("Optional"), text: $description, accent: shell.theme.accent, onSubmit: create, onEscape: { shell.closeNewPlaylist() })
+                }
+                DialogSwitch(label: L("Public"), hint: L("Other people on this server can see it."), isOn: $isPublic, accent: shell.theme.accent)
             }
             if let problem { ErrorText(text: problem) }
             DialogActions {
@@ -325,6 +342,7 @@ struct NewPlaylistLayer: View {
                 ActionButton(title: smartCriteria == nil ? (creating ? L("Creating…") : L("Create")) : (creating ? L("Saving…") : L("Save")), kind: .prominent(tint: shell.theme.accent), enabled: canCreate, action: create)
             }
         }
+        .onChange(of: shell.dialogSubmit) { create() }
     }
 
     private func create() {
@@ -349,7 +367,9 @@ struct NewPlaylistLayer: View {
         Task { @MainActor in
             do {
                 let id = try await shell.library.createPlaylist(name: title, songs: songs ?? [])
+                let trouble = covers && id != nil ? await finish(id!, title: title) : nil
                 shell.closeNewPlaylist()
+                if let trouble { shell.showToast(trouble); if songs == nil, let id { shell.go(.playlist(id)) }; return }
                 if songs != nil {
                     shell.showToast(L("Added to {name}", ["name": title]))
                     return
@@ -364,15 +384,29 @@ struct NewPlaylistLayer: View {
     }
 }
 
-/// Edit Details for a playlist the user owns. Only changed fields are sent through `updatePlaylist`.
+extension NewPlaylistLayer {
+    /// after the playlist exists: its description and Public, then its cover. returns what the server refused.
+    fileprivate func finish(_ id: String, title: String) async -> String? {
+        let comment = description.trimmingCharacters(in: .whitespaces)
+        var trouble = await shell.library.updatePlaylistDetails(id: id, name: nil, comment: comment.isEmpty ? nil : comment, isPublic: isPublic)
+        if let problem = await uploadChosenCover(slot: slot, slots: Self.slots, picked: picked, title: title, playlist: id, library: shell.library) { trouble = problem }
+        return trouble
+    }
+}
+
+/// Edit Details for an owned playlist; only what changed is sent.
 struct EditPlaylistLayer: View {
     let playlist: PlaylistRow
     let shell: ShellModel
     @State private var name: String
     @State private var description: String
     @State private var isPublic: Bool
+    @State private var slot: Int
+    @State private var picked: URL?
     @State private var saving = false
     @State private var problem: String?
+    private static let slots = CoverSlots(current: true)
+    private let covers: Bool
 
     init(playlist: PlaylistRow, shell: ShellModel) {
         self.playlist = playlist
@@ -380,13 +414,21 @@ struct EditPlaylistLayer: View {
         _name = State(initialValue: playlist.name)
         _description = State(initialValue: playlist.summary)
         _isPublic = State(initialValue: shell.isPublic(playlist))
+        covers = playlist.isOwned && shell.library.canChangePlaylistImages
+        _slot = State(initialValue: shell.coverSlotSeed ?? 0)
     }
 
     private var trimmedName: String { name.trimmingCharacters(in: .whitespaces) }
     private var canSave: Bool { !trimmedName.isEmpty && !saving }
+    /// another cover than the current one, with a picture to upload behind it.
+    private var newCover: Bool { covers && !Self.slots.isCurrent(slot) && (slot != Self.slots.upload || picked != nil) }
 
     var body: some View {
         DialogLayer(title: L("Edit Details"), dismiss: { shell.closeEditPlaylist() }) {
+            if covers {
+                CoverPicker(title: trimmedName.isEmpty ? L("Playlist Name") : trimmedName, current: playlist, slot: $slot, picked: $picked, accent: shell.theme.accent)
+                    .padding(.horizontal, -T.dialogPad)
+            }
             DialogBlock(label: L("Name")) {
                 PillTextField(placeholder: "", text: $name, accent: shell.theme.accent, onSubmit: save, onEscape: { shell.closeEditPlaylist() }, autoFocus: true)
             }
@@ -400,6 +442,7 @@ struct EditPlaylistLayer: View {
                 ActionButton(title: saving ? L("Saving…") : L("Save"), kind: .prominent(tint: shell.theme.accent), enabled: canSave, action: save)
             }
         }
+        .onChange(of: shell.dialogSubmit) { save() }
     }
 
     private func save() {
@@ -408,14 +451,19 @@ struct EditPlaylistLayer: View {
         let newName = trimmedName != playlist.name ? trimmedName : nil
         let newText = text != playlist.summary ? text : nil
         let newPublic = isPublic != shell.isPublic(playlist) ? isPublic : nil
-        if newName == nil, newText == nil, newPublic == nil {
+        let details = newName != nil || newText != nil || newPublic != nil
+        if !details, !newCover {
             shell.closeEditPlaylist()
             return
         }
         saving = true
         problem = nil
         Task { @MainActor in
-            if let failed = await shell.library.updatePlaylistDetails(id: playlist.id, name: newName, comment: newText, isPublic: newPublic) {
+            var failed = details ? await shell.library.updatePlaylistDetails(id: playlist.id, name: newName, comment: newText, isPublic: newPublic) : nil
+            if failed == nil, newCover {
+                failed = await uploadChosenCover(slot: slot, slots: Self.slots, picked: picked, title: trimmedName, playlist: playlist.id, library: shell.library)
+            }
+            if let failed {
                 saving = false
                 problem = failed
             } else {

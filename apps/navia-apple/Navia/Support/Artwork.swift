@@ -2,7 +2,7 @@ import AppKit
 import ImageIO
 import SwiftUI
 
-/// Decodes artwork off the main thread, downsampled to the size it's shown at, and caches the result.
+/// decodes off the main thread, downsampled to the shown size, and caches the result.
 final class ArtworkLoader {
     static let shared = ArtworkLoader()
 
@@ -18,9 +18,11 @@ final class ArtworkLoader {
     func load(_ url: URL, pixels: Int) async -> NSImage? {
         if let hit = cached(url, pixels: pixels) { return hit }
         var file = url
+        var keep = true
         if url.scheme == CoreArt.scheme {
             guard let resolved = await CoreArt.shared.file(for: url, pixels: pixels) else { return nil }
             file = resolved
+            keep = !CoreArt.shared.isPlaceholder(url, pixels: pixels)
         }
         // A web image, such as a Discord avatar, is fetched and then decoded the same way.
         if url.scheme == "https" {
@@ -31,7 +33,7 @@ final class ArtworkLoader {
             return image
         }
         let image = await Task.detached(priority: .userInitiated) { Self.decode(file, pixels: pixels) }.value
-        if let image { cache.setObject(image, forKey: key(url, pixels)) }
+        if let image, keep { cache.setObject(image, forKey: key(url, pixels)) }
         return image
     }
 
@@ -78,7 +80,7 @@ enum ArtworkKind {
     }
 }
 
-/// Artwork that fills its frame, like CSS `object-fit: cover`. A missing or broken image gets the plain fallback.
+/// like CSS `object-fit: cover`; a missing or broken image gets the plain fallback.
 struct ArtworkView: View {
     let url: URL?
     var kind: ArtworkKind = .album
@@ -86,19 +88,31 @@ struct ArtworkView: View {
     var alignment: Alignment = .center
     /// The vertical focus, 0 to 1, like CSS `object-position`. Nil uses `alignment`.
     var focusY: CGFloat? = nil
-    @State private var image: NSImage?
+    /// only where art is large.
+    var animates = false
+    @State private var loaded: (url: URL, image: NSImage)?
+    @State private var frames: AnimatedFrames?
     @Environment(\.isSnapshot) private var isSnapshot
+    @Environment(\.motionLive) private var live
 
+    /// art already in memory shows from the first frame; art that arrives later fades in (`T.artFade`).
     private var shown: NSImage? {
-        if isSnapshot, let url { return ArtworkLoader.shared.loadNow(url, pixels: pixels) }
-        return image
+        guard let url else { return nil }
+        if isSnapshot { return ArtworkLoader.shared.loadNow(url, pixels: pixels) }
+        if let loaded, loaded.url == url { return loaded.image }
+        return ArtworkLoader.shared.cached(url, pixels: pixels)
     }
 
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: alignment) {
                 if let shown {
-                    picture(shown, in: geo.size)
+                    picture(shown, in: geo.size).transition(.opacity)
+                    // under Reduce Motion the still cover stays: it is the first frame.
+                    if let frames, focusY == nil, !Motion.shared.reduced {
+                        AnimatedArtLayer(frames: frames, alignment: alignment)
+                            .frame(width: geo.size.width, height: geo.size.height)
+                    }
                 } else {
                     fallback(in: geo.size)
                 }
@@ -107,19 +121,25 @@ struct ArtworkView: View {
             .clipped()
         }
         .task(id: url) {
-            guard let url else { image = nil; return }
+            guard let url else { loaded = nil; return }
+            let wasShown = ArtworkLoader.shared.cached(url, pixels: pixels) != nil
             var delay = 2.0
             while !Task.isCancelled {
-                if let loaded = await ArtworkLoader.shared.load(url, pixels: pixels) {
-                    image = loaded
+                if let image = await ArtworkLoader.shared.load(url, pixels: pixels) {
+                    withAnimation(wasShown || !live ? nil : T.ease(T.artFade)) { loaded = (url, image) }
                     return
                 }
-                // Nothing is remembered as missing, since a request can be dropped or the network can blip.
-                image = nil
+                // Nothing is remembered as missing: a request can be dropped, or the network can blip.
+                loaded = nil
                 guard url.scheme == CoreArt.scheme else { return }
                 try? await Task.sleep(for: .seconds(delay))
                 delay = min(delay * 2, 60)
             }
+        }
+        .task(id: animates && !isSnapshot ? url : nil) {
+            frames = nil
+            guard animates, !isSnapshot, let url else { return }
+            frames = await CoreArt.shared.animatedFrames(for: url, pixels: pixels)
         }
     }
 
@@ -138,7 +158,7 @@ struct ArtworkView: View {
     private func fallback(in size: CGSize) -> some View {
         T.panel2.color.overlay(
             Image(systemName: kind.glyph)
-                .font(.system(size: max(10, size.width * 0.32), weight: .regular))
+                .font(.system(size: max(10, size.width * T.artGlyph), weight: .regular))
                 .foregroundStyle(T.t3.color)
         )
     }

@@ -84,7 +84,7 @@ struct FilterRow: View {
         .fixedSize()
     }
 
-    /// The same chips at their natural widths, unseen, so the line knows what folds.
+    /// unseen, so the line knows what folds.
     private func measure(_ candidates: [SongFilterId]) -> some View {
         HStack(spacing: 0) {
             ForEach(candidates, id: \.self) { id in
@@ -146,7 +146,6 @@ private struct FilterChipView: View {
     }
 }
 
-/// The open filter's popover under its chip: its editor, and Clear once it's set.
 struct FilterPopoverLayer: View {
     let request: PopupCenter.FilterRequest
     let center: PopupCenter
@@ -213,6 +212,7 @@ private struct FilterListEditor: View {
                         .textFieldStyle(.plain)
                         .font(.navia(T.textSM))
                         .accessibilityLabel(L(info.find ?? N_("Find")))
+                    SearchClearButton(text: $query, size: T.searchClearSM)
                 }
                 .padding(.horizontal, T.px(11))
                 .frame(height: T.px(34))
@@ -244,7 +244,7 @@ private struct FilterListEditor: View {
             .frame(height: Self.rowH)
             .contentShape(Rectangle())
         }
-        .buttonStyle(HoverFillStyle(key: option.value))
+        .buttonStyle(HoverFillStyle(key: option.value, shrinks: false))
         .accessibilityAddTraits(on ? .isSelected : [])
     }
 }

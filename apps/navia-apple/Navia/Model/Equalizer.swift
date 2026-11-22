@@ -264,7 +264,6 @@ func eqHeadphoneName(fromPath path: String) -> String {
     return name.trimmingCharacters(in: .whitespaces)
 }
 
-/// One filter of the audio chain.
 struct EqPlanFilter: Equatable {
     var kind: EqFilterKind
     var freq: Double
@@ -284,7 +283,6 @@ struct EqPlan: Equatable {
     var crossfeed: Double?
 }
 
-/// The key for the system's default output.
 let eqOutputDefault = "default"
 
 func eqFlatProfile(nextID: inout UInt64) -> EqProfile {
@@ -298,7 +296,6 @@ func eqFlatProfile(nextID: inout UInt64) -> EqProfile {
 /// Everything the Equalizer page saves. Each output has its own profile, and presets are shared.
 struct EqState {
     var enabled = false
-    /// The output whose profile is being edited.
     var output = eqOutputDefault
     var profiles: [String: EqProfile] = [:]
     var custom: [EqCustomPreset] = []
@@ -331,7 +328,6 @@ struct EqState {
         return headphones.first { $0.name == profile.headphone }?.correction
     }
 
-    /// The chain for one output, or nil when the equalizer is off.
     func plan(for output: String, sampleMode: Bool) -> EqPlan? {
         guard enabled else { return nil }
         var state = self
@@ -478,7 +474,6 @@ struct EqState {
         save()
     }
 
-    /// The summary line on Settings.
     func summary(outputLabel: String) -> String {
         guard state.enabled else { return L("Off. Audio plays unprocessed.") }
         let p = state.current

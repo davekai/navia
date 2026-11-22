@@ -75,7 +75,6 @@ final class WindowFrameProbe {
     }
 }
 
-/// Keeps a `WindowFrameProbe` pointed at this spot, for popovers placed in window coordinates.
 struct WindowFrameReader: NSViewRepresentable {
     let probe: WindowFrameProbe
     func makeNSView(context: Context) -> NSView {

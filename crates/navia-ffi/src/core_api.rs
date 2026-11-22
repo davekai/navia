@@ -73,6 +73,17 @@ pub struct DiscographySectionRow {
     pub rowids: Vec<u32>,
 }
 
+/// one song's Deezer `rank` for the album page's Heat column (`navia_core::album_heat`).
+#[derive(uniffi::Record)]
+pub struct SongHeatRow {
+    pub song_id: String,
+    pub rank: u64,
+}
+
+fn heat_rows(heat: std::collections::HashMap<String, u64>) -> Vec<SongHeatRow> {
+    heat.into_iter().map(|(song_id, rank)| SongHeatRow { song_id, rank }).collect()
+}
+
 /// "More by <album artist>" under an album (`navia_core::library::discography::more_by`).
 #[derive(uniffi::Record)]
 pub struct MoreByRow {
@@ -93,6 +104,7 @@ pub struct DiscographyRow {
     pub not_synced: u32,
 }
 
+/// `id` can be absent on success if the server didn't say it.
 #[derive(uniffi::Record)]
 pub struct CreatedPlaylist {
     pub id: Option<String>,
@@ -302,8 +314,11 @@ pub enum CoreEvent {
     SyncDone,
     /// The sync stopped partway, so a first sync's library may be incomplete.
     SyncFailed,
-    /// The server refused the saved login (Subsonic error 40 or 41, or HTTP 401). Sent once per core, before `Connected
-    /// { ok: false }`, so the app can ask to sign in again.
+    /// For You has something new stored (a mix landed, similar artists came in): reload it with
+    /// `for_you`.
+    ForYouChanged,
+    /// The server refused the saved login (Subsonic error 40 or 41, or HTTP 401). Sent once per
+    /// core, before `Connected { ok: false }`, so the app can ask to sign in again.
     LoginRejected,
 }
 
@@ -720,6 +735,22 @@ pub struct ForYouRow {
     pub not_played_recently: Vec<AlbumRow>,
     /// Today's mixes and similar artists haven't been requested yet. Call `refresh_for_you`.
     pub needs_refresh: bool,
+    /// today's mixes are being made right now: an empty page isn't final yet.
+    pub building: bool,
+}
+
+/// what a change check found (`NaviaCore::check_for_changes`).
+#[derive(uniffi::Record, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChangesRow {
+    /// the server's library changed and was synced now.
+    pub library: bool,
+    /// the server is scanning; its changes come with a later check.
+    pub server_scanning: bool,
+    /// a sync was already running; its own `SyncDone` follows when it ends.
+    pub sync_running: bool,
+    pub playlists: bool,
+    pub stars: bool,
+    pub plays: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -1017,9 +1048,7 @@ pub fn open_core(server_url: String, username: String, password: String, options
     let mut config = ClientConfig::new(server_url.clone(), credentials.clone());
     config.write_policy = if options.report_plays { WritePolicy::Allowed } else { WritePolicy::ReadOnly };
     let client = Client::new(config)?;
-    let mut writer_config = ClientConfig::new(server_url.clone(), credentials.clone());
-    writer_config.write_policy = if options.test_run && !options.report_plays { WritePolicy::ReadOnly } else { WritePolicy::Allowed };
-    let writer = Client::new(writer_config)?;
+    let writer = client.copy_with_policy(if options.test_run && !options.report_plays { WritePolicy::ReadOnly } else { WritePolicy::Allowed })?;
 
     let key = credentials.account_key(&server_url);
     let dirs = directories::ProjectDirs::from("", "", "Navia");
@@ -1060,16 +1089,16 @@ pub fn open_core(server_url: String, username: String, password: String, options
             }
         }
     }));
-    Ok(Arc::new(NaviaCore { friends, rt: ManuallyDrop::new(rt), client, writer, db, artwork, lyrics, downloads, reporter, queue_sync, queue_offer: Mutex::new(None), report_plays: AtomicBool::new(options.report_plays), private_mode: AtomicBool::new(false), test_run: options.test_run, background: Mutex::new(None), background_sync: AtomicBool::new(true), first_sync: Mutex::new(None), features: OnceLock::new(), admin: Mutex::new(None), image_support: Mutex::new(None), sharing: Mutex::new(None), started: AtomicBool::new(false), login_rejected: AtomicBool::new(false), sync_watch, sync_ping }))
+    Ok(Arc::new(NaviaCore { friends, rt: ManuallyDrop::new(rt), client, writer, db, artwork, lyrics, downloads, reporter, queue_sync, queue_offer: Mutex::new(None), report_plays: AtomicBool::new(options.report_plays), private_mode: AtomicBool::new(false), test_run: options.test_run, background: Mutex::new(None), background_sync: AtomicBool::new(true), first_sync: Mutex::new(None), daily_mixes: Mutex::new(None), listener: Mutex::new(None), features: OnceLock::new(), admin: Mutex::new(None), image_support: Mutex::new(None), sharing: Mutex::new(None), started: AtomicBool::new(false), login_rejected: AtomicBool::new(false), sync_watch, sync_ping }))
 }
 
 #[derive(uniffi::Object)]
 pub struct NaviaCore {
     /// Taken apart in `Drop`, because dropping a runtime normally blocks and panics on one of its own threads.
     rt: ManuallyDrop<Runtime>,
-    client: Client,
-    /// For the user's own edits like creating a playlist, which don't depend on scrobbling. Read-only in a test run
-    /// unless writes are allowed (`NAVIA_REPORT_PLAYS=1`).
+    pub(crate) client: Client,
+    /// For the user's own edits, such as creating a playlist, which don't depend on Scrobble
+    /// plays. Read-only in a test run unless it asks for writes (`NAVIA_REPORT_PLAYS=1`).
     writer: Client,
     pub(crate) db: Library,
     artwork: ArtworkCache,
@@ -1082,11 +1111,15 @@ pub struct NaviaCore {
     queue_offer: Mutex<Option<RemoteQueue>>,
     report_plays: AtomicBool,
     private_mode: AtomicBool,
-    test_run: bool,
+    pub(crate) test_run: bool,
     background: Mutex<Option<BackgroundRefresh>>,
     /// Whether the periodic refresh should run. The first sync after launch always runs.
     background_sync: AtomicBool,
     first_sync: Mutex<Option<JoinHandle<()>>>,
+    /// makes For You's mixes once a day in the background (`for_you::keep_mixes_daily`).
+    daily_mixes: Mutex<Option<JoinHandle<()>>>,
+    /// the app's listener, once `start_background` has it.
+    listener: Mutex<Option<Arc<Mutex<Box<dyn CoreListener>>>>>,
     /// The OpenSubsonic extensions in use, once `getOpenSubsonicExtensions` answers.
     features: OnceLock<ServerFeatures>,
     admin: Mutex<Option<bool>>,
@@ -1127,13 +1160,31 @@ impl NaviaCore {
         *self.background.lock().unwrap() = Some(BackgroundRefresh::spawn_with(syncer, REFRESH_EVERY, Some(self.reporter.clone())));
     }
 
-    /// Whether nothing should be reported now.
+    /// today's mixes, made in the background once a day after the launch sync, so For You has
+    /// them before it's opened. test runs only read what's stored.
+    fn start_daily_mixes(self: &Arc<Self>) {
+        if !self.external_allowed() || self.daily_mixes.lock().unwrap().is_some() {
+            return;
+        }
+        let listener = self.listener.lock().unwrap().clone();
+        let changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Some(l) = &listener
+                && let Ok(l) = l.lock()
+            {
+                l.on_event(CoreEvent::ForYouChanged);
+            }
+        });
+        let task = self.rt.spawn(navia_core::library::for_you::keep_mixes_daily(self.client.clone(), self.db.clone(), changed));
+        *self.daily_mixes.lock().unwrap() = Some(task);
+    }
+
+    /// Whether nothing should be reported right now.
     fn quiet(&self) -> bool {
         self.private_mode.load(Ordering::SeqCst) || !self.report_plays.load(Ordering::SeqCst)
     }
 
-    /// Runs a future on the core's runtime so all networking shares one reactor.
-    async fn on_runtime<T: Send + 'static>(&self, f: impl std::future::Future<Output = T> + Send + 'static) -> Result<T, NaviaError> {
+    /// Runs a future on the core's runtime, so all networking shares one reactor.
+    pub(crate) async fn on_runtime<T: Send + 'static>(&self, f: impl std::future::Future<Output = T> + Send + 'static) -> Result<T, NaviaError> {
         self.rt.spawn(f).await.map_err(|e| NaviaError::Failed { message: format!("task: {e}") })
     }
 
@@ -1167,16 +1218,17 @@ impl NaviaCore {
         self.db.album(key).ok().flatten().and_then(|a| a.cover_art).filter(|c| !c.is_empty()).unwrap_or_else(|| format!("al-{key}"))
     }
 
-    /// External lookups are off in scripted test runs because a stale item makes the server refresh its stored info.
-    /// `NAVIA_TEST_EXTERNAL=1` turns them back on.
-    fn external_allowed(&self) -> bool {
+    /// External lookups are off for scripted test runs, because a stale item makes the server
+    /// refresh its stored info, unless `NAVIA_TEST_EXTERNAL=1` asks for them.
+    pub(crate) fn external_allowed(&self) -> bool {
         !self.test_run || std::env::var_os("NAVIA_TEST_EXTERNAL").is_some_and(|v| v == "1")
     }
 
     /// Fetching play history and library totals logs in to the server, so test runs skip it.
     /// `NAVIA_TEST_SERVER_TOTALS=1` fetches totals, but only against a local stand-in.
     fn sync_options(&self) -> SyncOptions {
-        SyncOptions { play_history: !self.test_run, synced_smart: !self.test_run, watch: Some(self.sync_watch.clone()), server_totals: !self.test_run || std::env::var("NAVIA_TEST_SERVER_TOTALS").is_ok_and(|v| v == "1"), ..Default::default() }
+        let native = !self.test_run || std::env::var("NAVIA_TEST_SERVER_TOTALS").is_ok_and(|v| v == "1");
+        SyncOptions { play_history: !self.test_run, synced_smart: !self.test_run, watch: Some(self.sync_watch.clone()), server_totals: native, song_updates: native, ..Default::default() }
     }
 }
 
@@ -1234,6 +1286,7 @@ impl NaviaCore {
                 (listener, hook)
             };
             let (listener, hook) = on_progress;
+            *this.listener.lock().unwrap() = Some(listener.clone());
             *this.sync_ping.lock().unwrap() = Some(Arc::new({
                 let listener = listener.clone();
                 move || {
@@ -1263,6 +1316,7 @@ impl NaviaCore {
                 l.on_event(CoreEvent::SyncDone);
             }
             this.start_refresh();
+            this.start_daily_mixes();
         });
         *self.first_sync.lock().unwrap() = Some(task);
     }
@@ -1273,6 +1327,9 @@ impl NaviaCore {
         self.sync_ping.lock().unwrap().take();
         self.background.lock().unwrap().take();
         if let Some(task) = self.first_sync.lock().unwrap().take() {
+            task.abort();
+        }
+        if let Some(task) = self.daily_mixes.lock().unwrap().take() {
             task.abort();
         }
         self.downloads.cancel_all();
@@ -1816,8 +1873,22 @@ impl NaviaCore {
         self.downloads.set_online(online);
     }
 
-    /// Sends a star change when writes are allowed. Otherwise nothing leaves the app and the caller keeps the change
-    /// locally.
+    /// the offline switch: while on, nothing is sent to the server and every request fails as
+    /// if it couldn't be reached. call it before `start_background` so a launch with it on
+    /// doesn't try the server; turning it off needs the app's usual reconnect.
+    pub fn set_offline(&self, on: bool) {
+        self.client.set_offline(on);
+        if on {
+            self.downloads.set_online(false);
+        }
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.client.is_offline()
+    }
+
+    /// Sends a star change when writes are allowed. Without them nothing leaves the app; the
+    /// caller keeps the change locally.
     pub fn send_star(&self, table: StarKind, id: String, on: bool) {
         if !self.report_plays.load(Ordering::SeqCst) {
             return;
@@ -1873,6 +1944,7 @@ impl NaviaCore {
         let player = Player::with_backend(resolver, Box::new(airplay.inner.router()), config)?;
         crate::airplay_api::forward_device_volume(&player, &airplay);
         player.set_album_lookup(navia_core::audio::player::library_album_lookup(self.db.clone()));
+        player.set_edge_store(navia_core::audio::player::library_edge_store(self.db.clone()));
         attach_reporting(&player, self.reporter.clone());
         navia_core::engine::playlog::attach_play_log(&player, self.db.clone());
         Ok(Arc::new(NaviaPlayer { inner: player, capture: None }))
@@ -1894,6 +1966,7 @@ impl NaviaCore {
         };
         let player = Player::with_backend(resolver, backend, config)?;
         player.set_album_lookup(navia_core::audio::player::library_album_lookup(self.db.clone()));
+        player.set_edge_store(navia_core::audio::player::library_edge_store(self.db.clone()));
         // The reporter stays private while reporting is off, so this sends nothing until it's on.
         attach_reporting(&player, self.reporter.clone());
         // The play log is local only.
@@ -1916,7 +1989,21 @@ impl NaviaCore {
         let artwork = self.artwork.clone();
         let id = self.cover_id(&key);
         let cover = self.on_runtime(async move { artwork.cover(&id, size).await }).await??;
-        Ok(CoverArtRow { path: cover.path.display().to_string(), width: cover.width, height: cover.height, tint_rgb: cover.tint.to_vec() })
+        Ok(CoverArtRow { path: cover.path.display().to_string(), width: cover.width, height: cover.height, tint_rgb: cover.tint.to_vec(), placeholder: cover.placeholder })
+    }
+
+    /// the cover's frames for display at `size` pixels (longest side), or `None` when it's still.
+    /// ask only where art is large (page headers, player, full screen); elsewhere show `cover`.
+    pub async fn animated_artwork(&self, key: String, size: u32) -> Result<Option<Arc<NaviaAnimatedArt>>, NaviaError> {
+        let artwork = self.artwork.clone();
+        let id = self.cover_id(&key);
+        let art = self.on_runtime(async move { artwork.animated_artwork(&id, size).await }).await??;
+        Ok(art.map(|inner| Arc::new(NaviaAnimatedArt { inner })))
+    }
+
+    /// from the cache only: true when the cover plays as an animation, `None` if not known yet.
+    pub fn cover_is_animated(&self, key: String) -> Option<bool> {
+        self.artwork.is_animated(&self.cover_id(&key))
     }
 
     /// From the lyrics cache while fresh, else the server, else whatever is cached.
@@ -1939,15 +2026,53 @@ impl NaviaCore {
         if !self.external_allowed() {
             return Ok(Vec::new());
         }
-        let client = self.client.clone();
+        let (client, db) = (self.client.clone(), self.db.clone());
         let by_id = self.features.get().is_some_and(|f| f.top_songs_by_id);
-        // The limit applies before matching the library, so ask for plenty.
-        let songs = self.on_runtime(async move { client.artist_top_songs(&artist_id, &artist_name, by_id, 50).await }).await?.unwrap_or_default();
-        Ok(dedup(songs))
+        let day = local_day();
+        let ids = self.on_runtime(async move { navia_core::library::essentials::top_songs(&client, &db, &artist_id, &artist_name, by_id, day).await }).await??;
+        Ok(self.songs_by_rowid(self.db.top_song_rows(&ids).unwrap_or_default()))
     }
 
-    /// The artist's albums by release type, from Navidrome's list of albums they're credited on, or else the library's
-    /// own songs.
+    /// home's Essentials from what's stored for today: the artists' ids, best lately first.
+    pub fn essential_artists(&self) -> Vec<String> {
+        self.db.essentials(local_day()).unwrap_or_default().into_iter().map(|e| e.artist_id).collect()
+    }
+
+    /// Essentials for today, asking the server about the top artists not asked yet today, a few at
+    /// once; each answer is kept for the day, so their songs come from `top_songs` at once. empty
+    /// in test runs.
+    pub async fn refresh_essential_artists(&self) -> Vec<String> {
+        if !self.external_allowed() {
+            return self.essential_artists();
+        }
+        let (client, db) = (self.client.clone(), self.db.clone());
+        let by_id = self.features.get().is_some_and(|f| f.top_songs_by_id);
+        let day = local_day();
+        let found = self.on_runtime(async move { navia_core::library::essentials::refresh_essentials(&client, &db, by_id, day).await }).await;
+        match found {
+            Ok(Ok(list)) => list.into_iter().map(|e| e.artist_id).collect(),
+            _ => self.essential_artists(),
+        }
+    }
+
+    /// asks the server what changed since the last look and brings in only that (the library
+    /// after a new scan, playlists, stars, play counts); near-instant when nothing did. for the
+    /// refresh button on every page that has one, library pages included. sends `SyncDone` when
+    /// anything stored changed, so lists reload as after the background sync; a library sync it
+    /// starts shows on the sync meter.
+    pub async fn check_for_changes(&self) -> Result<ChangesRow, NaviaError> {
+        let syncer = Syncer::new(self.client.clone(), self.db.clone(), self.sync_options());
+        let c = self.on_runtime(async move { syncer.check_for_changes(&|_| {}).await }).await??;
+        if c.any()
+            && let Some(l) = self.listener.lock().unwrap().clone()
+            && let Ok(l) = l.lock()
+        {
+            l.on_event(CoreEvent::SyncDone);
+        }
+        Ok(ChangesRow { library: c.library, server_scanning: c.server_scanning, sync_running: c.sync_running, playlists: c.playlists, stars: c.stars, plays: c.plays })
+    }
+
+    /// the artist's albums by release type: Navidrome's list of albums they're credited on, else the library's own songs.
     pub async fn artist_discography(&self, artist_id: String) -> Result<DiscographyRow, NaviaError> {
         let (client, db) = (self.client.clone(), self.db.clone());
         let use_server = discography::server_list_allowed(self.test_run);
@@ -2021,8 +2146,24 @@ impl NaviaCore {
         found.into_iter().map(|(r, a)| artist_row(Some(r), a)).collect()
     }
 
-    /// "More by <album artist>" under an album, from the library. None for Various Artists or when there's nothing
-    /// else.
+    /// the album's Heat column: its songs' Deezer ranks, with the listener's switch on. asks Deezer
+    /// at most once a week per album (a miss once a day); test runs only read what's kept.
+    pub async fn album_heat(&self, album_id: String) -> Vec<SongHeatRow> {
+        if !self.external_allowed() {
+            return self.kept_album_heat(album_id);
+        }
+        let db = self.db.clone();
+        let heat = self.on_runtime(async move { navia_core::album_heat::album_heat(&db, navia_core::deezer::Deezer::shared(), &album_id).await }).await.unwrap_or_default();
+        heat_rows(heat)
+    }
+
+    /// the Heat column from what's kept only (any age; no request), for showing at once.
+    pub fn kept_album_heat(&self, album_id: String) -> Vec<SongHeatRow> {
+        heat_rows(navia_core::album_heat::kept_album_heat(&self.db, &album_id).unwrap_or_default())
+    }
+
+    /// "More by <album artist>" under an album, from the library: `None` for Various Artists or
+    /// when the album artist has nothing else.
     pub fn more_by(&self, album_id: String) -> Option<MoreByRow> {
         let found = self.db.more_by(&album_id).ok().flatten()?;
         let artist = self.db.artist(&found.artist_id).ok().flatten()?;
@@ -2064,7 +2205,7 @@ impl NaviaCore {
     pub fn for_you(&self) -> ForYouRow {
         let day = navia_core::library::taste::local_day(navia_core::library::taste::now_unix());
         let Ok(page) = self.db.for_you(day) else {
-            return ForYouRow { mixes: Vec::new(), new_to_you: Vec::new(), unplayed: Vec::new(), forgotten: Vec::new(), on_this_day: Vec::new(), not_played_recently: Vec::new(), needs_refresh: false };
+            return ForYouRow { mixes: Vec::new(), new_to_you: Vec::new(), unplayed: Vec::new(), forgotten: Vec::new(), on_this_day: Vec::new(), not_played_recently: Vec::new(), needs_refresh: false, building: false };
         };
         let albums = |rows: &[u32]| self.db.albums_by_rowid(rows).unwrap_or_default().into_iter().map(|(r, a)| album_row(Some(r), a)).collect::<Vec<_>>();
         ForYouRow {
@@ -2075,6 +2216,7 @@ impl NaviaCore {
             on_this_day: albums(&page.on_this_day),
             not_played_recently: albums(&page.not_played_recently),
             needs_refresh: page.needs_refresh,
+            building: page.building,
         }
     }
 
@@ -2082,19 +2224,6 @@ impl NaviaCore {
     pub fn mix(&self, id: String) -> Option<MixRow> {
         let day = navia_core::library::taste::local_day(navia_core::library::taste::now_unix());
         self.db.mix(day, &id).ok().flatten().map(|m| self.mix_row(m))
-    }
-
-    /// Asks the server for today's mixes and the top artists' similar artists when they aren't stored yet, then returns
-    /// the page. Read-only, a few dozen calls once a day. Test runs never ask.
-    pub async fn refresh_for_you(&self) -> ForYouRow {
-        if self.external_allowed() {
-            let day = navia_core::library::taste::local_day(navia_core::library::taste::now_unix());
-            let (client, db) = (self.client.clone(), self.db.clone());
-            if let Ok(Err(e)) = self.on_runtime(async move { navia_core::library::for_you::refresh_for_you(&client, &db, day).await }).await {
-                eprintln!("navia: For You: {e}");
-            }
-        }
-        self.for_you()
     }
 
     pub async fn album_notes(&self, album_id: String) -> Result<String, NaviaError> {
@@ -2181,9 +2310,24 @@ impl NaviaCore {
         })
     }
 
-    /// Saves a new song order for an editable playlist. `expected` is the order shown and `order` the new one. The
-    /// playlist is fetched first and the save is refused if it changed on the server. Test and read-only runs are
-    /// refused, except for the playlist named in `NAVIA_TEST_PLAYLIST`.
+    /// deletes a playlist on the server (its owner or an admin), then the stored copy. returns the
+    /// words to show when it didn't go, `None` when it did. test and read-only runs are refused,
+    /// except for the one playlist a test names in `NAVIA_TEST_PLAYLIST`.
+    pub async fn delete_playlist(&self, id: String) -> Result<Option<String>, NaviaError> {
+        let (client, db) = (self.playlist_writer(&id)?, self.db.clone());
+        let done = self.on_runtime(async move { Syncer::new(client, db, SyncOptions::default()).delete_playlist(&id).await }).await?;
+        Ok(match done {
+            Ok(()) => None,
+            Err(navia_core::Error::WritesDisabled { .. }) => Some("Test and read-only runs can't change playlists.".to_string()),
+            Err(e) => Some(format!("The server didn't delete it: {e}")),
+        })
+    }
+
+    /// Saves a new song order for a playlist this user can edit (not smart, not read-only).
+    /// `expected` is the order shown, `order` the new one; the playlist is fetched first and the
+    /// save is refused if it changed on the server, and its fresh copy is stored either way.
+    /// Test and read-only runs are refused, except for the one playlist a test names in
+    /// `NAVIA_TEST_PLAYLIST`, which it created itself.
     pub async fn save_playlist_order(&self, id: String, expected: Vec<String>, order: Vec<String>) -> Result<PlaylistEditResult, NaviaError> {
         let (client, db) = (self.playlist_writer(&id)?, self.db.clone());
         let saved = self.on_runtime(async move { Syncer::new(client, db, SyncOptions::default()).save_playlist_order(&id, &expected, &order).await }).await?;
@@ -2761,8 +2905,14 @@ pub enum FollowStep {
     Resync { entry: NowPlayingRow, player: String },
     /// In step. `drift_ms` is how far ahead this player is.
     Keep { drift_ms: i64, player: String },
-    /// A followed Spotify friend's song isn't in the library. Pause, say it was skipped once per `key`, and keep
-    /// following.
+    /// the listener's own change is on its way to the host: "Sending to <user>…".
+    Sending { player: String },
+    /// the host didn't take the listener's change: say so, then play `entry` as `Resync` does.
+    NotTaken { entry: NowPlayingRow, player: String },
+    /// they follow this player back and this side leads: stop following, keep playing.
+    Lead { user: String },
+    /// A followed Spotify friend's song isn't in the library: pause, say it was skipped (once per
+    /// `key`), keep following.
     NotInLibrary { key: String, song: String, artist: String },
 }
 
@@ -2775,8 +2925,21 @@ pub struct FollowLocal {
     pub playing: bool,
     pub held: bool,
     pub own_change_ms: Option<u64>,
-    pub seen_playing: Option<bool>,
-    pub seen_ms: Option<u64>,
+    pub lead: bool,
+    pub seen: Option<FollowSeen>,
+    pub ended: bool,
+    pub viewer: String,
+    pub two_way_since: Option<u64>,
+    pub now_ms: u64,
+}
+
+/// the followed player at a check (`navia_core::listen_along::Seen`).
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FollowSeen {
+    pub song_id: String,
+    pub position_ms: u64,
+    pub playing: bool,
+    pub at_ms: u64,
 }
 
 impl FollowLocal {
@@ -2787,17 +2950,30 @@ impl FollowLocal {
             playing: self.playing,
             held: self.held,
             own_change_ms: self.own_change_ms,
-            seen: self.seen_playing.zip(self.seen_ms),
+            lead: self.lead,
+            seen: self.seen.map(|s| navia_core::listen_along::Seen { song_id: s.song_id, position_ms: s.position_ms, playing: s.playing, at_ms: s.at_ms }),
+            ended: self.ended,
+            viewer: self.viewer,
+            two_way_since: self.two_way_since,
+            now_ms: self.now_ms,
         }
     }
 }
 
 /// Whether the followed person's session in these entries is playing. None when it's gone.
 #[uniffi::export]
-pub fn followed_playing(user: String, player: String, entries: Vec<NowPlayingRow>) -> Option<bool> {
+pub fn follow_seen(user: String, player: String, entries: Vec<NowPlayingRow>, now_ms: u64) -> Option<FollowSeen> {
     use navia_core::listen_along as la;
     let core: Vec<la::NowPlaying> = entries.iter().map(NowPlayingRow::core).collect();
-    la::followed_entry(&la::Followed { user, player }, &core).map(|e| e.state.is_some_and(la::SessionState::is_playing))
+    la::Seen::of(&la::Followed { user, player }, &core, now_ms).map(|s| FollowSeen { song_id: s.song_id, position_ms: s.position_ms, playing: s.playing, at_ms: s.at_ms })
+}
+
+/// whether the followed person follows `viewer` back (`navia_core::listen_along::two_way`).
+#[uniffi::export]
+pub fn follows_back(user: String, player: String, entries: Vec<NowPlayingRow>, viewer: String) -> bool {
+    use navia_core::listen_along as la;
+    let core: Vec<la::NowPlaying> = entries.iter().map(NowPlayingRow::core).collect();
+    la::two_way(&la::Followed { user, player }, &core, &viewer)
 }
 
 /// One check while following `user` on `player`, from a fresh [`NaviaCore::now_playing`].
@@ -2812,6 +2988,12 @@ pub fn follow_step(user: String, player: String, entries: Vec<NowPlayingRow>, lo
             Some(row) => FollowStep::Resync { entry: row.clone(), player },
             None => FollowStep::Ended,
         },
+        la::FollowStep::NotTaken { entry, player } => match entries.iter().find(|r| r.matches(&entry)) {
+            Some(row) => FollowStep::NotTaken { entry: row.clone(), player },
+            None => FollowStep::Ended,
+        },
+        la::FollowStep::Sending { player } => FollowStep::Sending { player },
+        la::FollowStep::Lead { user } => FollowStep::Lead { user },
         la::FollowStep::NotInLibrary { key, song, artist } => FollowStep::NotInLibrary { key, song, artist },
     }
 }
@@ -2826,13 +3008,15 @@ pub struct ListenAlongTiming {
     pub ended_notice_ms: u64,
     /// Listening Now from the last good check is dropped once this old.
     pub listing_keep_ms: u64,
+    /// two people seen following each other this long: the one who leads stops following.
+    pub two_way_settle_ms: u64,
 }
 
 #[uniffi::export]
 pub fn listen_along_timing() -> ListenAlongTiming {
     use navia_core::listen_along as la;
     let ms = |d: std::time::Duration| d.as_millis() as u64;
-    ListenAlongTiming { list_poll_ms: ms(la::LIST_POLL), follow_poll_ms: ms(la::FOLLOW_POLL), resync_drift_ms: ms(la::RESYNC_DRIFT), ended_notice_ms: ms(la::ENDED_NOTICE), listing_keep_ms: ms(la::LISTING_KEEP) }
+    ListenAlongTiming { list_poll_ms: ms(la::LIST_POLL), follow_poll_ms: ms(la::FOLLOW_POLL), resync_drift_ms: ms(la::RESYNC_DRIFT), ended_notice_ms: ms(la::ENDED_NOTICE), listing_keep_ms: ms(la::LISTING_KEEP), two_way_settle_ms: ms(la::TWO_WAY_SETTLE) }
 }
 
 /// Whether Autoplay should hand the player its next song now.
@@ -2847,6 +3031,7 @@ impl NaviaCore {
         self.client.base_url()
     }
 
+    /// for Discord art. older libraries may lack ISRCs; the art thread then asks the server.
     pub(crate) fn song_isrc_local(&self, song_id: &str) -> Option<String> {
         self.db.song(song_id).ok().flatten().and_then(|s| s.isrc.into_iter().next())
     }
@@ -3108,11 +3293,14 @@ impl NaviaCore {
         use navia_core::listen_along as la;
         let now = navia_core::lanyard::now_ms();
         let friends = self.friends.friends_matched(&self.db);
+        let followed_player = player.clone();
         match navia_core::lanyard::friend_step(&la::Followed { user, player }, &friends, &local.core(), now) {
             la::FollowStep::Ended => FollowStep::Ended,
             la::FollowStep::Keep { drift_ms, player } => FollowStep::Keep { drift_ms, player },
             la::FollowStep::NotInLibrary { key, song, artist } => FollowStep::NotInLibrary { key, song, artist },
-            la::FollowStep::Resync { entry, player } => FollowStep::Resync { entry: self.now_playing_row(entry), player },
+            la::FollowStep::Resync { entry, player } | la::FollowStep::NotTaken { entry, player } => FollowStep::Resync { entry: self.now_playing_row(entry), player },
+            la::FollowStep::Sending { player } => FollowStep::Sending { player },
+            la::FollowStep::Lead { .. } => FollowStep::Keep { drift_ms: 0, player: followed_player },
         }
     }
 
@@ -3201,34 +3389,58 @@ pub struct ListenerRow {
     pub playing: bool,
     pub in_step: bool,
     pub seen_ms: u64,
+    /// they have a song queued for the listening session.
+    pub queued: bool,
+    pub starting: bool,
 }
 
-/// This Navia as the host: its song, position, state, and when its user last changed playback.
+/// the listener whose song or place the host took (`navia_core::listen_along::Led`).
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct LedRow {
+    pub user: String,
+    pub player: String,
+    pub song_id: String,
+    pub at_ms: u64,
+}
+
+/// this Navia as the host: its song, position, state, when its user last changed playback, and
+/// the listener it follows the place of.
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct HostRow {
     pub song_id: String,
     pub position_ms: u64,
     pub playing: bool,
     pub own_change_ms: u64,
+    pub led: Option<LedRow>,
 }
 
-/// What the host does to mirror a listener (`navia_core::listen_along::HostAction`).
+/// what the host does to mirror a listener (`navia_core::listen_along::HostAction`). a pause or
+/// play carries the listener's place when the two are apart.
 #[derive(uniffi::Enum, Clone, Debug)]
 pub enum HostAction {
-    Pause,
-    Play,
+    Pause { position_ms: Option<u64> },
+    Play { position_ms: Option<u64> },
     Seek { position_ms: u64 },
     Song { song_id: String, position_ms: u64, playing: bool },
 }
 
+/// a host action, whose it is, and the lead to keep after carrying it out.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct HostMirror {
+    pub action: HostAction,
+    pub user: String,
+    pub led: Option<LedRow>,
+}
+
 impl HostRow {
     fn core(&self) -> navia_core::listen_along::Host {
-        navia_core::listen_along::Host { song_id: self.song_id.clone(), position_ms: self.position_ms, playing: self.playing, own_change_ms: self.own_change_ms }
+        let led = self.led.as_ref().map(|l| navia_core::listen_along::Led { user: l.user.clone(), player: l.player.clone(), song_id: l.song_id.clone(), at_ms: l.at_ms });
+        navia_core::listen_along::Host { song_id: self.song_id.clone(), position_ms: self.position_ms, playing: self.playing, own_change_ms: self.own_change_ms, led }
     }
 }
 
 fn listener_core(l: &ListenerRow) -> navia_core::listen_along::Listener {
-    navia_core::listen_along::Listener { user: l.user.clone(), player: l.player.clone(), song_id: l.song_id.clone(), position_ms: l.position_ms, playing: l.playing, in_step: l.in_step, seen_ms: l.seen_ms }
+    navia_core::listen_along::Listener { user: l.user.clone(), player: l.player.clone(), song_id: l.song_id.clone(), position_ms: l.position_ms, playing: l.playing, in_step: l.in_step, seen_ms: l.seen_ms, queued: l.queued, starting: l.starting }
 }
 
 #[uniffi::export]
@@ -3240,30 +3452,117 @@ impl NaviaCore {
         let prev: Vec<la::Listener> = prev.iter().map(listener_core).collect();
         la::listeners(&core, &self.username(), &host.core(), &prev, navia_core::lanyard::now_ms())
             .into_iter()
-            .map(|l| ListenerRow { user: l.user, player: l.player, song_id: l.song_id, position_ms: l.position_ms, playing: l.playing, in_step: l.in_step, seen_ms: l.seen_ms })
+            .map(|l| ListenerRow { user: l.user, player: l.player, song_id: l.song_id, position_ms: l.position_ms, playing: l.playing, in_step: l.in_step, seen_ms: l.seen_ms, queued: l.queued, starting: l.starting })
             .collect()
     }
 
-    /// Sets the client name marks for "Let listeners control playback" and for following someone. Only applies while
-    /// sharing.
-    pub fn set_listen_marks(&self, control: bool, following: bool) {
+    /// "Let listeners control playback", whether this player follows someone, and whether it has
+    /// a song queued for the listening session: the reports' client name carries the marks (only
+    /// while sharing).
+    pub fn set_listen_marks(&self, control: bool, following: bool, queued: bool) {
         let reporter = self.reporter.clone();
-        self.rt.spawn(async move { reporter.set_listen_marks(control, following).await });
+        self.rt.spawn(async move { reporter.set_listen_marks(control, following, queued).await });
     }
 }
 
 /// What the host does to mirror its listeners, if anything. `control` is whether the setting is on.
 #[uniffi::export]
-pub fn host_mirror(host: HostRow, prev: Vec<ListenerRow>, now: Vec<ListenerRow>, control: bool) -> Option<HostAction> {
+pub fn host_mirror(host: HostRow, prev: Vec<ListenerRow>, now: Vec<ListenerRow>, control: bool) -> Option<HostMirror> {
     use navia_core::listen_along::HostAction as A;
     let prev: Vec<_> = prev.iter().map(listener_core).collect();
     let now: Vec<_> = now.iter().map(listener_core).collect();
-    navia_core::listen_along::host_mirror(&host.core(), &prev, &now, control).map(|a| match a {
-        A::Pause => HostAction::Pause,
-        A::Play => HostAction::Play,
+    let host = host.core();
+    let m = navia_core::listen_along::host_mirror(&host, &prev, &now, control)?;
+    let led = m.led(&host, navia_core::lanyard::now_ms()).map(|l| LedRow { user: l.user, player: l.player, song_id: l.song_id, at_ms: l.at_ms });
+    let action = match m.action {
+        A::Pause(position_ms) => HostAction::Pause { position_ms },
+        A::Play(position_ms) => HostAction::Play { position_ms },
         A::Seek(position_ms) => HostAction::Seek { position_ms },
         A::Song { song_id, position_ms, playing } => HostAction::Song { song_id, position_ms, playing },
-    })
+    };
+    Some(HostMirror { action, user: m.user, led })
+}
+
+/// whose session song plays at the end of the current one (`navia_core::listen_along::Turn`).
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionTurn {
+    Mine,
+    Theirs,
+    Nobody,
+}
+
+impl From<navia_core::listen_along::Turn> for SessionTurn {
+    fn from(t: navia_core::listen_along::Turn) -> Self {
+        use navia_core::listen_along::Turn;
+        match t {
+            Turn::Mine => Self::Mine,
+            Turn::Theirs => Self::Theirs,
+            Turn::Nobody => Self::Nobody,
+        }
+    }
+}
+
+/// one side's hand-over of session songs at a song's end (`navia_core::listen_along::Handover`).
+#[derive(uniffi::Object, Default)]
+pub struct SessionHandover(std::sync::Mutex<navia_core::listen_along::Handover>);
+
+#[uniffi::export]
+impl SessionHandover {
+    #[uniffi::constructor]
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// the turn for the coming end, from the last stretch of the current song.
+    pub fn plan(&self, mine: bool, theirs: bool, host: bool) -> SessionTurn {
+        self.0.lock().expect("handover").plan(mine, theirs, host).into()
+    }
+
+    /// the turn worked out for the coming end, if any.
+    pub fn turn(&self) -> Option<SessionTurn> {
+        self.0.lock().expect("handover").turn.map(Into::into)
+    }
+
+    pub fn at_end(&self, mine: bool, theirs: bool, host: bool) -> SessionTurn {
+        self.0.lock().expect("handover").at_end(mine, theirs, host, navia_core::lanyard::now_ms()).into()
+    }
+
+    pub fn waiting(&self) -> bool {
+        self.0.lock().expect("handover").waiting_since.is_some()
+    }
+
+    pub fn started_mine(&self, song_id: String) {
+        self.0.lock().expect("handover").started_mine(&song_id, navia_core::lanyard::now_ms());
+    }
+
+    /// the own session song to put back first after a double start, if any.
+    pub fn theirs_arrived(&self) -> Option<String> {
+        self.0.lock().expect("handover").theirs_arrived(navia_core::lanyard::now_ms())
+    }
+
+    pub fn wait_over(&self) -> bool {
+        self.0.lock().expect("handover").wait_over(navia_core::lanyard::now_ms())
+    }
+
+    pub fn song_changed(&self) {
+        self.0.lock().expect("handover").song_changed();
+    }
+
+    pub fn reset(&self) {
+        *self.0.lock().expect("handover") = Default::default();
+    }
+}
+
+/// milliseconds until the next listen-along check (`navia_core::listen_along::check_every`).
+#[uniffi::export]
+pub fn listen_check_every_ms(session: bool, left_ms: Option<u64>, waiting: bool) -> u64 {
+    navia_core::listen_along::check_every(session, left_ms, waiting).as_millis() as u64
+}
+
+/// whether the client name of a `getNowPlaying` entry says it has a song queued for the session.
+#[uniffi::export]
+pub fn has_session_queue(player: String) -> bool {
+    player.contains(navia_core::listen_along::SHARE_MARK) && player.contains(navia_core::listen_along::QUEUE_MARK)
 }
 
 /// Whether a `getNowPlaying` session lets listeners control it, from its client name's mark.
@@ -3276,4 +3575,49 @@ pub fn allows_control(player: String) -> bool {
 #[uniffi::export]
 pub fn listen_now_ms() -> u64 {
     navia_core::lanyard::now_ms()
+}
+
+/// an animated cover at one display size. frames are straight-alpha RGBA, `width` by `height`,
+/// looping forever with `delays_ms`. the frame calls read the disk, so call them off the main thread.
+#[derive(uniffi::Object)]
+pub struct NaviaAnimatedArt {
+    inner: navia_core::artwork::AnimatedArt,
+}
+
+#[uniffi::export]
+impl NaviaAnimatedArt {
+    pub fn width(&self) -> u32 {
+        self.inner.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.inner.height
+    }
+
+    pub fn delays_ms(&self) -> Vec<u32> {
+        self.inner.delays_ms.clone()
+    }
+
+    pub fn frame_count(&self) -> u32 {
+        self.inner.frame_count() as u32
+    }
+
+    /// no transparent pixels, so the frames can be drawn without alpha.
+    pub fn opaque(&self) -> bool {
+        self.inner.opaque
+    }
+
+    /// memory every frame takes decoded; never more than 64 MB.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.inner.decoded_bytes()
+    }
+
+    pub fn frame(&self, index: u32) -> Result<Vec<u8>, NaviaError> {
+        Ok(self.inner.frame(index as usize)?.into_raw())
+    }
+
+    /// every frame, from one read of the file.
+    pub fn frames(&self) -> Result<Vec<Vec<u8>>, NaviaError> {
+        Ok(self.inner.frames()?.into_iter().map(|f| f.into_raw()).collect())
+    }
 }

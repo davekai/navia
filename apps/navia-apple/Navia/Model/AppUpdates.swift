@@ -12,7 +12,6 @@ import Observation
 
     private(set) var status: Status = .idle
 
-    /// "Check for updates automatically", on by default.
     var checkAutomatically: Bool {
         didSet { UserDefaults.standard.set(checkAutomatically, forKey: "checkUpdates") }
     }
@@ -40,7 +39,6 @@ import Observation
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
     }
 
-    /// The line under "Version", if any.
     var note: String? {
         switch status {
         case .idle: nil
@@ -82,7 +80,6 @@ import Observation
         }
     }
 
-    /// An automatic check stays quiet unless it finds a newer release than the one shown.
     private func run(automatic: Bool) {
         if !automatic { status = .checking }
         let running = Self.versionForAgent

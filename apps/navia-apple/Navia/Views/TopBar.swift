@@ -1,6 +1,6 @@
+import AppKit
 import SwiftUI
 
-/// What fills the center of the top bar.
 enum PageNav: Equatable {
     case icons, none
     case search(String)
@@ -13,10 +13,11 @@ struct PageFrame<Right: View, Content: View>: View {
     var nav: PageNav = .icons
     var title: String? = nil
     var detail: String? = nil
-    /// For pages whose rows are the AppKit table, which SwiftUI's scroll edge effect can't reach.
+    /// for the AppKit table, which SwiftUI's scroll edge effect can't reach.
     var edgeFade = false
     /// Whether the right side has anything in it, when the page decides that by state.
     var hasRight: Bool? = nil
+    var refresh: PageRefresh? = nil
     @ViewBuilder var right: Right
     @ViewBuilder var content: Content
 
@@ -24,14 +25,14 @@ struct PageFrame<Right: View, Content: View>: View {
         ZStack(alignment: .top) {
             content
             if edgeFade { TopEdgeFade() }
-            TopBar(shell: shell, nav: nav, title: title, detail: detail, hasRight: hasRight) { right }
+            TopBar(shell: shell, nav: nav, title: title, detail: detail, hasRight: hasRight, refresh: refresh) { right }
         }
     }
 }
 
 extension PageFrame where Right == EmptyView {
-    init(shell: ShellModel, nav: PageNav = .icons, title: String? = nil, detail: String? = nil, edgeFade: Bool = false, @ViewBuilder content: () -> Content) {
-        self.init(shell: shell, nav: nav, title: title, detail: detail, edgeFade: edgeFade, right: { EmptyView() }, content: content)
+    init(shell: ShellModel, nav: PageNav = .icons, title: String? = nil, detail: String? = nil, edgeFade: Bool = false, refresh: PageRefresh? = nil, @ViewBuilder content: () -> Content) {
+        self.init(shell: shell, nav: nav, title: title, detail: detail, edgeFade: edgeFade, refresh: refresh, right: { EmptyView() }, content: content)
     }
 }
 
@@ -41,6 +42,7 @@ struct TopBar<Right: View>: View {
     var title: String?
     var detail: String?
     var hasRight: Bool? = nil
+    var refresh: PageRefresh? = nil
     @ViewBuilder var right: Right
     @Environment(\.pageContext) private var ctx
 
@@ -50,13 +52,17 @@ struct TopBar<Right: View>: View {
         return false
     }
 
+    /// with something in the middle, both sides take half so it stays centred; without, the right side's controls come first
+    /// and the left (and its title) takes what's left.
+    private var centred: Bool { nav != .none }
+
     var body: some View {
         HStack(spacing: css > 620 ? T.px(12) : T.px(8)) {
             left.frame(maxWidth: crowded ? nil : .infinity, alignment: .leading)
             center
-            // The account button ends the bar.
-            HStack(spacing: T.px(10)) { if !crowded { Spacer(minLength: 0) }; right; AccountButton(shell: shell) }
-                .frame(maxWidth: crowded ? nil : .infinity, alignment: .trailing)
+            HStack(spacing: T.px(10)) { if !crowded && centred { Spacer(minLength: 0) }; right; if let refresh { RefreshButton(library: shell.library, kind: refresh) }; AccountButton(shell: shell) }
+                .frame(maxWidth: crowded || !centred ? nil : .infinity, alignment: .trailing)
+                .layoutPriority(centred ? 0 : 1)
         }
         .padding(.horizontal, T.gutter)
         .frame(height: T.topbarH)
@@ -78,13 +84,18 @@ struct TopBar<Right: View>: View {
                 IconButton(symbol: "chevron.right", label: L("Forward"), weight: .semibold, disabled: !shell.canGoForward) { shell.goForward() }
             }
             if let title, css > 620 {
-                HStack(spacing: T.px(10)) {
-                    Text(title).font(.navia(T.textMD, .semibold)).foregroundStyle(T.tEm.color)
-                    if let detail, css > 900 {
-                        Text(detail).font(.navia(T.textMD)).foregroundStyle(T.t2.color)
+                // whole or not at all: a cut title says nothing.
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: T.px(10)) {
+                        Text(title).font(.navia(T.textMD, .semibold)).foregroundStyle(T.tEm.color)
+                        if let detail, css > 900 {
+                            Text(detail).font(.navia(T.textMD)).foregroundStyle(T.t2.color)
+                        }
                     }
+                    .lineLimit(1)
+                    .fixedSize()
+                    Color.clear.frame(width: 0, height: 0)
                 }
-                .lineLimit(1)
             }
             if !crowded { Spacer(minLength: 0) }
         }
@@ -100,7 +111,6 @@ struct TopBar<Right: View>: View {
     }
 }
 
-/// The icon tabs at the top center of the window.
 struct CenterPill: View {
     let shell: ShellModel
     let tabWidth: CGFloat
@@ -136,9 +146,9 @@ struct CenterPill: View {
         case .home: item.label == L("Home")
         case .discover(.new): item.label == L("New")
         case .discover: item.label == L("Discover")
-        case .albums, .album, .songs, .liked, .artists, .artist, .playlists, .playlist: item.label == L("Library")
+        case .albums, .album, .songs, .liked, .artists, .artist, .artistTop, .playlists, .playlist: item.label == L("Library")
         case .browse, .search: item.label == L("Search")
-        case .settings, .equalizer, .downloads, .cachedSongs, .shares, .smartEditor, .mix: false
+        case .settings, .equalizer, .downloads, .cachedSongs, .shares, .smartEditor, .mix, .upcoming: false
         }
     }
 }
@@ -159,6 +169,7 @@ private struct PillTab: View {
                 .foregroundStyle((on ? T.tEm : hovering ? T.t1 : T.t2).color)
                 .frame(width: width, height: T.px(48))
                 .background(Capsule().fill(on ? T.glassOn.color : .clear))
+                .animation(T.toggle, value: on)
                 .contentShape(Capsule())
         }
         .buttonStyle(HoverBrightenStyle(selected: on, key: label))
@@ -168,7 +179,6 @@ private struct PillTab: View {
     }
 }
 
-/// The text tabs at the top center of Discover.
 private struct TabPill: View {
     let shell: ShellModel
     let active: DiscoverTab
@@ -204,6 +214,7 @@ private struct DiscoverTabButton: View {
                 .padding(.horizontal, padding)
                 .frame(height: T.px(44))
                 .background(Capsule().fill(on ? T.glassOn.color : .clear))
+                .animation(T.toggle, value: on)
                 .contentShape(Capsule())
         }
         .buttonStyle(HoverBrightenStyle(selected: on, key: title))
@@ -242,6 +253,9 @@ struct SearchField: View {
                     .focused($focused)
                     .onChange(of: text) { _, value in typed(value) }
                     .onChange(of: query) { _, value in if value != text { text = value } }
+                    .escapeClears($text)
+                    .holdsWindowStill()
+                SearchClearButton(text: $text, size: T.searchClearLG)
             }
         }
         .padding(.horizontal, T.px(19))
@@ -251,7 +265,9 @@ struct SearchField: View {
         .glassPill()
         .focusRing(focused, shell.theme.accent)
         .shadow(T.shadowPill)
-        .onAppear { text = query; focused = true }
+        .onAppear { text = query }
+        // focus waits a turn: on first appearance the field isn't in the window yet.
+        .task(id: shell.searchFocus) { await Task.yield(); focused = true }
     }
 
     private func typed(_ value: String) {
@@ -273,29 +289,59 @@ struct SearchPill: View {
     @FocusState private var focused: Bool
     @Environment(\.isSnapshot) private var isSnapshot
 
+    private static var glyph: CGFloat { T.px(16) }
+
     var body: some View {
-        HStack(spacing: T.px(9)) {
-            Image(systemName: "magnifyingglass").font(.system(size: T.px(16))).foregroundStyle(T.t2.color)
+        HStack(spacing: T.searchPillGap) {
+            Image(systemName: "magnifyingglass").font(.system(size: Self.glyph)).foregroundStyle(T.t2.color)
             if isSnapshot {
                 Text(placeholder).font(.navia(T.textMD)).foregroundStyle(T.t3.color).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                TextField("", text: $text, prompt: Text(placeholder).foregroundStyle(T.t3.color))
+                TextField("", text: $text)
                     .textFieldStyle(.plain)
                     .font(.navia(T.textMD))
                     .focused($focused)
+                    .escapeClears($text)
+                    .holdsWindowStill()
+                    .accessibilityLabel(placeholder)
+                    .overlay(alignment: .leading) {
+                        if text.isEmpty {
+                            // where the bar leaves no room for the page's own words whole, plain "Search" instead of a cut one.
+                            ViewThatFits(in: .horizontal) { Text(placeholder); Text(L("Search")) }
+                                .font(.navia(T.textMD))
+                                .foregroundStyle(T.t3.color)
+                                .lineLimit(1)
+                                .padding(.leading, T.fieldTextInset)
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
+                        }
+                    }
+                SearchClearButton(text: $text)
             }
         }
-        .padding(.horizontal, T.px(15))
-        .frame(width: width, height: T.controlH)
+        .padding(.horizontal, T.searchPillPad)
+        .frame(minWidth: width, idealWidth: fit, maxWidth: fit)
+        .frame(height: T.controlH)
         .glassPill()
         .focusRing(focused, accent)
+        // ahead of the spacer beside it, so it only narrows when the bar is full.
+        .layoutPriority(1)
+    }
+
+    private var fit: CGFloat { max(width, Self.fitting(placeholder)) }
+
+    /// wide enough to show `placeholder` whole, in any language.
+    private static func fitting(_ placeholder: String) -> CGFloat {
+        let text = (placeholder as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: T.textMD)]).width
+        let mark = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: glyph, weight: .regular))?.size.width ?? glyph
+        return (text + mark + T.searchPillGap + 2 * (T.searchPillPad + T.fieldTextInset)).rounded(.up)
     }
 }
 
 /// The search field's width, in steps by page width.
 func pillSearchWidth(_ ctx: PageContext) -> CGFloat { T.px(ctx.cssWidth > 1000 ? 187 : ctx.cssWidth > 620 ? 168 : 120) }
 
-/// A sort or filter button in a top bar pill, with checkmarks on the current choice.
 struct SortButton<Option: Identifiable & Equatable>: View {
     let symbol: String
     let label: String

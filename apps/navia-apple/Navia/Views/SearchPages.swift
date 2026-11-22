@@ -19,7 +19,7 @@ struct SearchPage: View {
         return ""
     }
 
-    /// Everything a search's answer depends on. A new one replaces and cancels the last.
+    /// everything a search depends on; a new key cancels the last search.
     private struct SearchKey: Hashable {
         let query: String
         let sort: SearchSort
@@ -120,7 +120,8 @@ struct SearchPage: View {
         let showTop = top != nil && show(L("Artists"))
         let showSongs = (top == nil || scope == L("Songs")) && show(L("Songs")) && !results.songs.isEmpty
         let showArtists = show(L("Artists")) && !results.artists.isEmpty
-        let showAlbums = show(L("Albums")) && !results.albums.isEmpty
+        let upcoming = favoritesOnly ? [] : shell.library.upcomingMatching(query)
+        let showAlbums = show(L("Albums")) && !(results.albums.isEmpty && upcoming.isEmpty)
         let nothing = !showTop && !showSongs && !showArtists && !showAlbums
         return PageScroll {
             if showTop, let top {
@@ -136,6 +137,7 @@ struct SearchPage: View {
                 Shelf(title: L("Albums"), action: { shell.go(.albums(.all)) }) {
                     let shared = results.albums.sharedNames
                     ForEach(results.albums) { album in AlbumCard(album: album, shell: shell, showEdition: shared.contains(album.name.lowercased())) { shell.go(.album(album.id)) } }
+                    ForEach(upcoming) { album in UpcomingCard(album: album, tag: true) { shell.go(.upcoming(album.id)) } }
                 }
             }
             if nothing && settled {
@@ -170,7 +172,7 @@ struct SearchPage: View {
                             Text(L("Play")).font(.navia(T.textMD, .medium))
                         }
                         .padding(.leading, T.px(13)).padding(.trailing, T.px(12))
-                        .frame(height: T.iconH).contentShape(Capsule())
+                        .frame(height: T.iconButtonH).contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
                     .disabled(songs.isEmpty)
@@ -179,7 +181,7 @@ struct SearchPage: View {
                 GlassGroup {
                     MenuIconButton(symbol: "ellipsis", label: L("More")) {
                         [MenuEntry(title: L("Go to Artist")) { shell.go(.artist(top.id)) },
-                         MenuEntry(title: L("Start Artist Radio"), enabled: !radio.isEmpty) { shell.startArtistRadio(top) },
+                         MenuEntry(title: L("Artist Radio"), enabled: !radio.isEmpty) { shell.startArtistRadio(top) },
                          shell.shareEntry(artist: top),
                          SongMenu.info(.artist(top.id), shell: shell)]
                     }

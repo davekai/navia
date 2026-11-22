@@ -23,18 +23,17 @@ struct AlbumDetail: View {
     let album: AlbumRow
     var embedded = false
     @State private var holder = Once<any SongsViewModel>()
-    @State private var blurbOpen = false
     @Environment(\.pageContext) private var ctx
     @Environment(\.isSnapshot) private var isSnapshot
 
     var body: some View {
         let songs = holder.get { shell.library.songs(forAlbum: album.id) }
-        // Decided here, where the page context is known, because the table measures the header in its own host.
-        let header = AlbumHeader(shell: shell, album: album, songs: songs, embedded: embedded, stacked: ctx.cssWidth <= 620, searchWidth: pillSearchWidth(ctx), blurbOpen: $blurbOpen)
+        // Decided here, where the page context is known: the table measures the header in a host of its own.
+        let header = AlbumHeader(shell: shell, album: album, songs: songs, embedded: embedded, stacked: ctx.cssWidth <= 620, searchWidth: pillSearchWidth(ctx))
             .padding(.leading, ctx.sidebarUnder + ctx.gutter)
             .padding(.trailing, ctx.end + ctx.gutter + ctx.dockUnder)
             .padding(.top, PagePadding.top)
-            .padding(.bottom, T.px(32))
+            .padding(.bottom, T.albumSectionGap)
         let hosted = header.background(alignment: .top) { if !embedded { PageTint(hex: album.tintHex ?? "2a2b33") } }
 
         ZStack(alignment: .top) {
@@ -50,7 +49,8 @@ struct AlbumDetail: View {
                 SongsTable(songs: songs, shell: shell, revision: songs.revision, editRevision: songs.editRevision,
                            nowPlayingID: shell.player.current?.id, variant: .album, pageHeader: AnyView(hosted),
                            bottomInset: PagePadding.bottom(hasBar: ctx.hasBar), discs: discs(songs),
-                           trailing: shell.library.moreBy(album: album).map { .section(AnyView(moreBy($0))) })
+                           trailing: shell.library.moreBy(album: album).map { .section(AnyView(moreBy($0))) },
+                           heat: shell.deezerChoice == true ? AlbumHeat(ranks: shell.library.albumHeat(album: album), tint: Tint(hex: album.tintHex).fg) : nil)
             }
             if songs.count == 0 && songs.totalCount > 0 && !isSnapshot {
                 EmptyStateView(symbol: "magnifyingglass", title: L("No songs match"),
@@ -59,6 +59,7 @@ struct AlbumDetail: View {
                     .padding(.top, PagePadding.top + T.heroArt + T.px(140))
             }
         }
+        .onChange(of: album.id, initial: true) { shell.library.reaskMissingHeat(album: album) }
     }
 }
 
@@ -94,7 +95,6 @@ private struct AlbumHeader: View {
     /// The art above the title instead of beside it, for narrow pages.
     let stacked: Bool
     let searchWidth: CGFloat
-    @Binding var blurbOpen: Bool
 
     private var tint: Tint { Tint(hex: album.tintHex) }
 
@@ -102,40 +102,31 @@ private struct AlbumHeader: View {
         let library = shell.library
         let current = library.album(id: album.id) ?? album
         let tracks = songs.entireList()
-        VStack(alignment: .leading, spacing: T.px(32)) {
-            (stacked ? AnyLayout(VStackLayout(alignment: .leading, spacing: T.px(25))) : AnyLayout(HStackLayout(alignment: .top, spacing: T.px(25)))) {
-                ArtworkView(url: album.artworkURL, pixels: 600)
-                    .frame(width: T.heroArt, height: T.heroArt)
-                    .clipShape(RoundedRectangle(cornerRadius: T.rMD, style: .continuous))
-                    .artShadow()
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack(alignment: .lastTextBaseline, spacing: T.textTitle * 0.27) {
-                        Text(album.name).font(.navia(T.textTitle, .bold)).foregroundStyle(T.tEm.color).tracking(-0.024 * T.textTitle).lineSpacing(T.px(2)).lineLimit(2).truncationMode(.tail)
-                        if album.isExplicit {
-                            ExplicitMark(size: T.textTitle).alignmentGuide(.lastTextBaseline) { $0[.bottom] - T.textTitle * 0.1 }
-                        }
-                    }
-                    artistLine.padding(.top, T.px(14))
-                    metaLine.padding(.top, T.px(12))
-                    if !album.blurb.isEmpty {
-                        ExpandingBlurb(text: album.blurb, isOpen: $blurbOpen).padding(.top, T.px(14))
-                    }
+        VStack(alignment: .leading, spacing: T.albumSectionGap) {
+            AlbumHead(artworkURL: album.artworkURL, stacked: stacked) {
+                AlbumTitle(name: album.name, explicit: album.isExplicit)
+                artistLine.padding(.top, T.albumArtistGap)
+                metaLine.padding(.top, T.albumMetaGap)
+                if !album.blurb.isEmpty {
+                    HeaderDescription(about: AboutText(title: album.name, subtitle: album.artist.isEmpty ? nil : album.artist, art: album.artworkURL.map { .artwork($0, .album) }, text: album.blurb), shell: shell)
+                        .padding(.top, T.albumArtistGap)
                 }
-                .padding(.top, T.px(20))
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
             ActionRow(spacing: T.px(8)) {
                 PlayActions(songs: tracks, shell: shell) {
-                    IconButton(symbol: "heart", label: L("Favorite"), active: current.isFavorite, inGlass: true) { library.toggleFavorite(album: album.id) }
+                    IconButton(symbol: "heart", label: L("Favorite"), active: current.isFavorite, inGlass: true, pop: true) { library.toggleFavorite(album: album.id) }
                     DownloadToggle(kind: .album, id: album.id, name: album.name, hasSongs: !tracks.isEmpty, shell: shell)
                     MenuIconButton(symbol: "ellipsis", label: L("More")) {
-                        [MenuEntry(title: L("Add to Queue"), enabled: !tracks.isEmpty) { tracks.forEach { shell.player.addToQueue($0) } },
+                        [MenuEntry(title: L("Add to Queue"), enabled: !tracks.isEmpty) { tracks.forEach { shell.player.addToQueue($0) }; RowFlash.shared.flash(tracks.map(\.id)) },
                          SongMenu.addToPlaylist(tracks, name: album.name, shell: shell),
                          shell.shareEntry(album: current),
                          SongMenu.info(.album(album.id), shell: shell)]
                     }
                 }
             } trailing: {
+                GlassGroup {
+                    MenuIconButton(symbol: "rectangle.split.2x1", label: L("Columns"), size: T.px(16)) { AlbumColumn.menu(deezer: shell.deezerChoice == true) }
+                }
                 GlassGroup {
                     SortButton(symbol: "line.3.horizontal.decrease", label: L("Filter songs"), options: SongFilter.allCases, title: \.label, current: songs.filter) { songs.filter = $0 }
                 }
@@ -151,19 +142,8 @@ private struct AlbumHeader: View {
             LinkedText(pieces: LinkPiece.artist(album), shell: shell)
                 .font(.navia(T.textSubtitle, .semibold))
                 .foregroundStyle(tint.fg.color)
-        } else if let id = album.artistID {
-            Button { shell.go(.artist(id)) } label: {
-                HStack(spacing: T.px(5)) {
-                    Text(album.artist).lineLimit(1).truncationMode(.tail)
-                    Image(systemName: "chevron.right").font(.system(size: T.px(16), weight: .bold))
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .font(.navia(T.textSubtitle, .semibold))
-            .foregroundStyle(tint.fg.color)
         } else {
-            Text(album.artist).font(.navia(T.textSubtitle, .semibold)).foregroundStyle(tint.fg.color)
+            AlbumArtistLine(name: album.artist, artistID: album.artistID, color: tint.fg, shell: shell)
         }
     }
 
@@ -191,65 +171,59 @@ private struct AlbumHeader: View {
     }
 }
 
-/// A three-line blurb with a plain MORE that appears only when the text is cut off. The last line fades out
-/// before the label.
-struct ExpandingBlurb: View {
-    let text: String
-    @Binding var isOpen: Bool
-    @State private var fullHeight: CGFloat = 0
-    @State private var shownHeight: CGFloat = 0
-    @State private var moreWidth: CGFloat = 0
-
-    private var clipped: Bool { fullHeight > shownHeight + 1 }
+struct AlbumHead<Info: View>: View {
+    let artworkURL: URL?
+    let stacked: Bool
+    @ViewBuilder var info: Info
 
     var body: some View {
-        VStack(alignment: .leading, spacing: T.px(6)) {
-            Text(text)
-                .font(.navia(T.textMD))
-                .lineSpacing(T.px(4))
-                .foregroundStyle(T.t2.color)
-                .lineLimit(isOpen ? nil : 3)
-                .fixedSize(horizontal: false, vertical: true)
-                .background(alignment: .top) {
-                    Text(text).font(.navia(T.textMD)).lineSpacing(T.px(4))
-                        .fixedSize(horizontal: false, vertical: true)
-                        .hidden()
-                        .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { fullHeight = $0 }
-                }
-                .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { shownHeight = $0 }
-                .mask { if clipped && !isOpen { tailFade } else { Rectangle() } }
-                .overlay(alignment: .bottomTrailing) {
-                    if clipped && !isOpen {
-                        moreButton(L("MORE"))
-                            .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { moreWidth = $0 }
-                    }
-                }
-            if isOpen && clipped == false && fullHeight > 0 && shownHeight >= fullHeight {
-                moreButton(L("LESS"))
-            }
+        (stacked ? AnyLayout(VStackLayout(alignment: .leading, spacing: T.albumHeadGap)) : AnyLayout(HStackLayout(alignment: .top, spacing: T.albumHeadGap))) {
+            ArtworkView(url: artworkURL, pixels: 600, animates: true)
+                .frame(width: T.heroArt, height: T.heroArt)
+                .clipShape(RoundedRectangle(cornerRadius: T.rMD, style: .continuous))
+                .artShadow()
+            VStack(alignment: .leading, spacing: 0) { info }
+                .padding(.top, T.albumInfoPadTop)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: T.px(620), alignment: .leading)
-    }
-
-    /// Opaque except at the last line's end, which fades out over 40 points and is clear under MORE.
-    private var tailFade: some View {
-        let line = shownHeight / 3
-        return VStack(spacing: 0) {
-            Rectangle()
-            HStack(spacing: 0) {
-                Rectangle()
-                LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing).frame(width: T.px(40))
-                Color.clear.frame(width: moreWidth + T.px(8))
-            }
-            .frame(height: line)
-        }
-    }
-
-    private func moreButton(_ label: String) -> some View {
-        Button { isOpen.toggle() } label: {
-            Text(label).font(.navia(T.textMD, .semibold)).foregroundStyle(T.t1.color)
-                .frame(height: T.px(22)).contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
     }
 }
+
+struct AlbumTitle: View {
+    let name: String
+    let explicit: Bool
+
+    var body: some View {
+        HStack(alignment: .lastTextBaseline, spacing: T.textTitle * 0.27) {
+            Text(name).font(.navia(T.textTitle, .bold)).foregroundStyle(T.tEm.color).tracking(-0.024 * T.textTitle).lineSpacing(T.px(2)).lineLimit(2).truncationMode(.tail).fullTextHelp(name)
+            if explicit {
+                ExplicitMark(size: T.textTitle).alignmentGuide(.lastTextBaseline) { $0[.bottom] - T.textTitle * 0.1 }
+            }
+        }
+    }
+}
+
+struct AlbumArtistLine: View {
+    let name: String
+    let artistID: String?
+    let color: RGBA
+    let shell: ShellModel
+
+    var body: some View {
+        if let artistID {
+            Button { shell.go(.artist(artistID)) } label: {
+                HStack(spacing: T.px(5)) {
+                    Text(name).lineLimit(1).truncationMode(.tail).fullTextHelp(name)
+                    Image(systemName: "chevron.right").font(.system(size: T.px(16), weight: .bold))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .font(.navia(T.textSubtitle, .semibold))
+            .foregroundStyle(color.color)
+        } else {
+            Text(name).font(.navia(T.textSubtitle, .semibold)).foregroundStyle(color.color)
+        }
+    }
+}
+

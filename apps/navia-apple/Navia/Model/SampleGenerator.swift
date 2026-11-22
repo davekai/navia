@@ -9,7 +9,7 @@ extension SampleLibrary.File {
     static let generatedTint = "#2a2b33"
     static let generatedPlaylistCount = 2
     static let generatedPlaylistSize = 50
-    /// GPUI's `top_songs` keeps at most this many.
+    /// matches GPUI's `top_songs` cap.
     static let generatedTopSongs = 20
 
     static func generated(count: Int = generatedSongCount) -> Self {

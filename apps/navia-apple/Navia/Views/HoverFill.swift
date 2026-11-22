@@ -13,10 +13,11 @@ struct HoverFillBackground: View {
     }
 }
 
-/// The fill style for text buttons. Disabled buttons get no hover. `key` names the control for the DEBUG
-/// `-naviaForceHover` flag.
+/// disabled buttons get no hover. `key` names the control for the DEBUG `-naviaForceHover` flag.
 struct HoverFillStyle: ButtonStyle {
     var key: String? = nil
+    /// off for list rows, and for buttons on the system's interactive glass, which has its own press.
+    var shrinks = true
 
     func makeBody(configuration: Configuration) -> some View {
         HoverFillBody(label: configuration.label, pressed: configuration.isPressed, style: self)
@@ -28,13 +29,125 @@ struct HoverFillStyle: ButtonStyle {
 struct HoverBrightenStyle: ButtonStyle {
     var selected = false
     var key: String? = nil
+    /// in the bar (`\.activeFills`) a round `--active-fill` shows behind the glyph while held.
+    var glyph: CGFloat? = nil
 
     func makeBody(configuration: Configuration) -> some View {
-        HoverBrightenBody(label: configuration.label, pressed: configuration.isPressed, selected: selected, key: key)
+        HoverBrightenBody(label: configuration.label, pressed: configuration.isPressed, selected: selected, key: key, glyph: glyph)
     }
 }
 
-/// The same for controls that aren't a SwiftUI `Button`.
+/// press feedback alone, for a control with no hover look.
+struct PressStyle: ButtonStyle {
+    /// A pill of `--active-fill` while held, for a text control in the bar.
+    var pill = false
+    var key: String? = nil
+
+    func makeBody(configuration: Configuration) -> some View {
+        PressBody(label: configuration.label, pressed: configuration.isPressed, pill: pill, key: key)
+    }
+}
+
+// A view of its own: state in a modifier applied straight in `makeBody` doesn't keep.
+private struct PressBody<Label: View>: View {
+    let label: Label
+    let pressed: Bool
+    let pill: Bool
+    let key: String?
+
+    var body: some View {
+        label
+            .modifier(PressShrink(pressed: pressed))
+            .modifier(ActiveFill(pressed: pressed, shape: pill ? .pill : nil, key: key))
+    }
+}
+
+/// held, it fades in from `--active-fill-start` of its size and grows over `--active-fill-grow`; let go, it fades out
+/// at the size it reached, so moving to the next control hands it over without a blink.
+/// under Reduce Motion it shows and goes at full size at once.
+struct ActiveFill: ViewModifier {
+    enum Shape { case round(CGFloat), pill }
+    let pressed: Bool
+    let shape: Shape?
+    var key: String? = nil
+    @Environment(\.activeFills) private var activeFills
+
+    func body(content: Content) -> some View {
+        content.background {
+            if activeFills, let shape { ActiveFillBody(pressed: pressed, shape: shape, key: key) }
+        }
+    }
+}
+
+private struct ActiveFillBody: View {
+    let pressed: Bool
+    let shape: ActiveFill.Shape
+    let key: String?
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var grown: CGFloat = 1
+
+    var body: some View {
+        #if DEBUG
+        let pressed = pressed || key.map { HoverLive.shared.pressed.contains($0) } == true
+        #endif
+        let on = isEnabled && pressed
+        Group {
+            switch shape {
+            case .round(let glyph):
+                Circle().fill(T.activeFill.color).frame(width: glyph * T.activeFillSize, height: glyph * T.activeFillSize)
+            case .pill:
+                Capsule().fill(T.activeFill.color).padding(.vertical, -T.activeFillPad).padding(.horizontal, -2 * T.activeFillPad)
+            }
+        }
+        .scaleEffect(grown)
+        #if DEBUG
+        .modifier(GrowProbe(scale: grown, key: key.map { "\($0) fill" }))
+        #endif
+        .opacity(on ? 1 : 0)
+        .animation(T.activeFill(on), value: on)
+        .allowsHitTesting(false)
+        .onChange(of: on) { _, held in
+            guard held, let growth = T.activeFill(true) else { return }
+            var start = Transaction(animation: nil)
+            start.disablesAnimations = true
+            withTransaction(start) { grown = T.activeFillStart }
+            withAnimation(growth) { grown = 1 }
+        }
+    }
+}
+
+/// Reduce Motion keeps the plain shrink in a `\.springPress` surface.
+struct PressShrink: ViewModifier {
+    let pressed: Bool
+    @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.springPress) private var spring
+    @State private var phase = PressPhase.rest
+    @State private var run = 0
+
+    func body(content: Content) -> some View {
+        let springs = spring && !Motion.isReduced
+        let scale = !isEnabled ? 1 : springs ? phase.scale : pressed ? T.pressShrink : 1
+        content
+            .scaleEffect(scale)
+            .animation(springs ? phase.motion : T.press(pressed), value: scale)
+            .onChange(of: pressed) { _, now in
+                guard springs else { return }
+                run += 1
+                let mine = run
+                if now { phase = .held; return }
+                phase = .squash
+                Task {
+                    try? await Task.sleep(for: .seconds(T.pressIn))
+                    guard run == mine else { return }
+                    phase = .over
+                    try? await Task.sleep(for: .seconds(T.pressOut))
+                    if run == mine { phase = .rest }
+                }
+            }
+    }
+}
+
+/// `HoverBrightenStyle` for controls that aren't a SwiftUI `Button`.
 struct HoverBrighten: ViewModifier {
     let on: Bool
     var pressed = false
@@ -54,6 +167,7 @@ private struct HoverBrightenBody<Label: View>: View {
     let pressed: Bool
     let selected: Bool
     let key: String?
+    let glyph: CGFloat?
     @State private var hovering = false
     @Environment(\.isEnabled) private var isEnabled
 
@@ -61,16 +175,19 @@ private struct HoverBrightenBody<Label: View>: View {
         let on = isEnabled && !selected && (hovering || HoverDebug.forced(key))
         label
             .modifier(HoverBrighten(on: on, pressed: pressed))
+            .modifier(PressShrink(pressed: pressed))
+            .modifier(ActiveFill(pressed: pressed, shape: glyph.map { .round($0) }, key: key))
             .onHover { hovering = $0 }
     }
 }
 
-/// Play and skip: a little larger on hover, a little smaller while pressed, no fill.
 struct HoverGrowStyle: ButtonStyle {
     var key: String? = nil
+    /// for the `--active-fill` behind it while held in the bar.
+    var glyph: CGFloat? = nil
 
     func makeBody(configuration: Configuration) -> some View {
-        HoverGrowBody(label: configuration.label, pressed: configuration.isPressed, key: key)
+        HoverGrowBody(label: configuration.label, pressed: configuration.isPressed, key: key, glyph: glyph)
     }
 }
 
@@ -78,29 +195,42 @@ private struct HoverGrowBody<Label: View>: View {
     let label: Label
     let pressed: Bool
     let key: String?
+    let glyph: CGFloat?
     @State private var hovering = false
     @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.springPress) private var spring
 
     var body: some View {
         let on = isEnabled && (hovering || HoverDebug.forced(key))
         #if DEBUG
         let pressed = pressed || key.map { HoverLive.shared.pressed.contains($0) } == true
         #endif
-        let scale = isEnabled && pressed ? T.pressShrink : on ? T.hoverGrow : 1
-        label
-            .scaleEffect(scale)
-            #if DEBUG
-            .modifier(GrowProbe(scale: scale, key: key))
-            #endif
-            .animation(T.hover(on), value: on)
-            .animation(T.press(pressed), value: pressed)
-            .onHover { hovering = $0 }
+        Group {
+            if spring {
+                label.modifier(PressShrink(pressed: pressed))
+            } else {
+                let scale = isEnabled && pressed ? T.pressShrink : on ? T.hoverGrow : 1
+                label
+                    .scaleEffect(scale)
+                    #if DEBUG
+                    .modifier(GrowProbe(scale: scale, key: key))
+                    #endif
+                    .animation(T.hover(on), value: on)
+                    .animation(T.press(pressed), value: pressed)
+                    .onHover { hovering = $0 }
+            }
+        }
+        .modifier(ActiveFill(pressed: pressed, shape: glyph.map { .round($0) }, key: key))
     }
 }
 
 extension EnvironmentValues {
     /// The hover ink where it isn't `T.hoverInk`, such as the tinted player's `playerFg`.
     @Entry var hoverInk: Color? = nil
+    /// A held control gets `--active-fill` behind it (`ActiveFill`).
+    @Entry var activeFills = false
+    /// controls press on a spring (`PressShrink`).
+    @Entry var springPress = false
 }
 
 struct HoverFillBody<Label: View>: View {
@@ -114,6 +244,7 @@ struct HoverFillBody<Label: View>: View {
         let on = isEnabled && (hovering || HoverDebug.forced(style.key))
         label
             .background { HoverFillBackground(on: on, pressed: pressed && on) }
+            .modifier(PressShrink(pressed: style.shrinks && pressed))
             .onHover { hovering = $0 }
     }
 }

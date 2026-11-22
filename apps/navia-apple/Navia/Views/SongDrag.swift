@@ -14,17 +14,15 @@ extension NSPasteboard.PasteboardType {
     static let naviaSongs = NSPasteboard.PasteboardType(UTType.naviaSongs.identifier)
 }
 
-/// A Playlists page entry as a drop target's playlist.
 func playlistRef(_ row: PlaylistRow) -> PlaylistRef { PlaylistRef(id: row.id, name: row.name) }
 
-/// Where dragged songs can land.
 enum SongDropTarget: Equatable {
     /// A playlist wherever it shows. The user's own regular playlists take songs, and smart or other people's
     /// playlists refuse them.
     case playlist(PlaylistRef, place: String)
     /// The queue tab and the bar's queue button, which add to the end of Next in Queue.
     case queueEnd(String)
-    /// The queue's own list, at the gap it opens.
+    /// at the gap it opens.
     case queue
 
     /// Tells targets apart, so only the one under the pointer is highlighted.
@@ -41,7 +39,7 @@ enum SongDropTarget: Equatable {
     /// The songs of the current or last drag. A drop reads them after the session has ended.
     private(set) var songs: [SongRow] = []
     private(set) var active = false
-    /// Songs from the queue itself, which don't drop back onto the queue.
+    /// songs from the queue don't drop back onto it.
     private(set) var fromQueue = false
     /// The highlighted target under the pointer, by `SongDropTarget.key`.
     private(set) var over: String?
@@ -93,7 +91,6 @@ enum SongDropTarget: Equatable {
         timer = nil
     }
 
-    /// Whether a target takes the songs being dragged.
     func takes(_ target: SongDropTarget) -> Bool {
         switch target {
         case .playlist(let p, _): targets.contains(p.id)
@@ -139,7 +136,6 @@ enum SongDropTarget: Equatable {
     }
 }
 
-/// Scrolling a list while something is dragged near its top or bottom edge.
 @MainActor enum EdgeScroll {
     /// Distance from the visible edge where scrolling starts, and the top speed per tick at 60 ticks a second.
     static let edge: CGFloat = 56
@@ -186,7 +182,6 @@ extension ShellModel {
         songDrag.begin(songs, fromQueue: fromQueue, targets: Set(library.playlistTargets().map(\.id)))
     }
 
-    /// Songs dropped on a target that takes them.
     func dropSongs(on target: SongDropTarget) {
         let songs = songDrag.songs
         songDrag.end()
@@ -237,7 +232,7 @@ private struct SongDropHighlight: ViewModifier {
                 if on { shape.fill(shell.theme.dropTarget.color).padding(-pad) }
             }
             .overlay {
-                if on { shape.strokeBorder(shell.theme.accent.color, lineWidth: T.dropRing).padding(-pad).allowsHitTesting(false) }
+                if on { shape.strokeBorder(shell.theme.dropTargetEdge.color, lineWidth: T.dropRing).padding(-pad).allowsHitTesting(false) }
             }
             .onDrop(of: [.naviaSongs], delegate: SongDropDelegate(target: target, shell: shell))
             .debugDropFrame(target.key, shell: shell)
@@ -260,12 +255,12 @@ extension View {
 struct SongDragCard: View {
     let lead: SongRow
     let count: Int
-    /// The lead song's cover, already decoded, or nil for the placeholder.
+    /// already decoded, or nil for the placeholder.
     let art: NSImage?
     let accent: RGBA
     let onAccent: RGBA
 
-    /// Room around the card for its shadow, in the rendered image.
+    /// in the rendered image.
     static var shadowRoom: CGFloat { T.px(28) }
 
     var body: some View {

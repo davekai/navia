@@ -71,7 +71,6 @@ struct DiagnosticsRunner: NSViewRepresentable {
             }
         }
         context.draw(top, in: CGRect(x: 0, y: 0, width: top.width, height: top.height))
-        // The window's own buttons, for checking their position against the layout.
         for (kind, color) in [(NSWindow.ButtonType.closeButton, NSColor.systemRed), (.miniaturizeButton, .systemYellow), (.zoomButton, .systemGreen)] {
             guard let button = window.standardWindowButton(kind) else { continue }
             let r = button.convert(button.bounds, to: nil)
@@ -149,12 +148,11 @@ struct DiagnosticsRunner: NSViewRepresentable {
             report["dragNewWidth"] = shell.dockWidthSaved
             report["dragWidened"] = shell.dockWidthSaved > widthBefore
             await drag(window, from: NSPoint(x: dockLeft(), y: handleY), to: NSPoint(x: dockLeft() + 2000, y: handleY))
-            report["dragClampedAtMin"] = shell.dockWidthSaved == T.dockMinTokens
+            report["dragClampedAtMin"] = shell.dockWidthSaved == T.dockMinW
             await click(window, at: NSPoint(x: dockLeft(), y: handleY), count: 2)
             try? await Task.sleep(for: .milliseconds(300))
-            report["doubleClickReset"] = shell.dockWidthSaved == T.dockDefaultTokens
+            report["doubleClickReset"] = shell.dockWidthSaved == T.dockW
 
-            // The song row rules on the real table, with real clicks.
             shell.go(.songs(genre: nil))
             try? await Task.sleep(for: .seconds(1))
             if let table = find(SongsNSTableView.self, in: window.contentView!), table.numberOfRows > 6 {
@@ -247,7 +245,6 @@ struct DiagnosticsRunner: NSViewRepresentable {
     private static func sampleArtist(_ shell: ShellModel) -> String { shell.library.topArtists(limit: 2).last?.id ?? "" }
     private static func samplePlaylist(_ shell: ShellModel) -> String { shell.library.playlists.first?.id ?? "" }
 
-    /// A press, a drag and a release, sent into this window only.
     private static func drag(_ window: NSWindow, from start: NSPoint, to end: NSPoint) async {
         func send(_ type: NSEvent.EventType, _ point: NSPoint) {
             guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else { return }
@@ -264,7 +261,7 @@ struct DiagnosticsRunner: NSViewRepresentable {
         try? await Task.sleep(for: .milliseconds(300))
     }
 
-    /// Sends a click straight to this window, so no event tap or Accessibility access is involved.
+    /// straight to this window, so no event tap or Accessibility access is involved.
     private static func click(_ window: NSWindow, at point: NSPoint, count: Int = 1, modifiers: NSEvent.ModifierFlags = []) async {
         func make(_ type: NSEvent.EventType) -> NSEvent? {
             NSEvent.mouseEvent(with: type, location: point, modifierFlags: modifiers, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: count, pressure: 1)
@@ -288,7 +285,6 @@ struct DiagnosticsRunner: NSViewRepresentable {
         return out
     }
 
-    /// Where the Settings switch is, in SwiftUI's top-left window coordinates.
     static var translucencySwitchFrame: CGRect?
 
     /// Large layers that paint solid. Anything here hides the blur.
@@ -378,7 +374,6 @@ struct DiagnosticsRunner: NSViewRepresentable {
         }
         shell.go(route)
 
-        // The blur has to keep filling the window as it resizes.
         let frame = window.frame
         window.setFrame(NSRect(x: frame.minX, y: frame.minY, width: frame.width - 200, height: frame.height - 120), display: true)
         report["7_resized"] = await translucencyState(window, shell)
@@ -398,7 +393,7 @@ struct DiagnosticsRunner: NSViewRepresentable {
         var report: [String: Any] = ["windowNumber": window.windowNumber, "frame": NSStringFromRect(window.frame)]
         let root = window.contentView!.superview!
 
-        // What a click at the top of the content would land on. Coordinates are from the bottom-left.
+        // coordinates are from the bottom-left.
         let h = root.bounds.height, w = root.bounds.width
         report["hitTopBarBack"] = describeHit(root, NSPoint(x: shell.sidebarPoints(windowWidth: w, docked: shell.player.current != nil) + T.windowInset + T.gutter + 20, y: h - T.topbarH / 2))
         report["hitTopBarCenter"] = describeHit(root, NSPoint(x: w / 2, y: h - T.topbarH / 2))
@@ -417,7 +412,6 @@ struct DiagnosticsRunner: NSViewRepresentable {
                 let name = cell.subviews.compactMap { $0 as? NSTextField }.first
                 report["cellFont"] = name?.font.map { "\($0.fontName) \($0.pointSize)" } ?? "?"
             }
-            // Jump through the table a page at a time and time each layout.
             var samples: [Double] = []
             let contentH = table.frame.height
             let pageH = scroll.contentView.bounds.height

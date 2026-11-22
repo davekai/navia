@@ -21,7 +21,6 @@ enum FilterPage { case songs, artists }
     var pendingOpen: SongFilterId?
     @ObservationIgnored private var optionsCache: [SongFilterId: [SongFilterOptionRow]] = [:]
     @ObservationIgnored private var quickCache: [SongFilterId: [SongFilterQuickRow]] = [:]
-    /// Called with the settings whenever they change, so the list narrows.
     @ObservationIgnored var onChange: (([SongFilterSetting]) -> Void)?
 
     init(core: NaviaCore?, page: FilterPage, genre: String? = nil) {
@@ -56,7 +55,7 @@ enum FilterPage { case songs, artists }
         }
     }
 
-    /// The chips shown: the main set, those added from More Filters, and any that are set.
+    /// the main set, those added from More Filters, and any that are set.
     var shown: [SongFilterId] { available.filter { info($0).main || added.contains($0) || value($0) != nil } }
     var rest: [SongFilterId] { available.filter { !shown.contains($0) } }
 

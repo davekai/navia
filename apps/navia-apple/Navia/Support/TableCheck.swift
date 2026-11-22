@@ -200,7 +200,7 @@ import AppKit
         return ["tableDragCard": value, "frame": [Double(card.frame.minX), Double(card.frame.minY), Double(card.frame.width), Double(card.frame.height)]]
     }
 
-    /// `tableDrop=I+J:ROW`: drops songs I and J above table row ROW through the same path as `acceptDrop`.
+    /// `tableDrop=I+J:ROW`, through the same path as `acceptDrop`.
     static func drop(_ value: String, window: NSWindow) async -> [String: Any] {
         let parts = value.split(separator: ":")
         guard parts.count == 2, let row = Int(parts[1]), let table = table(window), let c = table.controller else { return ["tableDrop": "bad"] }
@@ -215,7 +215,7 @@ import AppKit
         return out
     }
 
-    /// `tableGeom`: where the clip view, the table's visible rect and its tracking areas reach in the window.
+    /// `tableGeom`.
     static func geometry(_ window: NSWindow) -> [String: Any] {
         guard let table = table(window), let scroll = table.enclosingScrollView else { return ["tableGeom": "no table"] }
         let clip = scroll.contentView
@@ -328,7 +328,7 @@ import AppKit
                 "settled": Double(clip.bounds.origin.y), "insetTop": Double(scroll.contentInsets.top), "offsets": offsets.map { ($0 * 10).rounded() / 10 }]
     }
 
-    /// `tableTop`: scrolls to the top the way the page does on open (to minus the top inset) and reports it.
+    /// `tableTop`: scrolls to the top as the page does on open.
     static func top(_ window: NSWindow) -> [String: Any] {
         guard let table = table(window), let scroll = table.enclosingScrollView else { return ["tableTop": "no table"] }
         scroll.contentView.scroll(to: NSPoint(x: 0, y: -scroll.contentInsets.top))
@@ -344,7 +344,7 @@ import AppKit
         return ["tableMakeKey": window.isKeyWindow]
     }
 
-    /// `tableSelectAll`: Select All, then what it selected against the songs, and whether a header row got in.
+    /// `tableSelectAll`.
     static func selectAll(_ window: NSWindow) -> [String: Any] {
         guard let table = table(window), let c = table.controller else { return ["tableSelectAll": "no table"] }
         table.selectAll(nil)

@@ -62,15 +62,13 @@ enum GlowScrim {
         return peak
     }
 
-    /// The expanded player's backdrop gradient, top-left to bottom-right: the vivid tint darkened toward
-    /// `T.playerShadeStart`, the tint itself at 42%, darkened toward `T.playerShadeEnd`. Drawn by `PlayerExpanded`.
+    /// the expanded player's backdrop gradient, as `PlayerExpanded` draws it.
     static func backdropStops(_ tint: Tint) -> [(color: RGBA, location: Double)] {
         let vivid = tint.playerVivid
         return [(vivid.mixed(with: T.playerShadeStart, amount: T.playerShadeMix), 0), (vivid, 0.42), (vivid.mixed(with: T.playerShadeEnd, amount: 0.58), 1)]
     }
 
-    /// The black scrim's opacity: none when the backdrop is dark enough, else what brings its peak down to the
-    /// contrast targets, at most `T.glowScrimMax`.
+    /// none when the backdrop is dark enough, else what brings its peak down to the targets.
     static func alpha(peak: Double, tint: Tint) -> Double {
         let target = min((tint.playerFgDim.luminance + 0.05) / dimContrast, (tint.playerFg.luminance + 0.05) / fgContrast) - 0.05
         guard peak > target else { return 0 }

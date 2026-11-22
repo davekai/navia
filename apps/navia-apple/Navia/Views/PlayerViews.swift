@@ -1,10 +1,9 @@
 import SwiftUI
 
-/// The dock's left edge, an `edgeGrabW` strip straddling the gap to the page. Double-click resets to the default width.
+/// the dock's left edge, a `dockGrabW` strip; double-click resets to the default width.
 struct DockResizeHandle: NSViewRepresentable {
     let shell: ShellModel
     let windowWidth: CGFloat
-    /// The sidebar's width in points when it takes room beside the page.
     let sidebar: CGFloat?
 
     func makeNSView(context: Context) -> EdgeResizeView {
@@ -21,17 +20,17 @@ struct DockResizeHandle: NSViewRepresentable {
             if let drag = shell.dockDragWidth { shell.dockWidthSaved = drag }
             shell.dockDragWidth = nil
         }
-        view.onReset = { shell.dockWidthSaved = T.dockDefaultTokens }
+        view.onReset = { shell.dockWidthSaved = T.dockW }
     }
 
     private func clamped(_ tokens: CGFloat) -> CGFloat {
         let sidebar = sidebar.map { $0 + T.windowInset } ?? 0
         let room = (windowWidth - sidebar - T.windowInset - T.pageMinW) / T.scale
-        return min(max(T.dockMinTokens, min(tokens, T.dockMaxTokens)), max(T.dockMinTokens, room))
+        return min(max(T.dockMinW, min(tokens, T.dockMaxW)), max(T.dockMinW, room))
     }
 }
 
-/// The sidebar's right edge, the dock edge's twin: drag to resize, double-click for the default width.
+/// the sidebar's right edge, the dock edge's twin.
 struct SidebarResizeHandle: NSViewRepresentable {
     let shell: ShellModel
     let windowWidth: CGFloat
@@ -48,13 +47,13 @@ struct SidebarResizeHandle: NSViewRepresentable {
         view.growsRight = true
         view.onDrag = { delta in
             let room = shell.sidebarRoomTokens(windowWidth: windowWidth, docked: docked)
-            shell.sidebarDragWidth = min(max(T.sidebarMinTokens, shell.sidebarWidthSaved + delta), room)
+            shell.sidebarDragWidth = min(max(T.sidebarWMin, shell.sidebarWidthSaved + delta), room)
         }
         view.onEnd = {
             if let drag = shell.sidebarDragWidth { shell.sidebarWidthSaved = drag }
             shell.sidebarDragWidth = nil
         }
-        view.onReset = { shell.sidebarWidthSaved = T.sidebarDefaultTokens }
+        view.onReset = { shell.sidebarWidthSaved = T.sidebarW }
     }
 }
 
@@ -95,7 +94,6 @@ struct PlayerDock: View {
     let settledWidth: CGFloat
     let windowHeight: CGFloat
     @Environment(\.isSnapshot) private var isSnapshot
-    /// How far the artwork view has scrolled, for its top fade.
     @State private var artScrolled: CGFloat = 0
     private var player: any PlayerViewModel { shell.player }
 
@@ -114,6 +112,7 @@ struct PlayerDock: View {
         .foregroundStyle(tint.playerFg.color)
         .environment(\.playerDim, tint.playerFgDim.color)
         .environment(\.hoverInk, tint.playerFg.color)
+        .environment(\.springPress, true)
         .background(
             LinearGradient(stops: [.init(color: tint.playerVivid.color, location: 0.35),
                                    .init(color: tint.playerVivid.mixed(with: T.dockShade, amount: T.playerShadeMix).color, location: 1)],
@@ -125,11 +124,14 @@ struct PlayerDock: View {
         .shadow(T.shadowDock)
     }
 
-    @ViewBuilder private func bodyView(tint: Tint) -> some View {
-        switch shell.shownPlayerView {
-        case .artwork: artworkScroll(tint: tint)
-        case .lyrics: LyricsView(shell: shell).padding(.top, T.px(76))
-        case .queue: QueueListView(shell: shell).padding(.top, T.px(76))
+    private func bodyView(tint: Tint) -> some View {
+        Swap(key: shell.shownPlayerView, kind: .view) {
+            switch shell.shownPlayerView {
+            case .artwork: artworkScroll(tint: tint)
+            // covered by the full screen player, the dock's lyrics stop rather than run unseen.
+            case .lyrics: if shell.expanded { Color.clear } else { LyricsView(shell: shell).padding(.top, T.px(76)) }
+            case .queue: QueueListView(shell: shell).padding(.top, T.px(76))
+            }
         }
     }
 
@@ -142,7 +144,7 @@ struct PlayerDock: View {
             // Expand and the mini player on the left, the switcher centered regardless.
             ZStack {
                 HStack {
-                    IconButton(symbol: "arrow.up.left.and.arrow.down.right", label: L("Expand player"), size: T.px(18)) { withAnimation(ExpandClip.animation) { shell.expanded = true } }
+                    FullScreenButton(shell: shell, size: T.px(18))
                     MiniPlayerButton(shell: shell, size: T.px(18))
                     Spacer()
                     IconButton(symbol: "rectangle.bottomthird.inset.filled", label: L("Move player to the bottom"), size: T.px(18)) { shell.playerMode = .bar }
@@ -160,6 +162,7 @@ struct PlayerDock: View {
         let artHeight = min(T.px(502), windowHeight * 0.56 * T.scale) // 56% of the window height, at the interface scale.
         let kind: ArtworkKind = player.station == nil ? .album : .station
         let content = VStack(alignment: .leading, spacing: 0) {
+            Swap(key: player.current?.id, kind: .song) {
             ZStack(alignment: .top) {
                 ArtworkView(url: player.current?.artworkURL, kind: kind, alignment: .bottom)
                     .frame(width: settledWidth, height: T.px(240))
@@ -172,9 +175,10 @@ struct PlayerDock: View {
                     .mask(LinearGradient(stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.2), .init(color: .clear, location: 1)], startPoint: .top, endPoint: .bottom))
                     .offset(y: artHeight - T.px(95))
                     .allowsHitTesting(false)
-                ArtworkView(url: player.current?.artworkURL, kind: kind, alignment: .top)
+                ArtworkView(url: player.current?.artworkURL, kind: kind, alignment: .top, animates: !shell.expanded)
                     .frame(height: artHeight)
                     .mask(LinearGradient(stops: [.init(color: .black, location: 0.8), .init(color: .clear, location: 1)], startPoint: .top, endPoint: .bottom))
+            }
             }
             .frame(height: artHeight, alignment: .top)
 
@@ -219,7 +223,7 @@ struct PlayerDock: View {
     }
 
     private func footer(tint: Tint) -> some View {
-        PlayerControls(shell: shell, skipSize: T.px(32), playSize: T.px(44))
+        PlayerControls(shell: shell, skipSize: T.px(32), playSize: T.px(44), swapsSong: true)
             .padding(.top, T.px(12))
             .padding(.horizontal, T.px(32))
             .padding(.bottom, T.px(28))
@@ -250,11 +254,12 @@ private struct FeaturedArtistCell: View {
     }
 }
 
-/// The title row, scrubber, transport and volume shared by the dock and the expanded player.
 struct PlayerControls: View {
     let shell: ShellModel
     let skipSize: CGFloat
     let playSize: CGFloat
+    /// the title cross-fades on a song change (the side player); full screen it just changes.
+    var swapsSong = false
     @Environment(\.playerDim) private var dim
     private var player: any PlayerViewModel { shell.player }
 
@@ -264,25 +269,28 @@ struct PlayerControls: View {
                 PlayerChipSlot(player: player).padding(.bottom, T.px(12))
             }
             HStack(spacing: 0) {
+                Swap(key: swapsSong ? player.current?.id : nil, kind: .song, alignment: .leading) {
                 VStack(alignment: .leading, spacing: T.px(2)) {
                     // The title links to its album and each artist to theirs.
                     if let song = player.current {
-                        HStack(spacing: T.textLG * 0.27) {
-                            LinkedText(pieces: [LinkPiece.title(song)], shell: shell).font(.navia(T.textLG, .medium)).foregroundStyle(T.tOnArt.color)
-                            if song.isExplicit { ExplicitMark(size: T.textLG) }
+                        MarqueeText {
+                            HStack(spacing: T.textLG * 0.27) {
+                                LinkedText(pieces: [LinkPiece.title(song)], shell: shell).font(.navia(T.textLG, .medium)).foregroundStyle(T.tOnArt.color)
+                                if song.isExplicit { ExplicitMark(size: T.textLG) }
+                            }
                         }
-                        LinkedText(pieces: LinkPiece.artist(song), shell: shell).font(.navia(T.textMD)).playerDim(dim)
+                        MarqueeText { LinkedText(pieces: LinkPiece.artist(song), shell: shell).font(.navia(T.textMD)).playerDim(dim) }
                         OutputBadge(shell: shell).playerDim(dim).padding(.top, T.px(2))
                     }
                 }
+                }
                 .lineLimit(1)
-                // Right-click on the song: the same menu as More.
                 .rightClickMenu { playerMenu(shell) }
                 Spacer(minLength: T.px(8))
                 FavoriteButton(player: player)
                 TrackMenuButton(shell: shell)
             }
-            .padding(.bottom, T.px(16))
+            .padding(.bottom, T.playerMetaGap)
 
             ScrubberStacked(shell: shell)
 
@@ -297,14 +305,14 @@ struct PlayerControls: View {
                 Spacer()
                 RepeatButton(shell: shell, size: T.px(24))
             }
-            .padding(.top, T.px(12))
+            .padding(.top, T.playerTransportGap)
             .padding(.horizontal, T.px(-8))
 
             HStack(spacing: T.px(6)) {
                 VolumeRow(player: player)
                 OutputButton(shell: shell, size: T.px(17)).playerDim(dim)
             }
-            .padding(.top, T.px(8))
+            .padding(.top, T.playerVolumeGap)
             .padding(.horizontal, T.px(-8))
         }
     }
@@ -312,7 +320,7 @@ struct PlayerControls: View {
 
 struct ViewSwitcher: View {
     let shell: ShellModel
-    private var hasLyrics: Bool { shell.player.current?.hasLyrics == true && shell.player.station == nil }
+    private var hasLyrics: Bool { shell.player.mayHaveLyrics && shell.player.station == nil }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -321,8 +329,7 @@ struct ViewSwitcher: View {
             tab("list.bullet", label: L("Queue"), view: .queue, disabled: false)
         }
         .padding(T.px(4))
-        .modifier(SwitcherGlass())
-        .overlay(Capsule().strokeBorder(T.switcherEdge.color, lineWidth: 1).allowsHitTesting(false))
+        .plainGlass(Capsule(), flat: T.glassOn)
     }
 
     private func tab(_ symbol: String, label: String, view: PlayerView, disabled: Bool) -> some View {
@@ -335,11 +342,11 @@ struct ViewSwitcher: View {
                 .foregroundStyle(on ? AnyShapeStyle(T.tEm.color) : AnyShapeStyle(.foreground))
                 .frame(width: T.px(50), height: T.px(40))
                 .background(Capsule().fill(on ? T.switcherOn.color : .clear))
+                .animation(T.toggle, value: on)
                 .contentShape(Capsule())
-                .opacity(disabled ? 0.3 : on ? 1 : 0.85)
+                .opacity(disabled ? 0.3 : on ? 1 : T.switcherRest)
         }
         .buttonStyle(HoverBrightenStyle(selected: on, key: label))
-        // Songs dropped on the Queue tab go to the end of Next in Queue.
         .modifier(QueueTabDrop(view: view, shell: shell))
         .disabled(disabled)
         .help(disabled ? L("No lyrics for this song") : label)
@@ -356,17 +363,6 @@ private struct QueueTabDrop: ViewModifier {
             content.songDropTarget(.queueEnd("tab"), shell: shell)
         } else {
             content
-        }
-    }
-}
-
-private struct SwitcherGlass: ViewModifier {
-    @Environment(\.isSnapshot) private var isSnapshot
-    func body(content: Content) -> some View {
-        if isSnapshot {
-            content.background(Capsule().fill(T.switcherGlass.color))
-        } else {
-            content.glassEffect(.regular.tint(T.switcherGlass.color), in: Capsule())
         }
     }
 }
@@ -396,7 +392,7 @@ private struct ScrubberStacked: View {
                 TrackSlider(value: player.position, total: Double(player.current?.duration ?? 0), rest: T.playerTrack) { player.seek(to: $0) }
                 // Between the times: Private mode's mark, Waiting for server and the quality badge.
                 HStack(spacing: 0) {
-                    Text(clock(player.position))
+                    ScrubTime(shell: shell, side: .elapsed)
                     Spacer(minLength: T.px(8))
                     HStack(spacing: T.px(10)) {
                         PrivateBadge(player: player)
@@ -404,7 +400,7 @@ private struct ScrubberStacked: View {
                         QualityBadge(shell: shell)
                     }
                     Spacer(minLength: T.px(8))
-                    Text(clock(Double(player.current?.duration ?? 0)))
+                    ScrubTime(shell: shell, side: .end)
                 }
                 .font(.navia(T.textSM).monospacedDigit())
                 .playerDim(dim)
@@ -414,7 +410,27 @@ private struct ScrubberStacked: View {
     }
 }
 
-/// A quiet mark near the player while private mode is on.
+/// A time beside a scrubber: elapsed, or at the end the length or what's left (`timeShowsRemaining`); a click switches it.
+struct ScrubTime: View {
+    enum Side { case elapsed, end }
+    let shell: ShellModel
+    let side: Side
+
+    var body: some View {
+        let remaining = shell.timeShowsRemaining
+        Button { shell.timeShowsRemaining.toggle() } label: {
+            Text(side == .elapsed ? clock(shell.player.position) : Self.endText(shell)).contentShape(Rectangle())
+        }
+        .buttonStyle(PressStyle(pill: true, key: side == .elapsed ? "time-elapsed" : "time-end"))
+        .help(remaining ? L("Show song length") : L("Show remaining time"))
+    }
+
+    static func endText(_ shell: ShellModel) -> String {
+        let total = Double(shell.player.current?.duration ?? 0)
+        return shell.timeShowsRemaining ? "\u{2212}" + clock(max(0, total - shell.player.position)) : clock(total)
+    }
+}
+
 struct PrivateBadge: View {
     let player: any PlayerViewModel
     var body: some View {
@@ -450,9 +466,9 @@ struct VolumeRow: View {
     @Environment(\.playerDim) private var dim
     var body: some View {
         HStack(spacing: T.px(6)) {
-            // The icon takes the dimmer ink, the level the bright one.
-            IconButton(symbol: volumeSymbol(player), label: player.isMuted ? L("Unmute") : L("Mute"), size: T.px(16)) { player.isMuted.toggle() }.playerDim(dim)
-            // On AirPlay the slider drives the receiver's own volume. The core sends it only when moved.
+            // The icon takes the dimmer step; the level keeps the bright one.
+            IconButton(symbol: volumeSymbol(player), label: player.isMuted ? L("Unmute") : L("Mute"), size: T.px(16), level: volumeLevel(player)) { player.isMuted.toggle() }.playerDim(dim)
+            // on AirPlay the slider drives the receiver's own volume.
             let receiver = AirPlayModel.shared.active
             TrackSlider(value: player.isMuted ? 0 : player.volume, total: 100, rest: T.playerTrack, onWheel: { player.stepVolume($0) }) { player.setVolumeFromSlider($0) }
                 .accessibilityLabel(receiver.map { L("Volume on {device}", ["device": $0.name]) } ?? L("Volume"))
@@ -463,7 +479,7 @@ struct VolumeRow: View {
 
 private let volumeWheelStep: Double = 5
 
-private extension PlayerViewModel {
+extension PlayerViewModel {
     func setVolumeFromSlider(_ value: Double) {
         volume = value
         if value > 0 { isMuted = false }
@@ -474,14 +490,16 @@ private extension PlayerViewModel {
 }
 
 private func volumeSymbol(_ player: any PlayerViewModel) -> String {
-    if player.isMuted || player.volume == 0 { return "speaker.slash.fill" }
-    return player.volume < 50 ? "speaker.wave.1.fill" : "speaker.wave.3.fill"
+    player.isMuted || player.volume == 0 ? "speaker.slash.fill" : "speaker.wave.3.fill"
 }
+
+/// the waves light up one by one as the volume rises.
+private func volumeLevel(_ player: any PlayerViewModel) -> Double { player.isMuted ? 0 : player.volume / 100 }
 
 private struct FavoriteButton: View {
     let player: any PlayerViewModel
     var body: some View {
-        IconButton(symbol: "heart", label: L("Favorite"), active: player.current?.isFavorite ?? false, disabled: player.station != nil) { player.toggleFavorite() }
+        IconButton(symbol: "heart", label: L("Favorite"), active: player.current?.isFavorite ?? false, disabled: player.station != nil, pop: true) { player.toggleFavorite() }
     }
 }
 
@@ -548,10 +566,13 @@ struct ModeButton: View {
             }
             .frame(width: box, height: box)
             .foregroundStyle(on ? AnyShapeStyle(accent.color) : AnyShapeStyle(.foreground))
+            .animation(T.toggle, value: on)
+            .animation(T.toggle, value: badge)
             .contentShape(Rectangle())
         }
-        .buttonStyle(HoverBrightenStyle(key: label))
+        .buttonStyle(HoverBrightenStyle(key: label, glyph: size * 0.78))
         .opacity(disabled ? T.modeDisabled : on || hovering ? 1 : T.modeRest)
+        .animation(T.toggle, value: on)
         .disabled(disabled)
         .onHover { hovering = $0 }
         .help(help ?? label)
@@ -560,7 +581,6 @@ struct ModeButton: View {
     }
 }
 
-/// Shuffle for the transport row and Up Next. The same state everywhere.
 struct ShuffleButton: View {
     let shell: ShellModel
     let size: CGFloat
@@ -572,7 +592,6 @@ struct ShuffleButton: View {
     }
 }
 
-/// Repeat for the transport row. Each click cycles off, all, one.
 struct RepeatButton: View {
     let shell: ShellModel
     let size: CGFloat
@@ -596,7 +615,7 @@ struct SkipButton: View {
         Button(action: action) {
             Image(systemName: symbol).font(.system(size: size * 0.8)).frame(width: box ?? size + 8, height: box ?? size + 8).contentShape(Rectangle())
         }
-        .buttonStyle(HoverGrowStyle(key: label))
+        .buttonStyle(HoverGrowStyle(key: label, glyph: size * 0.8))
         .disabled(disabled)
         .opacity(disabled ? 0.35 : 1)
         .help(disabled ? L("Stations can't be skipped") : label)
@@ -612,30 +631,38 @@ struct PlayPauseButton: View {
         Button { player.togglePlayPause() } label: {
             Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
                 .font(.system(size: size * 0.8))
+                .contentTransition(.opacity)
+                .animation(T.easeOut(T.pressSwap), value: player.isPlaying)
                 .frame(width: box ?? size + 6, height: box ?? size + 6)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(HoverGrowStyle(key: "PlayPause"))
+        .buttonStyle(HoverGrowStyle(key: "PlayPause", glyph: size * 0.8))
+        .help(player.isPlaying ? L("Pause") : L("Play"))
         .accessibilityLabel(player.isPlaying ? L("Pause") : L("Play"))
     }
 }
 
-/// The floating bottom bar, the player's other form.
 struct PlayerBar: View {
     let shell: ShellModel
     let canDock: Bool
+    /// how far it's in as it slides up from below the window, 0 to 1.
+    var shown: CGFloat = 1
     @State private var volumeHover = BarVolumeHover()
+    @State private var barScrubHover = false
+    @State private var barScrubWait: Task<Void, Never>?
+    @State private var barArtHover = false
     private var player: any PlayerViewModel { shell.player }
 
     var body: some View {
         let tint = Tint(hex: player.current?.tintHex)
         ZStack(alignment: .bottom) {
-            // Gradient fractions apply to both axes, so the frame is taller by 1 / 0.52 to get an ellipse 52% wide and full height.
-            EllipticalGradient(colors: [tint.barGlow.opacity(T.barGlowOpacity).color, .clear], center: .bottom, startRadiusFraction: 0, endRadiusFraction: 0.52)
+            // fractions apply to both axes, so the frame is 1 / 0.52 taller for an ellipse 52% wide and full height.
+            EllipticalGradient(colors: [tint.barGlow.opacity(T.barGlowStrength).color, .clear], center: .bottom, startRadiusFraction: 0, endRadiusFraction: 0.52)
                 .frame(height: T.px(150) / 0.52)
                 .frame(height: T.px(150), alignment: .bottom)
                 .frame(maxWidth: .infinity)
                 .allowsHitTesting(false)
+                .opacity(shown)
 
             GeometryReader { geo in
                 let fit = BarFit(width: geo.size.width / T.scale, canDock: canDock)
@@ -658,7 +685,12 @@ struct PlayerBar: View {
             .frame(maxWidth: T.barW)
             .padding(.horizontal, T.px(14))
             .padding(.bottom, T.windowInset)
+            .offset(y: (T.barH + T.windowInset) * (1 - shown))
         }
+        .environment(\.activeFills, true)
+        .environment(\.springPress, true)
+        // the first click on an inactive window presses the control at once.
+        .allowsWindowActivationEvents(true)
         .overlayPreferenceValue(BarVolumeAnchor.self) { anchor in
             GeometryReader { geo in
                 if let anchor, volumeHover.open {
@@ -672,7 +704,7 @@ struct PlayerBar: View {
 
     private func openExpanded(_ view: PlayerView? = nil) {
         if let view { shell.playerView = view }
-        withAnimation(ExpandClip.animation) { shell.expanded = true }
+        shell.setExpanded(true)
     }
 
     /// Lyrics and Queue open the docked player on that view. A window too narrow to dock opens them full screen.
@@ -684,57 +716,111 @@ struct PlayerBar: View {
 
     /// Narrow bars drop extras in order: 1 Output and More, 2 heart and volume, 3 shuffle and repeat.
     private func bar(drop: Int, compact: Bool) -> some View {
-        // The bar's neutral colors, never the cover tint.
-        let fg = T.barInk.color, dim = T.barInk.color
-        // The play controls sit at the bar's exact center, with equal halves either side.
+        // the bar is neutral, never the cover tint.
+        let fg = T.tOnArt.color, dim = T.barInk.color
         return CentredRow(gap: T.px(BarFit.gap)) {
-            HStack(spacing: T.px(BarFit.gap)) {
-            Button { openExpanded() } label: {
-                ArtworkView(url: player.current?.artworkURL, kind: player.station == nil ? .album : .station, pixels: 120)
-                    .frame(width: T.px(38), height: T.px(38))
-                    .clipShape(RoundedRectangle(cornerRadius: T.rSM, style: .continuous))
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(L("Open player"))
-
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: T.px(10)) {
-                    HStack(spacing: 0) {
-                        if let song = player.current {
-                            LinkedText(pieces: [LinkPiece.title(song)], shell: shell).font(.navia(T.textMD, .medium)).foregroundStyle(T.barTitle.color).layoutPriority(1)
-                            if song.isExplicit { ExplicitMark(size: T.textMD).padding(.leading, T.textMD * 0.27) }
-                            if !song.artist.isEmpty {
-                                Text(verbatim: "  – ").font(.navia(T.textMD)).foregroundStyle(dim).fixedSize()
-                                LinkedText(pieces: LinkPiece.artist(song), shell: shell).font(.navia(T.textMD)).foregroundStyle(dim)
+            // over the progress line it rises and the times show over the rows, blurred behind them.
+            let timesShown = player.station == nil && barScrubHover
+            // the line's slot is taller than the line, so it overlaps upward by its empty half.
+            VStack(alignment: .leading, spacing: T.barLineGap - (T.scrubSlot - T.barScrubRest) / 2) {
+                ZStack(alignment: .bottomLeading) {
+                    HStack(spacing: T.px(BarFit.gap)) {
+                        Button { openExpanded() } label: {
+                            Swap(key: player.current?.id, kind: .song) {
+                                ArtworkView(url: player.current?.artworkURL, kind: player.station == nil ? .album : .station, pixels: 120)
+                            }
+                                .frame(width: T.barArt, height: T.barArt)
+                                .overlay {
+                                    ArtOverlay(shown: barArtHover) {
+                                        Image(systemName: "arrow.up.left.and.arrow.down.right").font(.system(size: T.barArtExpand, weight: .bold))
+                                    }
+                                }
+                                .clipShape(RoundedRectangle(cornerRadius: T.rSM, style: .continuous))
+                                .scaleEffect(barArtHover ? T.barArtGrow : 1)
+                                .animation(T.hover(barArtHover), value: barArtHover)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { barArtHover = $0 }
+                        .help("\(L("Expand player")) (⇧⌘F)")
+                        .accessibilityLabel(L("Expand player"))
+                        Swap(key: player.current?.id, kind: .song, alignment: .leading) {
+                        VStack(alignment: .leading, spacing: T.px(1)) {
+                            HStack(spacing: T.px(10)) {
+                                MarqueeText { HStack(spacing: 0) {
+                                    if let song = player.current {
+                                        LinkedText(pieces: [LinkPiece.title(song)], shell: shell).font(.navia(T.textMD, .medium)).foregroundStyle(T.barTitle.color).layoutPriority(1)
+                                        if song.isExplicit { ExplicitMark(size: T.textMD).padding(.leading, T.textMD * 0.27) }
+                                    }
+                                } }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                QualityBadge(shell: shell, bar: true, glyphOnly: drop >= 1).foregroundStyle(dim)
+                                PrivateBadge(player: player).foregroundStyle(dim)
+                                WaitingBadge(player: player).foregroundStyle(dim)
+                                OutputBadge(shell: shell, compact: true, glyphOnly: drop >= 1).foregroundStyle(dim)
+                            }
+                            if let song = player.current, !song.artist.isEmpty {
+                                MarqueeText { LinkedText(pieces: LinkPiece.artist(song), shell: shell) }
+                                .font(.navia(T.textSM))
+                                .foregroundStyle(dim)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
+                        }
+                        .lineLimit(1)
+                        // the artwork sets the block's height, so it and the line end up equally far from the bar's edges.
+                        .frame(height: T.barArt)
+                        .rightClickMenu { playerMenu(shell) }
                     }
-                    .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                    // Right-click on the song: the same menu as More.
-                    .rightClickMenu { playerMenu(shell) }
-                    PrivateBadge(player: player).foregroundStyle(dim)
-                    WaitingBadge(player: player).foregroundStyle(dim)
-                    // Where it plays on AirPlay. Only the glyph once the bar drops its Output button.
-                    OutputBadge(shell: shell, compact: true, glyphOnly: drop >= 1).foregroundStyle(dim)
+                    .blur(radius: timesShown ? T.barRowsBlur : 0)
+                    .opacity(timesShown ? T.barRowsDim : 1)
+                    .allowsHitTesting(!timesShown)
+                    if player.station == nil {
+                        HStack(spacing: T.px(12)) {
+                            ScrubTime(shell: shell, side: .elapsed).lineLimit(1).fixedSize()
+                            Spacer(minLength: 0)
+                            QualityBadge(shell: shell, bar: true)
+                            Spacer(minLength: 0)
+                            ScrubTime(shell: shell, side: .end).lineLimit(1).fixedSize()
+                        }
+                        .font(.navia(T.textSM).monospacedDigit())
+                        .foregroundStyle(dim)
+                        .opacity(timesShown ? 1 : 0)
+                        .offset(y: timesShown ? -T.barScrubRise : 0)
+                        .allowsHitTesting(timesShown)
+                    }
                 }
-                HStack(spacing: T.px(12)) {
-                    if player.station != nil {
+                .animation(T.reveal(timesShown), value: timesShown)
+                if player.station != nil {
+                    HStack(spacing: T.px(12)) {
                         Text(L("Live")).fontWeight(.semibold).lineLimit(1).fixedSize()
-                        Capsule().fill(.foreground).opacity(0.3).frame(height: 4)
-                    } else {
-                        Text(clock(player.position)).lineLimit(1).fixedSize().frame(minWidth: T.px(28), alignment: .leading)
-                        TrackSlider(value: player.position, total: Double(player.current?.duration ?? 0), rest: T.barTrack) { player.seek(to: $0) }.foregroundStyle(fg)
-                        Text(clock(Double(player.current?.duration ?? 0))).lineLimit(1).fixedSize().frame(minWidth: T.px(30), alignment: .trailing)
-                        QualityBadge(shell: shell, bar: true)
+                        Capsule().fill(.foreground).opacity(0.3).frame(height: T.barScrubRest)
                     }
+                    .font(.navia(T.textSM))
+                    .foregroundStyle(dim)
+                } else {
+                    // hover is tracked on the unmoved slot, so the rise can't carry the line out from under the pointer.
+                    ZStack {
+                        TrackSlider(value: player.position, total: Double(player.current?.duration ?? 0), rest: T.barTrack, grows: true, raised: timesShown) { player.seek(to: $0) }
+                            .foregroundStyle(fg)
+                            .offset(y: timesShown ? -T.barScrubRise : 0)
+                            .animation(T.reveal(timesShown), value: timesShown)
+                    }
+                    .padding(.top, T.barScrubReach)
+                    .contentShape(Rectangle())
+                    .onHover { over in
+                        barScrubWait?.cancel()
+                        // A short wait, so passing over the line on the way to the artwork doesn't raise it.
+                        if over { barScrubWait = Task { try? await Task.sleep(for: .seconds(T.barScrubDelay)); if !Task.isCancelled { barScrubHover = true } } }
+                    }
+                    .padding(.top, -T.barScrubReach)
                 }
-                .font(.navia(T.textSM).monospacedDigit())
-                .foregroundStyle(dim)
             }
-            .frame(maxWidth: .infinity)
-            }
-            .padding(.leading, T.px(BarFit.padLeading))
+            .padding(.top, T.barArtInset)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            // once raised, the line stays up while the pointer is anywhere over the block, so the times can be reached.
+            .onHover { if !$0 { barScrubWait?.cancel(); barScrubHover = false } }
+            .padding(.leading, T.barArtInset)
 
             HStack(spacing: T.px(6)) {
                 if drop < 3 { ShuffleButton(shell: shell, size: T.px(20)) }
@@ -758,12 +844,11 @@ struct PlayerBar: View {
                         BarVolumeButton(player: player, hover: volumeHover)
                         Spacer().frame(width: T.px(16))
                     }
-                    let hasLyrics = player.current?.hasLyrics == true && player.station == nil
+                    let hasLyrics = player.mayHaveLyrics && player.station == nil
                     IconButton(symbol: "quote.bubble", label: hasLyrics ? L("Lyrics") : L("No lyrics for this song"), disabled: !hasLyrics) { openSide(.lyrics) }
                     IconButton(symbol: "list.bullet", label: L("Queue")) { openSide(.queue) }
                         .songDropTarget(.queueEnd("bar"), shell: shell)
                     MiniPlayerButton(shell: shell)
-                    IconButton(symbol: "arrow.up.left.and.arrow.down.right", label: L("Expand player")) { openExpanded() }
                     if canDock {
                         IconButton(symbol: "rectangle.righthalf.inset.filled", label: L("Dock on the right")) { shell.playerMode = .dock }
                     }
@@ -775,7 +860,7 @@ struct PlayerBar: View {
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .frame(maxHeight: .infinity)
-        .modifier(BarGlass())
+        .plainGlass(RoundedRectangle(cornerRadius: T.px(22), style: .continuous), flat: T.floatGlass)
         .shadow(T.shadowFloat)
     }
 }
@@ -784,13 +869,13 @@ struct PlayerBar: View {
 /// in half of what's left. Extras drop in order (Output and More, heart and volume, shuffle and repeat, then the
 /// whole group) at fixed widths, or sooner if they don't fit. Matches GPUI's `bar_fit`.
 struct BarFit {
-    static let padLeading: CGFloat = 12, padTrailing: CGFloat = 14, gap: CGFloat = 18
+    static let padTrailing: CGFloat = 14, gap: CGFloat = 18
     private static let icon: CGFloat = 38, spacer: CGFloat = 16, skip: CGFloat = 23, play: CGFloat = 32, transportGap: CGFloat = 6
     private static let mode: CGFloat = 20 + 12
     let extras: Bool, optional: Bool, modes: Bool, side: Bool
 
     init(width: CGFloat, canDock: Bool) {
-        let base = (canDock ? 5 : 4) * Self.icon
+        let base = (canDock ? 4 : 3) * Self.icon
         func right(extras: Bool, optional: Bool) -> CGFloat {
             base + (optional ? 2 * Self.icon + 2 * Self.spacer : 0) + (extras ? 2 * Self.icon : 0) + Self.padTrailing
         }
@@ -835,30 +920,16 @@ private struct OutputButton: View {
         let playing = receiver?.state == .playing
         MenuIconButton(symbol: receiver == nil ? "laptopcomputer" : AirPlayGlyph.symbol,
                        label: receiver.map { L("Output: {device}", ["device": $0.name]) } ?? L("Output"),
-                       size: size, tint: playing ? shell.theme.accent.color : nil) {
-            shell.airplay.menuOpened()
-            return shell.outputMenu()
+                       size: size, tint: playing ? shell.theme.accent.color : nil, live: true,
+                       opened: { shell.airplay.menuOpened() }) {
+            shell.outputMenu()
         }
             .task { shell.loadOutputs() }
             .onHover { if $0 { shell.loadOutputs(refresh: true) } }
     }
 }
 
-private struct BarGlass: ViewModifier {
-    @Environment(\.isSnapshot) private var isSnapshot
-    private let shape = RoundedRectangle(cornerRadius: T.px(22), style: .continuous)
-    func body(content: Content) -> some View {
-        Group {
-            if isSnapshot { content.background(shape.fill(T.barGlass.color)) } else {
-                content.glassEffect(.regular.tint(T.barGlass.color), in: shape)
-            }
-        }
-        .overlay(shape.strokeBorder(T.glassEdge.color, lineWidth: 1).allowsHitTesting(false))
-    }
-}
-
-/// The bar's speaker and its hover panel. `PlayerBar` draws the panel outside the bar's glass, because glass clips
-/// hit testing and hover to its shape.
+/// the bar's speaker and its panel; `PlayerBar` draws the panel outside the bar's glass, which clips hit testing.
 @MainActor @Observable private final class BarVolumeHover {
     private(set) var open = false
     @ObservationIgnored private var closing: Task<Void, Never>?
@@ -893,7 +964,7 @@ private struct BarVolumeButton: View {
     let hover: BarVolumeHover
 
     var body: some View {
-        IconButton(symbol: volumeSymbol(player), label: player.isMuted ? L("Unmute") : L("Mute")) { player.isMuted.toggle() }
+        IconButton(symbol: volumeSymbol(player), label: player.isMuted ? L("Unmute") : L("Mute"), level: volumeLevel(player)) { player.isMuted.toggle() }
             .anchorPreference(key: BarVolumeAnchor.self, value: .bounds) { $0 }
             .onHover(perform: hover.hover)
     }
@@ -928,7 +999,19 @@ private extension View {
     }
 }
 
-/// Opens the mini player, from the bar and the dock's head.
+/// the full screen player's button (⇧⌘F): its glyph and label say whether it enters or leaves.
+struct FullScreenButton: View {
+    let shell: ShellModel
+    var size: CGFloat = T.px(17)
+    var body: some View {
+        let on = shell.expanded
+        IconButton(symbol: on ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
+                   label: on ? L("Collapse player") : L("Expand player"), size: size,
+                   help: "\(on ? L("Collapse player") : L("Expand player")) (⇧⌘F)") { shell.setExpanded(!on) }
+            .contentTransition(.symbolEffect(.replace))
+    }
+}
+
 struct MiniPlayerButton: View {
     let shell: ShellModel
     var size: CGFloat = T.px(17)

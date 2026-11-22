@@ -26,6 +26,5 @@ import Observation
         Task.detached(priority: .utility) { try? core.setPlayThreshold(threshold: next) }
     }
 
-    /// `60%`, as the language writes it.
     static func percentLabel(_ percent: UInt32) -> String { L("{percent}%", ["percent": String(percent)]) }
 }

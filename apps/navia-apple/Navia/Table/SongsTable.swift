@@ -1,15 +1,16 @@
 import AppKit
 import SwiftUI
 
-/// Colors the AppKit table needs, refreshed from SwiftUI whenever they change.
 enum SongListVariant { case full, album }
 
 struct TableColors: Equatable {
     var accent: RGBA
     var accentSoft: RGBA
     var onAccent: RGBA
-    /// A selected row: the accent at 30%.
-    var rowSelected: RGBA { accent.opacity(Theme.rowSelectedAlpha) }
+    /// `--row-selected`.
+    var rowSelected: RGBA { Theme.rowSelected(accent) }
+    /// `--row-flash-fill`.
+    var rowFlash: RGBA { Theme.rowFlashFill(accent) }
 }
 
 /// Columns a listener can show or hide from a song table's header. Song Name and Time always show.
@@ -26,7 +27,7 @@ enum SongColumn: String, CaseIterable, Sendable {
         }
     }
 
-    /// Its header's position (0 Song Name and 1 Time come first).
+    /// 0 Song Name and 1 Time come first.
     var header: Int { 2 + (SongColumn.allCases.firstIndex(of: self) ?? 0) }
 
     /// What the listener chose, per account. Genre, Date Added and Plays start hidden. An older Genre setting carries
@@ -46,6 +47,44 @@ enum SongColumn: String, CaseIterable, Sendable {
     }
 }
 
+/// an album table's columns, from its Columns button or the header's right-click; saved apart from the other tables'.
+/// albums have no sorting, and Heat is offered only with the Deezer switch on.
+enum AlbumColumn: String, CaseIterable, Sendable {
+    case time, plays, heat
+
+    var label: String {
+        switch self {
+        case .time: L("Time")
+        case .plays: L("Plays")
+        case .heat: L("Heat")
+        }
+    }
+
+    static func offered(deezer: Bool) -> [AlbumColumn] { allCases.filter { $0 != .heat || deezer } }
+
+    /// per account; until the listener picks, Time and Heat (Heat only shows while offered), and a pick
+    /// flips just that column, so Heat stays on unless hidden itself
+    private static var saved: Set<AlbumColumn> {
+        Set((UserDefaults.standard.array(forKey: AccountPrefs.key("albumColumns")) as? [String]).map { $0.compactMap(AlbumColumn.init(rawValue:)) } ?? [.time, .heat])
+    }
+
+    static func shown(deezer: Bool) -> Set<AlbumColumn> {
+        saved.intersection(offered(deezer: deezer))
+    }
+
+    static func toggle(_ column: AlbumColumn) {
+        var set = saved
+        if set.remove(column) == nil { set.insert(column) }
+        UserDefaults.standard.set(allCases.filter(set.contains).map(\.rawValue), forKey: AccountPrefs.key("albumColumns"))
+        NotificationCenter.default.post(name: .naviaSongColumnsChanged, object: nil)
+    }
+
+    static func menu(deezer: Bool) -> [MenuEntry] {
+        let on = shown(deezer: deezer)
+        return offered(deezer: deezer).map { column in MenuEntry(title: column.label, checked: on.contains(column)) { toggle(column) } }
+    }
+}
+
 extension Notification.Name {
     nonisolated static let naviaSongColumnsChanged = Notification.Name("naviaSongColumnsChanged")
 }
@@ -61,28 +100,32 @@ struct SongColumns {
     let genre: CGFloat
     let added: CGFloat
     let plays: CGFloat
+    let heat: CGFloat
     let actions: CGFloat
     var showsArtist: Bool { artist > 0 }
     var showsAlbum: Bool { album > 0 }
     var showsGenre: Bool { genre > 0 }
+    /// an album table labels its columns only with one other than Time.
+    var albumHeader: Bool { plays > 0 || heat > 0 }
 
-    /// `width` is the row's width inside the gutters.
-    init(width: CGFloat, compact: Bool, variant: SongListVariant = .full, shown: Set<SongColumn> = SongColumn.shown) {
+    /// `width` is the row's width inside the gutters; `albumShown` is the album table's chosen columns.
+    init(width: CGFloat, compact: Bool, variant: SongListVariant = .full, shown: Set<SongColumn> = SongColumn.shown, albumShown: Set<AlbumColumn> = [.time]) {
         let cssWidth = width / T.scale
         let leftPad: CGFloat = 5
         if variant == .album {
-            added = 0; plays = 0
-            let lead: CGFloat = cssWidth <= 500 ? 40 : 55
-            let time: CGFloat = cssWidth <= 500 ? 58 : 78
-            let actions: CGFloat = cssWidth <= 500 ? 124 : 132
-            let room = max(0, cssWidth - leftPad - lead - time - actions)
+            added = 0; artist = 0; album = 0; genre = 0
+            let narrow = cssWidth <= 500, wide = cssWidth > 700
+            let lead: CGFloat = narrow ? 40 : 55
+            let actions: CGFloat = narrow ? 124 : 132
+            time = albumShown.contains(.time) ? (narrow ? T.px(58) : T.timeColW) : 0
+            plays = wide && albumShown.contains(.plays) ? T.playsColW : 0
+            heat = wide && albumShown.contains(.heat) ? T.popularityColW : 0
             self.lead = T.px(leftPad + lead)
-            title = T.px(min(305, room))
-            self.time = T.px(time)
-            artist = 0; album = 0; genre = 0
             self.actions = T.px(actions)
+            title = max(0, width - self.lead - self.actions - time - plays - heat)
             return
         }
+        heat = 0
         let lead: CGFloat = compact ? 24 : 55
         let timeCSS: CGFloat, actionsCSS: CGFloat
         var fr: (title: CGFloat, artist: CGFloat, album: CGFloat, genre: CGFloat)
@@ -92,8 +135,8 @@ struct SongColumns {
         case ...700: (timeCSS, actionsCSS, fr) = (62, 124, (1, 1, 0, 0))
         case ...900: (timeCSS, actionsCSS, fr) = (70, 132, (2, 1.2, 1.4, 0))
         default:
-            (timeCSS, actionsCSS, fr) = (78, 132, (298, 172, 228, 95))
-            fixed = (shown.contains(.added) ? 122 : 0, shown.contains(.plays) ? 76 : 0)
+            (timeCSS, actionsCSS, fr) = (T.timeColW / T.scale, 132, (298, 172, 228, 95))
+            fixed = (shown.contains(.added) ? 122 : 0, shown.contains(.plays) ? T.playsColW / T.scale : 0)
         }
         if !shown.contains(.artist) { fr.artist = 0 }
         if !shown.contains(.album) { fr.album = 0 }
@@ -140,10 +183,13 @@ struct SongsTable: NSViewRepresentable {
     /// Disc names by number on albums with more than one disc. A header goes above each disc's first song. Nil
     /// otherwise.
     var discs: [Int: String]? = nil
-    /// Songs after the list, in the same scroll (a playlist's Recommended).
     var trailing: TrailingSongs? = nil
-    /// Called when the end of the list scrolls near view, so what follows it can be asked for only then.
+    /// so what follows the list is asked for only when it nears view.
     var nearEnd: (() -> Void)? = nil
+    /// an album's Heat column: its songs' Deezer ranks and the cover's tint.
+    var heat: AlbumHeat? = nil
+    /// song ids the server doesn't have: playing a row plays the others.
+    var unavailable: Set<String> = []
 
     func makeCoordinator() -> SongsTableController { SongsTableController() }
 
@@ -159,31 +205,35 @@ struct SongsTable: NSViewRepresentable {
         context.coordinator.remove = remove
         context.coordinator.nearEnd = nearEnd
         context.coordinator.setTrailing(trailing)
+        context.coordinator.setHeat(heat)
+        context.coordinator.unavailable = unavailable
     }
 }
 
-/// Songs shown after the list in the same scroll (a playlist's Recommended): a hosted heading, then rows with Add in
-/// place of Download and Favorite. They don't select, reorder or drag.
+/// an album's songs' Deezer ranks by song id, and the tint the hottest song's bars start from.
+struct AlbumHeat: Equatable {
+    var ranks: [String: UInt64]
+    var tint: RGBA
+}
+
+/// They aren't part of the list: they don't select, reorder or drag, and they play, add and open menus on their own.
 struct TrailingSongs {
     var heading: AnyView
     var songs: [SongRow]
-    /// Bumped when the songs change, so the rows reload.
     var revision: Int
-    /// The rows dim while the next batch is on its way.
     var dimmed: Bool
     var play: (Int) -> Void
     var add: (SongRow) -> Void
     /// Show the heading even with no songs, for a closing section with no rows of its own.
     var keepsHeading = false
 
-    /// A hosted section after the list and nothing else.
     static func section(_ view: AnyView) -> TrailingSongs {
         TrailingSongs(heading: view, songs: [], revision: 0, dimmed: false, play: { _ in }, add: { _ in }, keepsHeading: true)
     }
 }
 
 extension NSPasteboard.PasteboardType {
-    /// A song row being moved within one table: its song index.
+    /// its song index, for a move within one table.
     static let naviaSongRow = NSPasteboard.PasteboardType("com.davekai.Navia.song-row")
 }
 
@@ -202,6 +252,13 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     private(set) var trailingInset: CGFloat = 0
     /// Offline, rows for songs not on this device are dimmed.
     private(set) var offline = false
+    var unavailable: Set<String> = [] {
+        didSet { if unavailable != oldValue { refreshVisibleRows() } }
+    }
+
+    func isUnavailable(_ index: Int) -> Bool {
+        !unavailable.isEmpty && songs?.song(at: index).map { unavailable.contains($0.id) } == true
+    }
     private var nowPlayingID: String?
     private var lastRevision = -1
     private var lastEdit = -1
@@ -216,7 +273,7 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     private static let spacerID = NSUserInterfaceItemIdentifier("spacerRow")
     private static let discID = NSUserInterfaceItemIdentifier("disc")
 
-    /// The page tint's height, so the hosted header is tall enough to paint it behind the rows.
+    /// so the hosted header is tall enough to paint the tint behind the rows.
     private let tintHeight = T.px(460)
 
     override init() {
@@ -253,8 +310,9 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         scrollView.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(self, selector: #selector(scrolled), name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
         NotificationCenter.default.addObserver(self, selector: #selector(columnsChanged), name: .naviaSongColumnsChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(flashRows), name: RowFlash.didFlash, object: nil)
 
-        // Clicking outside the rows clears the selection. Menus run their own event loop, so using one doesn't.
+        // menus run their own event loop, so using one doesn't clear the selection.
         clickAway = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             guard let self, event.window === self.table.window, let root = event.window?.contentView?.superview else { return event }
             let hit = root.hitTest(root.convert(event.locationInWindow, from: nil))
@@ -309,6 +367,8 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
             lastRevision = revision
             lastEdit = editRevision
             findDiscBreaks()
+            rescaleHeat()
+            albumHeader = variant == .album && columns(width: rowWidth).albumHeader
             table.reloadData()
         } else if colorsChanged || nowChanged || insetsChanged || offlineChanged || editRevision != lastEdit {
             lastEdit = editRevision
@@ -317,20 +377,58 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     private var lastPageHeader: AnyView?
-    private var columnHeaderHeight: CGFloat { compact ? T.rowCompactH : T.rowH }
-    private var showsColumnHeader: Bool { variant == .full }
+    private var columnHeaderHeight: CGFloat { variant == .album ? songRowHeight : compact ? T.rowCompactH : T.rowH }
+    private var showsColumnHeader: Bool { variant == .full || albumHeader }
+    /// album tables label their columns only with one other than Time, at the table's width.
+    private var albumHeader = false
 
-    /// The first row: the page header's measured height, or the room under the top bar on pages without one.
+    /// the album table's chosen columns: Heat only with the Deezer switch on.
+    var albumShown: Set<AlbumColumn> { AlbumColumn.shown(deezer: shell?.deezerChoice == true) }
+
+    func columns(width: CGFloat) -> SongColumns {
+        SongColumns(width: width, compact: compact, variant: variant, albumShown: albumShown)
+    }
+
+    private var rowWidth: CGFloat { table.bounds.width - 2 * T.gutter - leadingInset - trailingInset }
+
+    /// the column header row comes and goes on album tables, which moves every row after it.
+    private func refreshAlbumHeader() {
+        let shows = variant == .album && columns(width: rowWidth).albumHeader
+        guard shows != albumHeader else { return }
+        albumHeader = shows
+        applyPageHeader()
+        table.reloadData()
+    }
+
+    // MARK: Heat
+
+    private var heat: AlbumHeat?
+    private(set) var heatScale = HeatScale()
+    private(set) var heatTint: RGBA?
+
+    func setHeat(_ heat: AlbumHeat?) {
+        guard heat != self.heat else { return }
+        self.heat = heat
+        rescaleHeat()
+        refreshVisibleRows()
+    }
+
+    /// against the songs shown, so a filter rescales the meters.
+    private func rescaleHeat() {
+        guard let heat, let songs else { heatScale = HeatScale(); heatTint = nil; return }
+        let ids = Set((0..<songs.count).compactMap { songs.song(at: $0)?.id })
+        heatScale = HeatScale(ranks: heat.ranks.filter { ids.contains($0.key) })
+        heatTint = heat.tint
+    }
+
+    /// the room under the top bar on pages without a page header.
     private var topRowHeight: CGFloat { lastPageHeader != nil ? max(1, pageHeaderHeight) : T.topbarH + T.contentTop }
-    /// Everything above the first song.
     private var headersHeight: CGFloat { topRowHeight + (showsColumnHeader ? columnHeaderHeight : 0) }
 
     // MARK: Rows: headers, songs, the bottom room
 
-    /// Rows before the first song: the top row, and the column header when shown.
     var leadRows: Int { showsColumnHeader ? 2 : 1 }
     private var columnHeaderRow: Int { showsColumnHeader ? 1 : -1 }
-    /// The first row after the list's songs and disc headers.
     private var listEnd: Int { leadRows + (songs?.count ?? 0) + discBreaks.count }
     private var bottomRow: Int { listEnd + trailingRows }
 
@@ -347,7 +445,6 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     private var trailingHeadRow: Int? { trailingRows > 0 ? listEnd : nil }
     private static let trailingHeadID = NSUserInterfaceItemIdentifier("trailingHead")
 
-    /// The index among the songs after the list for a table row, if the row is one of them.
     func trailingIndex(_ row: Int) -> Int? {
         guard let head = trailingHeadRow, let count = trailing?.songs.count, row > head, row - head - 1 < count else { return nil }
         return row - head - 1
@@ -382,7 +479,6 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         }
     }
 
-    /// Tells the page once the end of the list is within `T.nearViewMargin` of the visible rows.
     private func checkNearEnd() {
         guard let nearEnd, table.numberOfRows > listEnd else { return }
         let end = table.rect(ofRow: min(listEnd, table.numberOfRows - 1)).minY
@@ -399,14 +495,13 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
 
     func addTrailing(_ index: Int) { trailingSong(index).map { trailing?.add($0) } }
 
-    /// Whether a table row is a song of the list or one after it: the rows that hover and take links and menus.
+    /// the rows that hover and take links and menus.
     func isSongRow(_ row: Int) -> Bool { songIndex(row) != nil || trailingIndex(row) != nil }
 
     private var discs: [Int: String]?
-    /// Disc headers: each goes above the song at `index`. Header k is table row `leadRows + index + k`.
+    /// header k is table row `leadRows + index + k`.
     private(set) var discBreaks: [(index: Int, title: String)] = []
 
-    /// Where each disc starts among the songs shown, on an album with more than one disc.
     private func findDiscBreaks() {
         discBreaks = []
         guard let discs, variant == .album, let songs else { return }
@@ -419,7 +514,6 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         }
     }
 
-    /// The disc header's title at a table row, if that row is one.
     func discTitle(_ row: Int) -> String? {
         let r = row - leadRows
         for (k, b) in discBreaks.enumerated() {
@@ -429,7 +523,7 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         return nil
     }
 
-    /// The song index for a table row, or nil for a header, a disc header or the bottom room.
+    /// nil for a header, a disc header or the bottom room.
     func songIndex(_ row: Int) -> Int? {
         let r = row - leadRows
         guard r >= 0 else { return nil }
@@ -520,8 +614,21 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     func tableResized() {
+        refreshAlbumHeader()
         applyPageHeader()
         if abs(table.bounds.width - trailingHeadWidth) > 0.5 { measureTrailingHead() }
+    }
+
+    @objc private func flashRows() {
+        let ids = RowFlash.shared.songs
+        // after the change that queued them, so rows it adds light too.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.table.window?.occlusionState.contains(.visible) == true else { return }
+            self.table.enumerateAvailableRowViews { rowView, row in
+                guard let index = self.songIndex(row), let id = self.songs?.song(at: index)?.id, ids.contains(id) else { return }
+                (rowView as? SongRowView)?.flash(self.colors.rowFlash)
+            }
+        }
     }
 
     func refreshVisibleRows() {
@@ -550,7 +657,6 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         view?.alphaValue = draggedSongs.contains(index) ? T.dragOutDim : 1
     }
 
-    /// Dims or restores the visible rows being dragged.
     private func refreshDraggedRows() {
         table.enumerateAvailableRowViews { view, row in
             if let index = self.songIndex(row) { self.applyRowState(view as? SongRowView, index: index) }
@@ -608,9 +714,9 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         if table.numberOfRows > 0 { table.noteHeightOfRows(withIndexesChanged: IndexSet(0..<table.numberOfRows)) }
     }
 
-    /// Only songs can be selected, so Select All and Shift-click across the headers take songs only.
+    /// so Select All and Shift-click across the headers take songs only.
     func tableView(_ tableView: NSTableView, selectionIndexesForProposedSelection proposed: IndexSet) -> IndexSet {
-        proposed.filteredIndexSet { songIndex($0) != nil }
+        proposed.filteredIndexSet { songIndex($0).map { !isUnavailable($0) } ?? false }
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -702,8 +808,13 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     // The actions below take song indexes, not table rows.
 
     func play(row: Int) {
-        guard row >= 0, let songs, let shell else { return }
-        shell.player.play(songAt: row, in: songs)
+        guard row >= 0, let songs, let shell, !isUnavailable(row) else { return }
+        if unavailable.isEmpty {
+            shell.player.play(songAt: row, in: songs)
+        } else if let song = songs.song(at: row) {
+            let playable = songs.allSongs().filter { !unavailable.contains($0.id) }
+            shell.player.play(playable, at: playable.firstIndex { $0.id == song.id } ?? 0, shuffle: nil)
+        }
     }
 
     func toggleFavorite(row: Int) { songs?.toggleFavorite(at: row) }
@@ -721,7 +832,7 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
             return makeMenu(SongMenu.several(selected.compactMap { songs.song(at: $0) }, shell: shell, remove: removing(Array(selected))))
         }
         guard let song = songs.song(at: row) else { return nil }
-        return makeMenu(SongMenu.single(song, shell: shell, remove: removing([row])))
+        return makeMenu(SongMenu.single(song, shell: shell, remove: removing([row]), play: { [weak self] in self?.play(row: row) }))
     }
 
     @objc private func scrolled() {
@@ -729,14 +840,14 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         checkNearEnd()
     }
 
-    /// The first selected song, for ⌘I's Get Info.
+    /// for ⌘I's Get Info.
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard let shell, let songs else { return }
         shell.selectedSong = table.selectedRowIndexes.compactMap { songIndex($0) }.first.flatMap { songs.song(at: $0) }
     }
 
-    /// The column chooser changed: every table lays its header and rows out again.
     @objc private func columnsChanged() {
+        refreshAlbumHeader()
         header.needsLayout = true
         table.enumerateAvailableRowViews { rowView, _ in (rowView.view(atColumn: 0) as? NSView)?.needsLayout = true }
     }
@@ -749,18 +860,16 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         header.sortable = (0..<7).map { SongSort.column($0).map { songs?.canSort($0) ?? false } ?? false }
     }
 
-    /// A click on a column header cycles that column ascending, descending, then the list's own order.
+    /// cycles ascending, descending, then the list's own order.
     func headerClicked(_ column: Int) {
         songs?.headerClicked(column)
         if let songs { setSort(songs.sort, descending: songs.descending) }
     }
 
-    /// A link in a row: the artist, album or genre page.
     func open(_ route: Route) { shell?.go(route) }
 
     private(set) var reorder: (([Int], Int) -> Void)?
     var remove: (([Int]) -> Void)?
-    /// Song indexes being dragged, from the session's start to its end.
     private(set) var draggedSongs: [Int] = []
 
     func setReorder(_ reorder: (([Int], Int) -> Void)?) {
@@ -783,7 +892,7 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// Only songs can be dragged. Each carries its place in the list for reordering and its id for a playlist or the
     /// queue.
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
-        guard let index = songIndex(row), let song = songs?.song(at: index) else { return nil }
+        guard let index = songIndex(row), !isUnavailable(index), let song = songs?.song(at: index) else { return nil }
         let item = NSPasteboardItem()
         item.setString(String(index), forType: .naviaSongRow)
         item.setString(song.id, forType: .naviaSongs)
@@ -878,7 +987,7 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     #if DEBUG
-    /// For CoreCheck's `tableGapDrag`, which has no real dragging session to start one.
+    /// for CoreCheck's `tableGapDrag`, which has no real dragging session.
     func debugBeginDrag(songs: [Int]) {
         draggedSongs = songs
         table.setHoverSuppressed(true)
@@ -909,7 +1018,7 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         return drop(songs: draggedSongs, aboveRow: row)
     }
 
-    /// Moves `songs` (song indexes) above table row `row` and selects them in their new places. False when nothing moves.
+    /// `songs` are song indexes; selects them in their new places. false when nothing moves.
     @discardableResult func drop(songs moving: [Int], aboveRow row: Int) -> Bool {
         guard let reorder, let target = dropRow(proposed: row), let count = songs?.count else { return false }
         let rows = Array(Set(moving.filter { $0 >= 0 && $0 < count })).sorted()
@@ -924,7 +1033,7 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
         return true
     }
 
-    /// Press-and-hold on a song: begins the table's own drag with the pressed row, or the selection when the row is in it.
+    /// drags the pressed row, or the selection when the row is in it.
     func beginHoldDrag(row: Int, event: NSEvent) {
         guard songIndex(row) != nil else { return }
         if !table.selectedRowIndexes.contains(row) { table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
@@ -957,7 +1066,6 @@ final class SongsTableController: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 }
 
-/// The empty slot in the gap a drag opens: a soft rounded fill, like an empty row.
 final class DropSlotView: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -1005,10 +1113,10 @@ final class SongsNSTableView: NSTableView {
         if window != nil { controller?.backingChanged() }
     }
 
-    /// The song row under a point, or -1 over the headers and the bottom room.
+    /// -1 over the headers and the bottom room.
     func songRow(at point: NSPoint) -> Int {
         let row = row(at: point)
-        return controller?.songIndex(row) != nil ? row : -1
+        return controller?.songIndex(row).map { controller?.isUnavailable($0) == false } == true ? row : -1
     }
 
     /// Rows reach under the sidebar, the dock and the top bar, so hover only counts where a click would reach this
@@ -1016,10 +1124,10 @@ final class SongsNSTableView: NSTableView {
     private func hoverRow(at point: NSPoint) -> Int {
         guard let c = controller, point.x >= c.leadingInset, point.x <= bounds.width - c.trailingInset, reachable(point) else { return -1 }
         let row = row(at: point)
-        return c.isSongRow(row) ? row : -1
+        return c.isSongRow(row) && c.songIndex(row).map(c.isUnavailable) != true ? row : -1
     }
 
-    /// Whether the window's own hit test at a point (in this view's coordinates) lands in this table.
+    /// the point is in this view's coordinates.
     private func reachable(_ local: NSPoint) -> Bool {
         guard let root = window?.contentView?.superview else { return true }
         guard let hit = root.hitTest(root.convert(convert(local, to: nil), from: nil)) else { return false }
@@ -1031,7 +1139,7 @@ final class SongsNSTableView: NSTableView {
         updateIconHover(event.locationInWindow)
     }
 
-    /// Tells the hovered row which of its icons and links is under the pointer (window coordinates).
+    /// the location is in window coordinates.
     private func updateIconHover(_ location: NSPoint) {
         guard hoveredRow >= 0, let cell = view(atColumn: 0, row: hoveredRow, makeIfNecessary: false) as? SongCell else { setLinkCursor(false); return }
         let local = cell.convert(location, from: nil)
@@ -1064,7 +1172,6 @@ final class SongsNSTableView: NSTableView {
         updateIconHover(window.mouseLocationOutsideOfEventStream)
     }
 
-    /// While rows are dragged, no row shows hover.
     private var hoverSuppressed = false
     func setHoverSuppressed(_ on: Bool) {
         hoverSuppressed = on
@@ -1085,7 +1192,7 @@ final class SongsNSTableView: NSTableView {
         T.appKitMotion { super.draggingUpdated(sender) }
     }
 
-    /// A drag that leaves the table closes its gap, so the empty slot goes too.
+    /// so the empty slot goes too.
     override func draggingExited(_ sender: (any NSDraggingInfo)?) {
         T.appKitMotion { super.draggingExited(sender) }
         controller?.hideSlot()
@@ -1106,7 +1213,7 @@ final class SongsNSTableView: NSTableView {
     }
 
     #if DEBUG
-    /// Mouse downs that reached the table, for CoreCheck's `rowProbe`.
+    /// for CoreCheck's `rowProbe`.
     static var debugMouseDowns = 0
     #endif
 
@@ -1118,7 +1225,8 @@ final class SongsNSTableView: NSTableView {
         window?.makeFirstResponder(self)
         // A double-click on rows scrolled under the top bar belongs to the title bar.
         if TitlebarDoubleClick.handleInTopBar(event) { return }
-        // A plain click on a link's text follows it and leaves the selection alone.
+        if TitlebarDoubleClick.movesWindow(event) { return }
+        // A plain click on a link's text goes there and leaves the selection alone.
         if event.modifierFlags.intersection([.command, .shift, .control]).isEmpty, event.clickCount == 1,
            let route = link(at: convert(event.locationInWindow, from: nil)) {
             controller?.open(route)
@@ -1223,6 +1331,11 @@ final class SongRowView: NSTableRowView {
         NSRect(x: innerRect.minX, y: bounds.maxY - 1, width: innerRect.width, height: 1).fill()
     }
 
+    func flash(_ fill: RGBA) {
+        wantsLayer = true
+        layer?.rowFlash(fill, rect: pillRect, radius: T.rRow)
+    }
+
     override func drawSelection(in dirtyRect: NSRect) {
         // The accent at 30%, with the row's own text colors on top.
         colors.rowSelected.ns.setFill()
@@ -1244,13 +1357,13 @@ final class SongHeaderView: NSView {
     /// none.
     var sortedColumn: Int? { didSet { if sortedColumn != oldValue { applyEmphasis() } } }
     var descending = false { didSet { if descending != oldValue { applyEmphasis() } } }
-    /// Which headers sort when clicked.
     var sortable: [Bool] = []
     weak var controller: SongsTableController?
-    private let titles = [L("Song Name"), L("Time"), L("Artist name"), L("Album name"), L("Genre"), L("Date Added"), L("Plays")]
-    private let labels: [NSTextField] = (0..<7).map { i in
+    private let titles = [L("Song Name"), L("Time"), L("Artist name"), L("Album name"), L("Genre"), L("Date Added"), L("Plays"), L("Heat")]
+    private let labels: [NSTextField] = (0..<8).map { i in
         let field = SongCell.makeLabel()
-        if i == 6 { field.alignment = .right }
+        // Time and Plays are right-aligned, headers and values alike.
+        if i == 1 || i == 6 { field.alignment = .right }
         return field
     }
 
@@ -1264,7 +1377,7 @@ final class SongHeaderView: NSView {
 
     /// Right-click: the columns that can be shown or hidden, saved per account.
     override func menu(for event: NSEvent) -> NSMenu? {
-        guard variant == .full else { return nil }
+        guard variant == .full else { return makeMenu(AlbumColumn.menu(deezer: controller?.shell?.deezerChoice == true)) }
         let shown = SongColumn.shown
         return makeMenu(SongColumn.allCases.map { column in
             MenuEntry(title: column.label, checked: shown.contains(column)) { SongColumn.toggle(column) }
@@ -1299,12 +1412,12 @@ final class SongHeaderView: NSView {
         controller?.headerClicked(column)
     }
 
-    /// A header label's frame, for checks.
+    /// for checks.
     func labelFrame(_ column: Int) -> NSRect { labels.indices.contains(column) ? labels[column].frame : .zero }
 
-    /// The header column under a point: each label's column runs to the next label.
+    /// each label's column runs to the next label.
     func column(at p: NSPoint) -> Int? {
-        let shown = labels.enumerated().filter { !$0.element.isHidden }
+        let shown = labels.enumerated().filter { !$0.element.isHidden }.sorted { $0.element.frame.minX < $1.element.frame.minX }
         for (k, item) in shown.enumerated() {
             let start = item.element.frame.minX
             let end = k + 1 < shown.count ? shown[k + 1].element.frame.minX : item.element.frame.maxX + T.px(14)
@@ -1325,28 +1438,25 @@ final class SongHeaderView: NSView {
         super.layout()
         needsDisplay = true // The rule under the labels follows the width and insets.
         let width = bounds.width - 2 * T.gutter - leadingInset - trailingInset
-        let columns = SongColumns(width: width, compact: compact, variant: variant)
+        let columns = controller?.columns(width: width) ?? SongColumns(width: width, compact: compact, variant: variant)
         // Song Name starts where the artwork does.
         let left = T.gutter + leadingInset
         let artLeft = left + T.px(5) + (compact ? T.px(12) : T.px(21)) - T.thumb / 2
         var x = artLeft
         let height = ceil(labels[0].intrinsicContentSize.height)
         let y = (bounds.height - height) / 2
-        // Labels take their column's full width, so a short one like Time still fits its sort arrow.
-        func place(_ field: NSTextField, _ w: CGFloat) {
+        // labels take their column's full width, so a short one still fits its sort arrow; numbers end where their values do.
+        func place(_ i: Int, _ w: CGFloat) {
+            let field = labels[i]
             field.isHidden = w <= 0
-            field.frame = NSRect(x: x, y: y, width: max(0, w - T.px(4)), height: height)
+            let pad = field.alignment == .right ? T.numCellPad : T.px(4)
+            field.frame = NSRect(x: x, y: y, width: max(0, w - pad), height: height)
             x += w
         }
-        place(labels[0], left + columns.lead + columns.title - artLeft)
-        place(labels[1], columns.time)
-        place(labels[2], columns.artist)
-        place(labels[3], columns.album)
-        place(labels[4], columns.genre)
-        place(labels[5], columns.added)
-        place(labels[6], columns.plays)
-        // Plays lines up with its numbers, which end 20 points in from the column's edge.
-        if columns.plays > 0 { labels[6].frame.size.width = max(0, columns.plays - T.px(20)) }
+        place(0, left + columns.lead + columns.title - artLeft)
+        for (i, w) in [(2, columns.artist), (3, columns.album), (4, columns.genre), (5, columns.added), (6, columns.plays), (7, columns.heat), (1, columns.time)] {
+            place(i, w)
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1355,7 +1465,7 @@ final class SongHeaderView: NSView {
     }
 }
 
-/// One song row. Built by hand with frames so reuse and layout stay cheap at any library size.
+/// built by hand with frames so reuse and layout stay cheap at any library size.
 final class SongCell: NSTableCellView {
     private let thumb = NSImageView()
     private let playOverlay = HoverPlayButton()
@@ -1367,6 +1477,10 @@ final class SongCell: NSTableCellView {
     private let genre = SongCell.makeLabel()
     private let added = SongCell.makeLabel()
     private let plays = SongCell.makeLabel()
+    private let heat = HeatMeterView()
+    private var isHot = false
+    private var hasHeat = false
+    private var hovered = false
     private let explicit = ExplicitBadgeView()
     private var isExplicit = false
     private let download = SongCell.makeAction("arrow.down", label: L("Download"))
@@ -1378,7 +1492,6 @@ final class SongCell: NSTableCellView {
     /// A song after the list: Add in place of Download and Favorite.
     private var trailing = false
     private var addHost: NSHostingView<AnyView>?
-    /// Artist, album and genre links: the field, the linked part of its text, and where it goes.
     private var links: [(field: NSTextField, range: NSRange, route: Route)] = []
     private var hoveredLink: Int?
     private var compact = false
@@ -1432,12 +1545,13 @@ final class SongCell: NSTableCellView {
         time.font = .monospacedDigitSystemFont(ofSize: T.textMD, weight: .regular)
         plays.font = .monospacedDigitSystemFont(ofSize: T.textMD, weight: .regular)
         plays.alignment = .right
+        time.alignment = .right
         number.font = .monospacedDigitSystemFont(ofSize: T.textMD, weight: .regular)
         number.alignment = .center
         for button in actions {
             button.onPress = { [weak self] in self?.refreshIconHover() }
         }
-        [thumb, number, playOverlay, name, explicit, time, artist, album, genre, added, plays, download, star, more].forEach(addSubview)
+        [thumb, number, playOverlay, name, explicit, time, artist, album, genre, added, plays, heat, download, star, more].forEach(addSubview)
         playOverlay.isHidden = true
         playOverlay.target = self
         playOverlay.action = #selector(playTapped)
@@ -1465,7 +1579,6 @@ final class SongCell: NSTableCellView {
             }
         }
         addHost?.isHidden = !trailing
-        star.isHidden = trailing
         self.isNow = isNow
         self.compact = compact
         self.variant = variant
@@ -1482,14 +1595,26 @@ final class SongCell: NSTableCellView {
         genre.stringValue = song.genre
         added.stringValue = fmtDate(song.added)
         plays.stringValue = song.plays > 0 ? fmtInt(song.plays) : ""
+        if let lit = controller.heatScale.lit(song.id), let tip = controller.heatScale.tip(song.id) {
+            isHot = lit == HeatScale.bars
+            heat.configure(lit: lit, hot: isHot ? controller.heatTint ?? T.popularityHeatFoot : nil, now: isNow, tip: tip, accentSoft: colors.accentSoft)
+            hasHeat = true
+        } else {
+            isHot = false
+            hasHeat = false
+        }
+        heat.setSweeping(isHot && (isNow || hovered))
         isExplicit = song.isExplicit
         links = SongLinks.artists(song).map { (artist, NSRange($0.range, in: song.artist), Route.artist($0.id)) }
         if !song.albumID.isEmpty, !song.album.isEmpty { links.append((album, NSRange(location: 0, length: (song.album as NSString).length), .album(song.albumID))) }
         if !song.genre.isEmpty { links.append((genre, NSRange(location: 0, length: (song.genre as NSString).length), .songs(genre: song.genre))) }
         hoveredLink = nil
-        download.isHidden = song.isDownloaded || trailing
-        let dim = controller.offline && controller.shell?.library.playsOffline(song: song) != true
-        [thumb, number, name, explicit, time, artist, album, genre, added, plays].forEach { $0.alphaValue = dim ? 0.4 : 1 }
+        let unavailable = controller.isUnavailable(row) && !trailing
+        download.isHidden = song.isDownloaded || trailing || unavailable
+        star.isHidden = trailing || unavailable
+        more.isHidden = unavailable
+        let dim = unavailable || (controller.offline && controller.shell?.library.playsOffline(song: song) != true)
+        [thumb, number, name, explicit, time, artist, album, genre, added, plays, heat].forEach { $0.alphaValue = dim ? T.rowUnavailableOpacity : 1 }
         download.image = Self.symbolImage(controller.shell?.library.isDownloading(song: song) == true ? "arrow.down.circle.dotted" : "arrow.down", label: L("Download"))
         star.image = Self.symbolImage(song.isFavorite ? "heart.fill" : "heart", label: L("Favorite"))
         number.stringValue = song.trackNumber.map(String.init) ?? "\(row + 1)"
@@ -1500,7 +1625,7 @@ final class SongCell: NSTableCellView {
         needsLayout = true
     }
 
-    /// A row that hasn't loaded yet, so a reused cell doesn't show another song.
+    /// so a reused cell doesn't show another song.
     func clear(row: Int) {
         self.row = row
         [name, artist, album, genre, added, plays, time, number].forEach { $0.stringValue = "" }
@@ -1508,7 +1633,10 @@ final class SongCell: NSTableCellView {
         links = []
         hoveredLink = nil
         star.image = nil
-        [thumb, number, name, explicit, time, artist, album, genre, added, plays].forEach { $0.alphaValue = 1 }
+        [thumb, number, name, explicit, time, artist, album, genre, added, plays, heat].forEach { $0.alphaValue = 1 }
+        hasHeat = false
+        isHot = false
+        heat.setSweeping(false)
         artworkURL = nil
         thumb.image = nil
         thumb.isHidden = false
@@ -1539,6 +1667,8 @@ final class SongCell: NSTableCellView {
     }
 
     func setHovered(_ on: Bool) {
+        hovered = on
+        heat.setSweeping(isHot && (isNow || on))
         playOverlay.isHidden = !on
         if variant == .album { number.isHidden = on }
         if !on { iconHover(at: nil) }
@@ -1563,13 +1693,13 @@ final class SongCell: NSTableCellView {
     }
 
     #if DEBUG
-    /// Each link's text span in window points from the top left, with where it goes, for CoreCheck.
+    /// for CoreCheck, in window points from the top left.
     func debugLinkSpans() -> [[String: Any]] {
         guard let window else { return [] }
         let height = window.contentView?.bounds.height ?? 0
         return links.indices.compactMap { i in
             let frame = links[i].field.frame
-            // Find the span by probing across the field, the same test a click uses.
+            // probes across the field, the same test a click uses.
             let xs = stride(from: frame.minX, through: frame.maxX, by: 1).filter { linkIndex(at: NSPoint(x: $0, y: frame.midY)) == i }
             guard let lo = xs.first, let hi = xs.last else { return nil }
             let a = convert(NSPoint(x: lo, y: frame.midY), to: nil), b = convert(NSPoint(x: hi, y: frame.midY), to: nil)
@@ -1622,15 +1752,15 @@ final class SongCell: NSTableCellView {
         name.textColor = (isNow ? colors.accentSoft : T.t1).ns
         [time, artist, album, genre, added, plays, number].forEach { $0.textColor = T.t2.ns }
         let icon = T.t1.ns
-        [download, more].forEach { $0.restTint = icon.withAlphaComponent(0.88) }
-        star.restTint = isFavorite ? icon : icon.withAlphaComponent(0.88)
+        [download, more].forEach { $0.restTint = icon.withAlphaComponent(T.iconRest) }
+        star.restTint = isFavorite ? icon : icon.withAlphaComponent(T.iconRest)
     }
 
     override func layout() {
         super.layout()
         let left = T.gutter + leadingInset
         let width = bounds.width - 2 * T.gutter - leadingInset - trailingInset
-        let columns = SongColumns(width: width, compact: compact, variant: variant)
+        let columns = controller?.columns(width: width) ?? SongColumns(width: width, compact: compact, variant: variant)
         let h = bounds.height
         let lineHeight = ceil(name.intrinsicContentSize.height)
         let textY = (h - lineHeight) / 2
@@ -1646,10 +1776,9 @@ final class SongCell: NSTableCellView {
             field.frame = NSRect(x: x, y: textY, width: max(0, w - pad), height: lineHeight)
             x += w
         }
-        place(name, columns.title, pad: T.px(12))
+        place(name, columns.title, pad: T.nameCellPad)
         let twoLine = variant == .album
         if twoLine {
-            // An album's track: the title over its artists, every one a link, with the explicit mark before them.
             let line = T.textMD * 1.32
             let top = (h - 2 * line) / 2
             name.frame.origin.y = top + (line - lineHeight) / 2
@@ -1670,14 +1799,18 @@ final class SongCell: NSTableCellView {
             name.frame.size.width = textWidth
             explicit.frame = NSRect(x: name.frame.minX + textWidth + gap - 2, y: (h - side) / 2, width: side, height: side)
         }
-        place(time, columns.time, pad: T.px(14))
-        if twoLine { x += columns.artist } else { place(artist, columns.artist, pad: T.px(14)) }
-        place(album, columns.album, pad: T.px(14))
-        place(genre, columns.genre, pad: T.px(14))
-        place(added, columns.added, pad: T.px(14))
-        place(plays, columns.plays, pad: T.px(20))
+        if twoLine { x += columns.artist } else { place(artist, columns.artist, pad: T.cellPad) }
+        place(album, columns.album, pad: T.cellPad)
+        place(genre, columns.genre, pad: T.cellPad)
+        place(added, columns.added, pad: T.cellPad)
+        place(plays, columns.plays, pad: T.numCellPad)
+        let heatColumn = columns.heat
+        heat.frame = NSRect(x: x, y: 0, width: HeatMeterView.width, height: h)
+        heat.isHidden = !hasHeat || heatColumn <= 0
+        x += heatColumn
+        place(time, columns.time, pad: T.numCellPad)
 
-        let buttonH = T.iconH
+        let buttonH = T.iconButtonH
         let y = (h - buttonH) / 2
         var right = bounds.width - T.gutter - trailingInset - T.px(12)
         for button in [more, star, download] {
@@ -1689,11 +1822,15 @@ final class SongCell: NSTableCellView {
             let size = addHost.intrinsicContentSize
             addHost.frame = NSRect(x: more.frame.minX - size.width, y: (h - size.height) / 2, width: size.width, height: size.height)
         }
+        for field in [name, artist, album, genre] { field.showFullTextWhenCut() }
         refreshIconHover()
     }
 
     @objc private func playTapped() { if trailing { controller?.playTrailing(row) } else { controller?.play(row: row) } }
-    @objc private func starTapped() { controller?.toggleFavorite(row: row) }
+    @objc private func starTapped() {
+        if !isFavorite { star.likePop() }
+        controller?.toggleFavorite(row: row)
+    }
     @objc private func downloadTapped() { controller?.setDownloaded(row: row) }
     @objc private func moreTapped() {
         guard let menu = trailing ? controller?.trailingMenu(row) : controller?.menu(forRow: row) else { return }
@@ -1704,7 +1841,6 @@ final class SongCell: NSTableCellView {
 /// A row icon whose ink brightens on hover and dims while pressed.
 final class RowActionButton: NSButton {
     var onPress: (() -> Void)?
-    /// The icon's ink at rest.
     var restTint: NSColor = T.t1.ns { didSet { update() } }
     private(set) var hovered = false
     private(set) var pressed = false
@@ -1731,7 +1867,6 @@ final class RowActionButton: NSButton {
 
 }
 
-/// The play glyph shown over the artwork of the hovered row.
 final class HoverPlayButton: NSButton {
     init() {
         super.init(frame: .zero)
@@ -1810,7 +1945,7 @@ final class DiscHeaderView: NSView {
         needsDisplay = true
     }
 
-    /// Takes no clicks, so a click on it doesn't select a row.
+    /// so a click on it doesn't select a row.
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     override func layout() {

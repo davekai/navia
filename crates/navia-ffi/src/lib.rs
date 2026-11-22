@@ -22,6 +22,8 @@ pub use discord_api::*;
 mod queue_api;
 
 mod smart_api;
+mod upcoming_api;
+pub use upcoming_api::*;
 pub use queue_api::*;
 
 
@@ -127,6 +129,8 @@ pub struct AlbumRow {
     pub artists: Vec<ArtistCredit>,
     /// The version as a label, like "Deluxe Edition". None for explicit or clean, or without a version.
     pub edition: Option<String>,
+    /// by the first-release date, so a reissue isn't new.
+    pub new_release: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -136,10 +140,12 @@ pub struct DiscTitleRow {
 }
 
 pub(crate) fn album_row(rowid: Option<u32>, a: Album) -> AlbumRow {
+    let new_release = navia_core::upcoming::is_new_release(&a, navia_core::library::taste::local_day(navia_core::library::taste::now_unix()));
     let genre = a.genre.or_else(|| a.genres.into_iter().next().map(|g| g.name));
     let explicit = navia_core::client::is_explicit(a.explicit_status.as_deref());
     let disc_titles = a.disc_titles.into_iter().filter(|d| !d.title.trim().is_empty()).map(|d| DiscTitleRow { disc: d.disc, title: d.title }).collect();
     AlbumRow {
+        new_release,
         id: a.id,
         // Shown without the version Navidrome appends to the name. The version is `edition`.
         name: navia_core::display::album_name(&a.name, a.version.as_deref()).into_owned(),
@@ -251,6 +257,15 @@ pub struct CoverArtRow {
     pub width: u32,
     pub height: u32,
     pub tint_rgb: Vec<u8>,
+    /// the server's no-cover placeholder: show it, but ask again after `placeholder_ttl_seconds()`,
+    /// since a real cover may have been added by then.
+    pub placeholder: bool,
+}
+
+/// how long a placeholder cover (`CoverArtRow.placeholder`) may be shown before it's asked for again.
+#[uniffi::export]
+pub fn placeholder_ttl_seconds() -> u32 {
+    navia_core::artwork::NO_STORE_TTL.as_secs() as u32
 }
 
 #[derive(uniffi::Record)]
@@ -329,6 +344,7 @@ pub enum SourceLink {
     Album { id: String },
     Playlist { id: String },
     Artist { id: String },
+    ArtistTop { id: String },
     Genre { name: String },
     Mix { id: String },
     Liked,
@@ -342,6 +358,7 @@ impl From<QueueSource> for navia_core::queue_order::QueueSource {
             SourceLink::Album { id } => L::Album(id),
             SourceLink::Playlist { id } => L::Playlist(id),
             SourceLink::Artist { id } => L::Artist(id),
+            SourceLink::ArtistTop { id } => L::ArtistTop(id),
             SourceLink::Genre { name } => L::Genre(name),
             SourceLink::Mix { id } => L::Mix(id),
             SourceLink::Liked => L::Liked,
@@ -358,6 +375,7 @@ impl From<navia_core::queue_order::QueueSource> for QueueSource {
             L::Album(id) => SourceLink::Album { id },
             L::Playlist(id) => SourceLink::Playlist { id },
             L::Artist(id) => SourceLink::Artist { id },
+            L::ArtistTop(id) => SourceLink::ArtistTop { id },
             L::Genre(name) => SourceLink::Genre { name },
             L::Mix(id) => SourceLink::Mix { id },
             L::Liked => SourceLink::Liked,
@@ -530,7 +548,8 @@ pub enum PlayerEventRow {
     OutputError { device: Option<String>, message: String },
     QueueChanged,
     QueueEnded,
-    OutputChanged { rate: u32, device: Option<String> },
+    /// `device_rate`: what the device runs at, when the output can tell.
+    OutputChanged { rate: u32, device_rate: Option<u32>, device: Option<String> },
     /// The player started or stopped waiting for the server during an outage.
     Connection { waiting: bool, message: Option<String> },
     /// Next or Previous with Repeat one switched it to Repeat all.
@@ -546,7 +565,7 @@ fn event_row(event: &PlayerEvent) -> Option<PlayerEventRow> {
         PlayerEvent::OutputError { device, message } => PlayerEventRow::OutputError { device: device.clone(), message: message.clone() },
         PlayerEvent::QueueChanged => PlayerEventRow::QueueChanged,
         PlayerEvent::QueueEnded => PlayerEventRow::QueueEnded,
-        PlayerEvent::OutputChanged { rate, device } => PlayerEventRow::OutputChanged { rate: *rate, device: device.clone() },
+        PlayerEvent::OutputChanged { rate, device_rate, device } => PlayerEventRow::OutputChanged { rate: *rate, device_rate: *device_rate, device: device.clone() },
         PlayerEvent::Connection { waiting, message } => PlayerEventRow::Connection { waiting: *waiting, message: message.clone() },
         PlayerEvent::RepeatChanged(r) => PlayerEventRow::RepeatChanged {
             mode: match r {
@@ -723,9 +742,21 @@ impl NaviaPlayer {
         self.inner.set_following(on);
     }
 
-    /// Smart crossfade. With a crossfade set, songs that continue an album in order play gapless.
+    /// a listening session waiting on the other side's song: the queue ends after the playing
+    /// song instead of going on; Next still moves on.
+    pub fn set_hold_after_current(&self, on: bool) {
+        self.inner.set_hold_after_current(on);
+    }
+
+    /// Smart crossfade: with a crossfade set, songs that continue an album in order join gapless.
     pub fn set_smart_crossfade(&self, on: bool) {
         self.inner.set_smart_crossfade(on);
+    }
+
+    /// Smart transitions: with a crossfade set, each join's length and place come from the
+    /// songs' measured starts and ends, with beat alignment, a bass swap and loudness matching.
+    pub fn set_smart_transitions(&self, on: bool) {
+        self.inner.set_smart_transitions(on);
     }
 
     pub fn set_output_device(&self, device: Option<String>) {
@@ -756,6 +787,7 @@ impl NaviaPlayer {
         self.inner.retry_now();
     }
 
+    /// the song a live stream says is playing, when it says.
     pub fn stream_title(&self) -> Option<String> {
         self.inner.stream_title()
     }
@@ -872,7 +904,7 @@ impl NaviaSession {
 
     pub async fn cover(&self, cover_art_id: String, size: Option<u32>) -> Result<CoverArtRow, NaviaError> {
         let cover = self.session.artwork().cover(&cover_art_id, size).await?;
-        Ok(CoverArtRow { path: cover.path.display().to_string(), width: cover.width, height: cover.height, tint_rgb: cover.tint.to_vec() })
+        Ok(CoverArtRow { path: cover.path.display().to_string(), width: cover.width, height: cover.height, tint_rgb: cover.tint.to_vec(), placeholder: cover.placeholder })
     }
 
     pub async fn glow(&self, cover_art_id: String, width: u32, height: u32) -> Result<GlowRow, NaviaError> {
@@ -977,6 +1009,31 @@ pub fn moved_order(len: u64, positions: Vec<u64>, before: u64) -> Vec<u64> {
     navia_core::queue_order::moved_order(len as usize, &positions, before as usize).unwrap_or_default().into_iter().map(|i| i as u64).collect()
 }
 
+
+/// a ready-made playlist cover: `id` is stable, `name` is its English catalog key.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct CoverStyle {
+    pub id: String,
+    pub name: String,
+}
+
+/// the ready-made playlist covers, in the order the New Playlist dialog offers them.
+#[uniffi::export]
+pub fn cover_styles() -> Vec<CoverStyle> {
+    navia_core::covers::COVER_STYLES.iter().map(|s| CoverStyle { id: s.id.into(), name: s.name.into() }).collect()
+}
+
+/// pixels on a side of the image uploaded for a chosen cover.
+#[uniffi::export]
+pub fn cover_export_px() -> u32 {
+    navia_core::covers::COVER_EXPORT_PX
+}
+
+/// a cover style with the playlist's title, `size` pixels square, as a PNG. `None` for an unknown style.
+#[uniffi::export]
+pub fn render_cover_png(style: String, title: String, size: u32) -> Option<Vec<u8>> {
+    navia_core::covers::render_cover_png(&style, &title, size)
+}
 
 #[uniffi::export]
 pub fn navia_core_version() -> String {

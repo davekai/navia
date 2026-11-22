@@ -2,14 +2,22 @@ import AppKit
 import SwiftUI
 
 extension View {
-    /// Platform glass in a capsule, tinted with `tint`, with a thin light edge.
-    func glassPill(tint: RGBA = T.glass) -> some View {
-        modifier(GlassFill(shape: AnyShape(Capsule()), tint: tint))
-            .overlay(Capsule().strokeBorder(T.glassEdge.color, lineWidth: 1).allowsHitTesting(false))
+    /// the system's own glass with no Navia tint or edge, so the system's look and transparency settings apply.
+    func glassPill(interactive: Bool = false) -> some View {
+        modifier(NativeGlass(shape: Capsule(), interactive: interactive))
     }
 
-    /// Platform glass in a rounded rectangle. `veil` is a color laid over the blur to pull it toward the window's
-    /// color. `inactiveVeil` replaces it while the window is inactive, where the platform glass lightens.
+    /// the system's own glass in `shape`, as `glassPill`; `flat` is what offscreen check images draw instead.
+    func plainGlass(_ shape: some Shape, flat: RGBA) -> some View {
+        modifier(NativeGlass(shape: shape, flat: flat))
+    }
+
+    /// the system's prominent glass button: the glass tinted with `tint` (the accent, or `--danger`).
+    func prominentGlassPill(_ tint: RGBA) -> some View {
+        modifier(NativeGlass(shape: Capsule(), tint: tint, interactive: true))
+    }
+
+    /// `veil` sits the glass closer to the window's color; `inactiveVeil` replaces it while the platform glass lifts itself.
     func glassPanel(radius: CGFloat, tint: RGBA, veil: RGBA? = nil, inactiveVeil: RGBA? = nil) -> some View {
         modifier(GlassFill(shape: AnyShape(RoundedRectangle(cornerRadius: radius, style: .continuous)), tint: tint, veil: veil, inactiveVeil: inactiveVeil))
     }
@@ -19,9 +27,16 @@ extension View {
         glassPanel(radius: radius, tint: T.panelGlass, veil: T.panelGlassVeil, inactiveVeil: T.panelGlassVeilInactive)
     }
 
-    /// A floating panel, used by popups, the smart rules and the volume panel. `clip` keeps scrolling content inside
-    /// the corners.
-    func floatPanel(clip: Bool = false, radius: CGFloat = T.rFloat) -> some View { modifier(FloatPanel(clip: clip, radius: radius)) }
+    /// `--panel` as a plain fill: grouped rows such as Settings, which have no glass rim.
+    func panelPlain(radius: CGFloat) -> some View {
+        background(T.panel.color, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+    }
+
+    /// A floating panel on the system's glass with `--shadow-float`; `clip` keeps scrolling content inside. `tinted` is
+    /// Navia's `--float-glass` with `--glass-edge`, for a card standing on its own (the sign-in form, the queue's prompt card).
+    func floatPanel(clip: Bool = false, radius: CGFloat = T.rFloat, tinted: Bool = false) -> some View {
+        modifier(FloatPanel(clip: clip, radius: radius, tinted: tinted))
+    }
 
     func shadow(_ token: T.Shadow) -> some View {
         shadow(color: token.color.color, radius: T.px(token.blur / 2), x: T.px(token.x), y: T.px(token.y))
@@ -32,7 +47,8 @@ extension View {
         overlay(Capsule().strokeBorder(color.color, lineWidth: width).padding(-width).opacity(on ? 1 : 0).allowsHitTesting(false))
     }
 
-    func invalidRing(_ on: Bool) -> some View { focusRing(on, T.invalidRing, width: T.invalidRingWidth) }
+    /// `--invalid-outline`: the thin `--invalid-ring` round a field or value with a problem.
+    func invalidRing(_ on: Bool) -> some View { focusRing(on, T.invalidRing, width: T.invalidRingW) }
 
     func artShadow() -> some View { shadow(T.shadowArt) }
 }
@@ -56,7 +72,7 @@ struct PromptCard<Answers: View>: View {
         }
         .padding(T.promptCardPad)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .floatPanel(radius: T.rLG)
+        .floatPanel(radius: T.rLG, tinted: true)
     }
 }
 
@@ -64,22 +80,23 @@ private struct FloatPanel: ViewModifier {
     let clip: Bool
     /// `T.rFloat`, or `T.rLg` for a card standing on its own.
     let radius: CGFloat
+    let tinted: Bool
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
         Group {
-            if clip {
-                content.glassPanel(radius: radius, tint: T.floatGlass).clipShape(shape)
-            } else {
-                content.glassPanel(radius: radius, tint: T.floatGlass)
-            }
+            if clip { glass(content, shape).clipShape(shape) } else { glass(content, shape) }
         }
-        .overlay(shape.strokeBorder(T.glassEdge.color, lineWidth: 1).allowsHitTesting(false))
+        .overlay { if tinted { shape.strokeBorder(T.glassEdge.color, lineWidth: 1).allowsHitTesting(false) } }
         .shadow(T.shadowFloat)
+    }
+
+    @ViewBuilder private func glass(_ content: Content, _ shape: RoundedRectangle) -> some View {
+        if tinted { content.glassPanel(radius: radius, tint: T.floatGlass) } else { content.plainGlass(shape, flat: T.menuGlass) }
     }
 }
 
-/// Platform glass in the window. Offscreen check images can't draw glass, so they get its flat tint instead.
+/// offscreen check images can't draw glass, so they get its flat tint instead.
 private struct GlassFill: ViewModifier {
     let shape: AnyShape
     let tint: RGBA
@@ -99,6 +116,23 @@ private struct GlassFill: ViewModifier {
     }
 }
 
+/// offscreen check images can't draw glass, so they get a flat fill (`--glass` unless `flat` says otherwise).
+private struct NativeGlass<S: Shape>: ViewModifier {
+    let shape: S
+    var tint: RGBA? = nil
+    var interactive = false
+    var flat: RGBA? = nil
+    @Environment(\.isSnapshot) private var isSnapshot
+
+    func body(content: Content) -> some View {
+        if isSnapshot {
+            content.background(shape.fill((flat ?? tint ?? T.glass).color))
+        } else {
+            content.glassEffect(.regular.tint(tint?.color).interactive(interactive), in: shape)
+        }
+    }
+}
+
 struct GlassGroup<Content: View>: View {
     @ViewBuilder var content: Content
     var body: some View {
@@ -109,7 +143,55 @@ struct GlassGroup<Content: View>: View {
     }
 }
 
-/// A Play pill with a filled glyph and its Shuffle partner, followed by a page's own actions in a second pill.
+/// what a page's refresh does: `library` runs the library sync now and turns with any sync; `rows` reloads the rows of
+/// Home, New, Charts and Radio.
+enum PageRefresh { case library, rows }
+
+/// a page's refresh, the last of its controls, in its own pill: `arrow.clockwise` turning once per `T.spinPeriod` while
+/// a refresh runs, ending on a whole turn; still while motion is reduced. a click while it turns does nothing.
+struct RefreshButton: View {
+    let library: any LibraryViewModel
+    let kind: PageRefresh
+    @State private var turnStart: Date?
+    @State private var turnEnd: Date?
+
+    var body: some View {
+        let busy = library.isRefreshing(library: kind == .library)
+        GlassGroup {
+            IconButton(symbol: "arrow.clockwise", label: L("Refresh"), glyph: AnyView(glyph)) { if !busy { library.refreshNow() } }
+        }
+        .onChange(of: busy, initial: true) { _, on in turn(on) }
+    }
+
+    private var glyph: some View {
+        TimelineView(.animation(paused: Motion.shared.reduced || turnStart == nil)) { context in
+            Image(systemName: "arrow.clockwise")
+                .font(.system(size: T.px(17)))
+                .rotationEffect(.degrees(angle(at: context.date)))
+        }
+    }
+
+    private func angle(at now: Date) -> Double {
+        guard let turnStart, !Motion.shared.reduced, turnEnd.map({ now < $0 }) ?? true else { return 0 }
+        return now.timeIntervalSince(turnStart).truncatingRemainder(dividingBy: T.spinPeriod) / T.spinPeriod * 360
+    }
+
+    private func turn(_ on: Bool) {
+        let now = Date()
+        if on {
+            if turnStart == nil { turnStart = now }
+            turnEnd = nil
+        } else if let start = turnStart {
+            let end = start.addingTimeInterval(max(1, ceil(now.timeIntervalSince(start) / T.spinPeriod)) * T.spinPeriod)
+            turnEnd = end
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(end.timeIntervalSince(now)))
+                if turnEnd == end { turnStart = nil; turnEnd = nil }
+            }
+        }
+    }
+}
+
 struct PlayActions<Extra: View>: View {
     let songs: [SongRow]
     let shell: ShellModel
@@ -145,7 +227,7 @@ struct TextPillButton: View {
             }
             .padding(.leading, T.px(13))
             .padding(.trailing, T.px(12))
-            .frame(height: T.iconH)
+            .frame(height: T.iconButtonH)
             .contentShape(Capsule())
         }
         .buttonStyle(HoverFillStyle(key: key ?? title))
@@ -186,7 +268,7 @@ struct ActionButton: View {
                     .modifier(SmallButtonFill(kind: kind, enabled: enabled))
                     .contentShape(Capsule())
             }
-            .buttonStyle(HoverFillStyle(key: title))
+            .buttonStyle(HoverFillStyle(key: title, shrinks: isPrimary))
             .disabled(!enabled)
             // A disabled primary keeps a faint fill and a legible label instead of fading whole.
             .opacity(enabled || isPrimary ? 1 : T.disabledOpacity)
@@ -223,8 +305,8 @@ private struct SmallButtonFill: ViewModifier {
     let enabled: Bool
     func body(content: Content) -> some View {
         switch kind {
-        case .secondary: content.glassPill()
-        case .prominent(let tint): content.glassPill(tint: tint)
+        case .secondary: content.glassPill(interactive: true)
+        case .prominent(let tint): content.prominentGlassPill(tint)
         case .primary(let fill, let ink):
             content
                 .foregroundStyle((enabled ? ink : T.t2).color)
@@ -248,7 +330,7 @@ struct IconButton: View {
     var active = false
     var inGlass = false
     var width: CGFloat = T.iconW
-    var height: CGFloat = T.iconH
+    var height: CGFloat = T.iconButtonH
     var disabled = false
     /// The tint for shuffle and repeat when on.
     var activeTint: Color? = nil
@@ -257,28 +339,44 @@ struct IconButton: View {
     var help: String? = nil
     /// Window controls over a cover, on a dark fill that darkens on hover.
     var onArt = false
+    /// the glyph pops as the button turns on, as a heart does when liking.
+    var pop = false
+    /// 0 to 1 for a symbol drawn by level (the volume's waves); a change of symbol morphs into the next one.
+    var level: Double? = nil
     var action: () -> Void = {}
     @State private var hovering = false
+    @State private var pops = 0
+    @Environment(\.springPress) private var spring
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            if pop && !active && !Motion.isReduced { pops += 1 }
+            action()
+        } label: {
             Group {
                 if let glyph {
                     glyph
                 } else {
-                    Image(systemName: symbol)
+                    Image(systemName: symbol, variableValue: level)
                         .font(.system(size: size, weight: weight))
+                        // draw mode grows each wave with the level instead of switching it on whole.
+                        .symbolVariableValueMode(.draw)
+                        .contentTransition(.symbolEffect(.automatic))
+                        .animation(level == nil ? nil : T.toggle, value: symbol)
+                        .animation(level == nil ? nil : T.toggle, value: level)
                         .symbolVariant(active && weight != .semibold && weight != .bold ? .fill : .none)
                         .foregroundStyle(active && activeTint != nil ? AnyShapeStyle(activeTint!) : AnyShapeStyle(.foreground))
+                        .modifier(LikePopEffect(trigger: pops))
                 }
             }
                 .frame(width: width, height: height)
                 .background(Capsule().fill(active && inGlass ? T.glassOn.color : .clear))
                 .background(Capsule().fill(onArt ? (hovering ? T.windowButtonOnArtHover : T.windowButtonOnArt).color : .clear))
+                .animation(T.toggle, value: active)
                 .contentShape(Capsule())
         }
-        .buttonStyle(HoverBrightenStyle(selected: active && inGlass, key: label))
-        .opacity(disabled ? 0.3 : (active || hovering || HoverDebug.forced(label) ? 1 : 0.88))
+        .buttonStyle(HoverBrightenStyle(selected: active && inGlass, key: label, glyph: size))
+        .opacity(disabled ? 0.3 : (active || hovering || spring || HoverDebug.forced(label) ? 1 : T.iconRest))
         .disabled(disabled)
         .onHover { hovering = $0 }
         .help(help ?? label)
@@ -329,7 +427,11 @@ struct TrackSlider: View {
     var rest: RGBA = T.barTrack
     /// The mini player's hairline track, with a smaller thumb.
     var thin = false
-    /// Text in a small chip over the playhead while hovered, kept `T.scrubChipEdge` from the ends.
+    /// the bar's line: `barScrubRest` thick, `barScrubHover` while hovered or dragged.
+    var grows = false
+    /// set by a host that decides when the line counts as hovered (the bar, after its delay); nil uses the pointer.
+    var raised: Bool? = nil
+    /// text in a float chip over the playhead while hovered, kept `T.scrubChipEdge` from the ends.
     var chip: String? = nil
     /// A wheel step while hovered, 1 up and -1 down. Nil leaves the wheel to whatever is behind the slider.
     var onWheel: ((Int) -> Void)? = nil
@@ -341,20 +443,14 @@ struct TrackSlider: View {
     var body: some View {
         GeometryReader { geo in
             let fraction = total > 0 ? min(1, max(0, value / total)) : 0
-            let line = thin ? T.scrubThin : 4
-            let knob = thin ? T.scrubThinKnob : T.scrubKnob
-            let shown = hovering || dragging
+            let shown = (raised ?? hovering) || dragging
+            let restLine = thin ? T.scrubThin : grows ? T.barScrubRest : T.scrubLine
+            let line = shown ? (thin ? T.scrubThinHover : grows ? T.barScrubHover : T.scrubLineHover) : restLine
             ZStack(alignment: .leading) {
                 Capsule().fill(rest.color).frame(height: line)
                 Capsule().fill(.foreground).frame(width: geo.size.width * fraction, height: line)
-                Circle().fill(T.knob.color).frame(width: knob, height: knob)
-                    .shadow(T.shadowKnob)
-                    .scaleEffect(shown ? 1 : T.scrubKnobRestScale)
-                    .opacity(shown ? 1 : 0)
-                    .animation(T.hover(shown), value: shown)
-                    .offset(x: geo.size.width * fraction - knob / 2)
-                    .allowsHitTesting(false)
             }
+            .animation(T.hover(shown), value: line)
             .frame(maxHeight: .infinity)
             .overlay(alignment: .topLeading) {
                 if let chip {
@@ -365,7 +461,7 @@ struct TrackSlider: View {
                         .lineLimit(1)
                         .padding(.horizontal, T.px(8))
                         .padding(.vertical, T.px(3))
-                        .glassPill(tint: T.floatGlass)
+                        .glassPill()
                         .fixedSize()
                         .alignmentGuide(.leading) { $0[HorizontalAlignment.center] - x }
                         // Sits 2 px above the bar. `.alignmentGuide(.top)` is ignored here, so the measured height places it.
@@ -382,7 +478,7 @@ struct TrackSlider: View {
                 onChange(min(1, max(0, drag.location.x / max(1, geo.size.width))) * total)
             }.onEnded { _ in dragging = false })
         }
-        .frame(height: T.px(14))
+        .frame(height: T.scrubSlot)
         .onHover { over in
             hovering = over
             guard let onWheel else { return }
@@ -532,7 +628,7 @@ struct FilterChip<Label: View>: View {
                 .frame(height: T.chipH)
                 .contentShape(Capsule())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressStyle())
             if let remove {
                 Button(action: remove) {
                     Image(systemName: "xmark").font(.system(size: T.chipGlyph * 0.8, weight: .bold))
@@ -564,7 +660,9 @@ struct FilterChip<Label: View>: View {
 }
 
 private struct ChipRemoveStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View { ChipRemoveBody(label: configuration.label) }
+    func makeBody(configuration: Configuration) -> some View {
+        ChipRemoveBody(label: configuration.label).modifier(PressShrink(pressed: configuration.isPressed))
+    }
 }
 
 private struct ChipRemoveBody<Label: View>: View {
@@ -630,5 +728,303 @@ struct AnchoredPopover<Content: View>: View {
                 .opacity(wanted == 0 && !isSnapshot ? 0 : 1)
         }
         .frame(width: windowSize.width, height: windowSize.height, alignment: .topLeading)
+    }
+}
+
+extension EnvironmentValues {
+    /// false while the window is hidden or being resized (set by `RootView`).
+    @Entry var marqueeMoves = true
+}
+
+extension View {
+    /// text cut short by its line limit shows `text` in full as its tooltip, only while it's cut (credits pass their joined list).
+    func fullTextHelp(_ text: String) -> some View { modifier(FullTextHelp(text: text)) }
+}
+
+private struct FullTextHelp: ViewModifier {
+    let text: String
+    @State private var shown: CGSize = .zero
+    @State private var ideal: CGSize = .zero
+
+    func body(content: Content) -> some View {
+        content
+            .onGeometryChange(for: CGSize.self, of: { $0.size }) { shown = $0 }
+            .background { content.fixedSize().hidden().onGeometryChange(for: CGSize.self, of: { $0.size }) { ideal = $0 } }
+            .help(cut ? text : "")
+    }
+
+    /// one line's full width past the room of the lines shown. A clamp wraps at words, so a few cut clamps read as fitting, never the reverse.
+    private var cut: Bool {
+        guard ideal.height > 0, shown.width > 0 else { return false }
+        let lines = max(1, (shown.height / ideal.height).rounded())
+        return ideal.width > shown.width * lines + 0.5
+    }
+}
+
+extension NSTextField {
+    /// AppKit's `fullTextHelp`: the full string as the tooltip while the field's line is cut.
+    func showFullTextWhenCut() {
+        toolTip = !isHidden && (cell?.cellSize.width ?? 0) > bounds.width + 0.5 ? stringValue : nil
+    }
+}
+
+/// A player line that scrolls sideways when it doesn't fit; the line itself holds the layout.
+struct MarqueeText<Content: View>: View {
+    @ViewBuilder let content: Content
+    @Environment(\.marqueeMoves) private var moves
+    @Environment(\.appearsActive) private var active
+    @State private var contentW: CGFloat = 0
+    @State private var boxW: CGFloat = 0
+
+    var body: some View {
+        let overflows = contentW > boxW + 0.5 && boxW > 0
+        let runs = overflows && moves && active && !Motion.isReduced
+        content
+            .lineLimit(1)
+            // still takes clicks at its resting place, where opacity 0 wouldn't.
+            .opacity(runs ? T.marqueeRestOpacity : overflows ? 0 : 1)
+            .overlay(alignment: .leading) {
+                if overflows && !runs {
+                    // at rest a line that doesn't fit fades out at its end, instead of each linked piece ending in "…".
+                    content.lineLimit(1).fixedSize(horizontal: true, vertical: false)
+                        .frame(width: boxW, alignment: .leading)
+                        .clipped()
+                        .mask(LinearGradient(stops: [.init(color: .black, location: 0),
+                                                     .init(color: .black, location: 1 - T.marqueeFade / boxW),
+                                                     .init(color: .clear, location: 1)],
+                                             startPoint: .leading, endPoint: .trailing))
+                }
+                if runs {
+                    MarqueeRoll(strip: AnyView(HStack(spacing: T.marqueeGap) { content; content }.lineLimit(1).fixedSize()),
+                                distance: contentW + T.marqueeGap, stripWidth: contentW * 2 + T.marqueeGap)
+                        .frame(width: boxW)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+            .background { content.lineLimit(1).fixedSize(horizontal: true, vertical: false).hidden().onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { contentW = $0 } }
+            .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { boxW = $0 }
+    }
+}
+
+/// moved by a Core Animation keyframe animation, so the window server runs the roll and the app draws nothing.
+private struct MarqueeRoll: NSViewRepresentable {
+    let strip: AnyView
+    let distance: CGFloat
+    let stripWidth: CGFloat
+
+    func makeNSView(context: Context) -> MarqueeRollView { MarqueeRollView() }
+
+    func updateNSView(_ view: MarqueeRollView, context: Context) {
+        view.host.rootView = AnyView(strip.environment(\.self, context.environment))
+        view.distance = distance
+        view.stripWidth = stripWidth
+        view.needsLayout = true
+    }
+}
+
+/// one clock for every marquee, each cycle as long as the longest roll, so a title and the line under it never drift.
+@MainActor final class MarqueeSync {
+    static let shared = MarqueeSync()
+    private let views = NSHashTable<MarqueeRollView>.weakObjects()
+
+    var cycle: Double { T.marqueePause + (views.allObjects.map(\.roll).max() ?? 0) }
+
+    func join(_ view: MarqueeRollView) { views.add(view); restart() }
+    func leave(_ view: MarqueeRollView) { views.remove(view); restart() }
+
+    private func restart() {
+        let epoch = CACurrentMediaTime(), cycle = cycle
+        for view in views.allObjects { view.start(epoch: epoch, cycle: cycle) }
+    }
+}
+
+final class MarqueeRollView: NSView {
+    let host = NSHostingView(rootView: AnyView(EmptyView()))
+    private let fade = CAGradientLayer()
+    var distance: CGFloat = 0
+    /// both copies and the gap; set by the caller, since a host with no sizing options reports no fitting size.
+    var stripWidth: CGFloat = 0
+    private var started: (distance: CGFloat, width: CGFloat)?
+    var roll: Double { Double(distance / T.marqueeSpeed) }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        fade.startPoint = CGPoint(x: 0, y: 0.5)
+        fade.endPoint = CGPoint(x: 1, y: 0.5)
+        layer?.mask = fade
+        host.sizingOptions = []
+        host.wantsLayer = true
+        addSubview(host)
+    }
+
+    required init?(coder: NSCoder) { nil }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        host.frame = CGRect(x: 0, y: 0, width: stripWidth, height: bounds.height)
+        fade.frame = bounds
+        CATransaction.commit()
+        guard distance > 0, bounds.width > 0, started.map({ $0 != (distance, bounds.width) }) ?? true else { return }
+        started = (distance, bounds.width)
+        MarqueeSync.shared.join(self)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { started = nil; MarqueeSync.shared.leave(self) }
+    }
+
+    /// rests, rolls, then holds where its second copy looks like the start until the shared cycle ends.
+    func start(epoch: CFTimeInterval, cycle total: Double) {
+        guard distance > 0, bounds.width > 0, total > 0 else { return }
+        let begin = NSNumber(value: T.marqueePause / total)
+        let end = NSNumber(value: min(1, (T.marqueePause + roll) / total))
+        let move = CAKeyframeAnimation(keyPath: "transform.translation.x")
+        move.values = [0, 0, -distance, -distance]
+        move.keyTimes = [0, begin, end, 1]
+
+        let edge = NSNumber(value: Double(T.marqueeFade / bounds.width))
+        fade.locations = [0, edge, NSNumber(value: 1 - edge.doubleValue), 1]
+        let black = NSColor.black.cgColor, clear = NSColor.clear.cgColor
+        let resting = [black, black, black, clear], rolling = [clear, black, black, clear]
+        fade.colors = resting
+        let edges = CAKeyframeAnimation(keyPath: "colors")
+        let fadeIn = T.marqueeFadeIn / total
+        edges.values = [resting, resting, rolling, rolling, resting, resting]
+        edges.keyTimes = [0, begin, NSNumber(value: min(end.doubleValue, begin.doubleValue + fadeIn)), end,
+                          NSNumber(value: min(1, end.doubleValue + fadeIn)), 1]
+
+        for (animation, target) in [(move, host.layer), (edges, fade)] {
+            guard let target else { continue }
+            animation.duration = total
+            animation.repeatCount = .infinity
+            animation.isRemovedOnCompletion = false
+            animation.beginTime = target.convertTime(epoch, from: nil)
+            target.add(animation, forKey: "marquee")
+        }
+    }
+}
+
+/// the dark veil and glyph over artwork while it's hovered. the caller clips it to the art's corners.
+struct ArtOverlay<Glyph: View>: View {
+    let shown: Bool
+    @ViewBuilder let glyph: Glyph
+
+    var body: some View {
+        ZStack {
+            T.windowButtonOnArt.color
+            glyph.foregroundStyle(T.tOnArt.color).shadow(T.shadowKnob)
+        }
+        .opacity(shown ? 1 : 0)
+        .animation(T.hover(shown), value: shown)
+        .allowsHitTesting(false)
+    }
+}
+
+/// as the system's search fields do it: the ✕ shows only while there's text, and emptying the field keeps the keyboard in it.
+struct SearchClearButton: View {
+    @Binding var text: String
+    var size: CGFloat = T.searchClear
+    @State private var hovering = false
+
+    var body: some View {
+        if !text.isEmpty {
+            Button { text = "" } label: {
+                Image(systemName: "xmark.circle.fill").font(.system(size: size)).foregroundStyle((hovering ? T.t1 : T.t3).color)
+                    .animation(T.hover(hovering), value: hovering)
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .onHover { hovering = $0 }
+            .help(L("Clear Search"))
+            .accessibilityLabel(L("Clear Search"))
+        }
+    }
+}
+
+extension View {
+    /// escape empties a search field that has text, as the system's search fields do.
+    func escapeClears(_ text: Binding<String>) -> some View {
+        onKeyPress(.escape) {
+            guard !text.wrappedValue.isEmpty else { return .ignored }
+            text.wrappedValue = ""
+            return .handled
+        }
+    }
+}
+
+extension View {
+    /// for a text field in the top bar: the window server moves the window on a press and drag anywhere in the title
+    /// bar that no title bar view blocks, before the field sees it, so text couldn't be selected.
+    func holdsWindowStill() -> some View { background(TitlebarDragBlock().allowsHitTesting(false)) }
+}
+
+/// the drag region AppKit hands the window server counts only the title bar's own views, not content under the bar, so
+/// a twin of this view's frame goes into the title bar view.
+private struct TitlebarDragBlock: NSViewRepresentable {
+    func makeNSView(context: Context) -> Marker { Marker() }
+    func updateNSView(_ nsView: Marker, context: Context) { nsView.place() }
+
+    final class Marker: NSView {
+        private let block = Block()
+        private var observers: [NSObjectProtocol] = []
+
+        isolated deinit {
+            observers.forEach(NotificationCenter.default.removeObserver)
+            block.removeFromSuperview()
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override func layout() { super.layout(); place() }
+        override func viewDidHide() { super.viewDidHide(); place() }
+        override func viewDidUnhide() { super.viewDidUnhide(); place() }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers = []
+            place()
+            guard let window else { return }
+            // SwiftUI moves the hosts this view sits in, not this view, and a page scrolls by its clip view's bounds.
+            var ancestor = superview
+            while let view = ancestor, view !== window.contentView {
+                var names = [NSView.frameDidChangeNotification]
+                if view is NSClipView {
+                    view.postsBoundsChangedNotifications = true
+                    names.append(NSView.boundsDidChangeNotification)
+                }
+                for name in names {
+                    observers.append(NotificationCenter.default.addObserver(forName: name, object: view, queue: .main) { [weak self] _ in
+                        MainActor.assumeIsolated { self?.place() }
+                    })
+                }
+                ancestor = view.superview
+            }
+            for name in [NSWindow.didResizeNotification, NSWindow.didExitFullScreenNotification] {
+                observers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.place() }
+                })
+            }
+        }
+
+        func place() {
+            guard let window, !isHiddenOrHasHiddenAncestor, !visibleRect.isEmpty, let bar = window.standardWindowButton(.closeButton)?.superview else {
+                block.removeFromSuperview()
+                return
+            }
+            if block.superview !== bar { bar.addSubview(block) }
+            block.frame = bar.convert(visibleRect, from: self)
+        }
+    }
+
+    final class Block: NSView {
+        override var mouseDownCanMoveWindow: Bool { false }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }

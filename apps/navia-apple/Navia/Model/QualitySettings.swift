@@ -17,9 +17,7 @@ import Observation
     private(set) var metered: QualityChoice
     private(set) var download: QualityChoice
     private(set) var leveling: String
-    /// True when the system says this connection is metered.
     private(set) var connectionMetered = false
-    /// Format ids the server said it can't make.
     private(set) var unavailable: Set<String> = []
     @ObservationIgnored private var checkedServer = false
 
@@ -74,7 +72,7 @@ import Observation
         }
     }
 
-    /// Asks the server once which formats it can't make, off the main thread.
+    /// once, off the main thread.
     func checkServerOnce() {
         guard !checkedServer else { return }
         checkedServer = true

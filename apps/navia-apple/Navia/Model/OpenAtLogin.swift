@@ -6,7 +6,7 @@ import ServiceManagement
 /// System Settings show here too.
 @MainActor @Observable final class OpenAtLogin {
     private(set) var isOn = false
-    /// Registered, but the user has to allow it in System Settings first.
+    /// registered, but waiting for the user to allow it in System Settings.
     private(set) var needsApproval = false
 
     init() { refresh() }

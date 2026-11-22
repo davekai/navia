@@ -122,7 +122,12 @@ impl NaviaAirPlay {
         self.inner.outputs().into_iter().map(row).collect()
     }
 
-    /// Asks the receiver to show its PIN. Blocks for a few seconds, so call it off the main thread.
+    /// ask the network for receivers again (the output menu opened, or the Mac woke).
+    pub fn rescan(&self) {
+        self.inner.rescan();
+    }
+
+    /// Ask the receiver to show its PIN. Blocks for up to a few seconds: call off the main thread.
     pub fn pair_begin(&self, id: String) -> Result<(), NaviaError> {
         Ok(self.inner.pair_begin(&id)?)
     }

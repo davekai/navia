@@ -19,7 +19,6 @@ private nonisolated final class CollectionEvents: CollectionListener, @unchecked
     }
 
     private(set) var rows: [Row] = []
-    /// Bumped on every change, for pages that list downloads.
     private(set) var revision = 0
     @ObservationIgnored private let core: NaviaCore
     @ObservationIgnored private var refreshing = false
@@ -92,7 +91,6 @@ private nonisolated final class CollectionEvents: CollectionListener, @unchecked
         }
     }
 
-    /// The short line in a collection's header, after its song count.
     static func statusText(_ s: CollectionStatusRow) -> String {
         let progress = L("{have} of {total}", ["have": fmtInt(Int(s.have)), "total": fmtInt(Int(s.total))])
         switch s.phase {

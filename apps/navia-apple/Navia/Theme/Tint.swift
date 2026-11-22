@@ -56,4 +56,17 @@ enum OKLCH {
         func clip(_ v: Double) -> Double { min(1, max(0, gamma(max(0, v)))) }
         return RGBA(clip(r), clip(g), clip(b))
     }
+
+    /// whether the colour is inside sRGB before any clipping.
+    static func inSRGB(l: Double, c: Double, h: Double) -> Bool {
+        let A = c * Foundation.cos(h), B = c * Foundation.sin(h)
+        let l1 = l + 0.3963377774 * A + 0.2158037573 * B
+        let m1 = l - 0.1055613458 * A - 0.0638541728 * B
+        let s1 = l - 0.0894841775 * A - 1.2914855480 * B
+        let (l3, m3, s3) = (l1 * l1 * l1, m1 * m1 * m1, s1 * s1 * s1)
+        let rgb = [4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3,
+                   -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3,
+                   -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3]
+        return rgb.allSatisfy { $0 >= -1e-4 && $0 <= 1 + 1e-4 }
+    }
 }

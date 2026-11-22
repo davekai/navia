@@ -5,7 +5,6 @@ import SwiftUI
 struct DownloadsPage: View {
     let shell: ShellModel
     @State private var entries: [DownloadEntry]?
-    /// Songs downloaded on their own, not only held by a kept playlist or album.
     @State private var singles: Set<String> = []
     @Environment(\.pageContext) private var ctx
 
@@ -134,8 +133,8 @@ private struct CollectionRow: View {
             .clipShape(RoundedRectangle(cornerRadius: T.rSM, style: .continuous))
             Button { shell.go(route) } label: {
                 VStack(alignment: .leading, spacing: T.px(1)) {
-                    Text(name).font(.navia(T.textMD, .medium)).foregroundStyle(T.t1.color).lineLimit(1)
-                    Text(sub).font(.navia(T.textSM)).foregroundStyle(T.t2.color).lineLimit(1)
+                    Text(name).font(.navia(T.textMD, .medium)).foregroundStyle(T.t1.color).lineLimit(1).fullTextHelp(name)
+                    Text(sub).font(.navia(T.textSM)).foregroundStyle(T.t2.color).lineLimit(1).fullTextHelp(sub)
                 }
                 .frame(maxWidth: compact ? .infinity : nameWidth, alignment: .leading)
                 .contentShape(Rectangle())
@@ -189,7 +188,7 @@ struct ListSongCells: View {
     /// The title's color while it's the song playing.
     var playing: Color? = nil
     var onName: (() -> Void)? = nil
-    /// Off where the row draws the art itself, as `SelectableRow`'s lead with its play button.
+    /// off where the row draws the art itself.
     var art = true
 
     var body: some View {
@@ -202,7 +201,7 @@ struct ListSongCells: View {
             name.allowsHitTesting(false)
         }
         if !compact {
-            Text(song.album).font(.navia(T.textSM)).foregroundStyle(T.t2.color).lineLimit(1)
+            Text(song.album).font(.navia(T.textSM)).foregroundStyle(T.t2.color).lineLimit(1).fullTextHelp(song.album)
                 .frame(width: albumWidth, alignment: .leading)
                 .allowsHitTesting(false)
         }
@@ -213,8 +212,8 @@ struct ListSongCells: View {
 
     private var name: some View {
         VStack(alignment: .leading, spacing: T.px(1)) {
-            Text(song.title).font(.navia(T.textMD, .medium)).foregroundStyle(playing ?? T.t1.color).lineLimit(1)
-            Text(song.artist).font(.navia(T.textSM)).foregroundStyle(T.t2.color).lineLimit(1)
+            Text(song.title).font(.navia(T.textMD, .medium)).foregroundStyle(playing ?? T.t1.color).lineLimit(1).fullTextHelp(song.title)
+            Text(song.artist).font(.navia(T.textSM)).foregroundStyle(T.t2.color).lineLimit(1).fullTextHelp(song.artist)
         }
         .frame(maxWidth: compact ? .infinity : nameWidth, alignment: .leading)
         .contentShape(Rectangle())

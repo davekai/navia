@@ -13,7 +13,8 @@ struct HomePage: View {
         let because = library.becauseYouPlayed()
         let rotation = library.backInRotation()
         let stations = library.artistStations()
-        PageFrame(shell: shell, nav: .icons) {
+        let upcoming = library.upcomingHome()
+        PageFrame(shell: shell, nav: .icons, refresh: .rows) {
             PageScroll {
                 if essentials.isEmpty && world == nil && recent.isEmpty && top.isEmpty && repeating.isEmpty && because == nil && stations.isEmpty && rotation.isEmpty {
                     LibraryEmptyState(library: library, symbol: "music.note.list", title: L("Nothing here yet"), hint: L("Home fills in once the server has music."))
@@ -38,6 +39,7 @@ struct HomePage: View {
                         }
                     }
                     albumShelf(L("Recently Added"), recent) { shell.openAlbums(sort: .recent) }
+                    UpcomingShelf(albums: upcoming, shell: shell)
                     if !essentials.isEmpty {
                         Shelf(title: L("Essentials"), action: { shell.go(.artists) }) {
                             ForEach(essentials) { artist in

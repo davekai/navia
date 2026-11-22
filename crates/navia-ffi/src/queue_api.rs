@@ -315,7 +315,7 @@ impl NaviaQueue {
         self.edit(|q| q.move_entries(&offsets, before as usize, into_queued));
     }
 
-    /// A double-click on the queue entry at `index`, following Spotify's rules.
+    /// A double-click on the queue entry at `index`, following the jump rules.
     pub fn jump(&self, index: u64) {
         self.edit(|q| q.jump(index as usize));
     }
@@ -357,8 +357,14 @@ impl NaviaQueue {
         self.state.lock().unwrap().pq.step_waiting();
     }
 
-    /// Following ended with the followed song kept. It becomes the playing entry and the queue is restored around it.
-    /// Ends holding.
+    /// while following, the first song of Next in Queue leaves the waiting queue to play through
+    /// the followed person (a listening session's turn).
+    pub fn take_queued_next(&self) -> Option<String> {
+        self.state.lock().unwrap().pq.take_queued_next()
+    }
+
+    /// Following ended with the followed song kept: it becomes the playing entry, and the queue
+    /// goes back into the player around it. Ends holding.
     pub fn keep_in_front(&self, song: QueueItem) {
         let mut st = self.state.lock().unwrap();
         st.holding = false;

@@ -51,7 +51,8 @@ import NaviaCoreFFI
             let number: Int?
             let hasLyrics, hiRes: Bool
         }
-        struct Line: Decodable { let s: Int?; let t: String }
+        /// `w`: the server's word timing, per word [start ms, end ms or null, UTF-8 byte start, byte end (exclusive)] of `t`.
+        struct Line: Decodable { let s: Int?; let t: String; let w: [[Int?]]? }
         struct Station: Decodable { let name, url: String }
         let songs: [Song]
         let nowPlaying: Song
@@ -109,7 +110,7 @@ import NaviaCoreFFI
 
     var collectionRevision: Int { collection.revision }
 
-    /// Rows for the same album, artist or playlist repeat under the scale test. Their ids end in `-n`.
+    /// rows repeated by the scale test have ids ending in `-n`.
     private func base(_ id: String) -> String { scale > 1 ? String(id.prefix { $0 != "-" }) : id }
 
     init() {
@@ -143,7 +144,13 @@ import NaviaCoreFFI
         for n in 0..<scale { rows += file.songs.map { row($0, suffix: n == 0 ? "" : "-\(n)") } }
         allRows = rows
         nowPlaying = row(file.nowPlaying)
-        nowLyrics = file.lyrics.map { LyricLine(start: $0.s, text: $0.t) }
+        nowLyrics = file.lyrics.map { line in
+            let words = (line.w ?? []).compactMap { w -> LyricWord? in
+                guard w.count == 4, let start = w[0], let from = w[2], let to = w[3] else { return nil }
+                return LyricWord(start: UInt32(from), end: UInt32(to), startMs: UInt32(start), endMs: w[1].map { UInt32($0) })
+            }
+            return LyricLine(start: line.s, text: line.t, words: words)
+        }
 
         var byAlbum: [String: [SongRow]] = [:]
         for s in rows where !s.id.contains("-") { byAlbum[s.albumID, default: []].append(s) }
@@ -379,6 +386,8 @@ import NaviaCoreFFI
 
     func mix(id: String) -> MixInfo? { nil }
     func songs(forMix mix: MixInfo) -> any SongsViewModel { LocalSongsModel(rows: mix.songs, collection: collection, defaultSort: .order) }
+    func songs(forArtistTop rows: [SongRow]) -> any SongsViewModel { LocalSongsModel(rows: rows, collection: collection, defaultSort: .order, sortable: false) }
+    func songs(forUpcoming album: UpcomingAlbum) -> any SongsViewModel { LocalSongsModel(rows: album.tracks, collection: collection, defaultSort: .order) }
 
     func latestSongs(limit: Int) -> [SongRow] {
         let firstTracks: [SongRow] = recentIDs.compactMap { id in
@@ -478,6 +487,7 @@ import NaviaCoreFFI
     func toggleFavorite(album id: String) { collection.toggleFavorite(album: base(id)) }
     func toggleFavorite(artist id: String) { collection.toggleFavorite(artist: base(id)) }
     func toggleFavorite(song: SongRow) { collection.toggleFavorite(song: song.id) }
+    func isFavorite(song: SongRow) -> Bool { collection.favoriteSongs.contains(song.id) }
     func isDownloaded(song: SongRow) -> Bool { collection.downloadedSongs.contains(song.id) }
     func setDownloaded(songs: [SongRow], _ downloaded: Bool) { collection.setDownloaded(songs.map(\.id), downloaded) }
     func createPlaylist(name: String, songs: [SongRow]) async throws -> String? { throw CoreCreateError.noServer }
@@ -651,6 +661,7 @@ import NaviaCoreFFI
 
     var lyrics: [LyricLine] { current?.id == nowID ? nowLyrics : [] }
     var lyricsSynced: Bool { true }
+    var lyricsPending: Bool { false }
 
     var featuredArtists: [FeaturedArtist] {
         guard let current, station == nil else { return [] }

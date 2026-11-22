@@ -11,7 +11,7 @@ import Foundation
 /// A missing key falls back to English, and a raw key is never shown.
 nonisolated enum Language {
     static let codes = ["en", "fr", "es", "de"]
-    /// Each language's name as written in that language, for the Language setting. Never translated.
+    /// each language's name in that language; never translated.
     static let names: [(code: String, name: String)] = [("en", "English"), ("fr", "Français"), ("es", "Español"), ("de", "Deutsch")]
 }
 
@@ -165,13 +165,12 @@ nonisolated func resolveLanguage(_ choice: String?) -> String {
     return "en"
 }
 
-/// The active language's text for `key`, falling back to English.
 nonisolated func L(_ key: String) -> String { Catalogs.shared.plain(key) }
 
 /// Marks `key` as translatable in a table. Show it with `L(value)`.
 nonisolated func N_(_ key: String) -> String { key }
 
-/// `L` with `{name}` placeholders. Values are inserted as they are.
+/// values are inserted as they are.
 nonisolated func L(_ key: String, _ vars: [String: String]) -> String {
     fillPlaceholders(Catalogs.shared.plain(key), vars)
 }
@@ -183,7 +182,7 @@ nonisolated func Ln(_ one: String, _ other: String, _ n: Int, _ vars: [String: S
     return fillPlaceholders(Catalogs.shared.plural(one: one, other: other, n: n), all)
 }
 
-/// A whole number with the language's grouping, like 12,345 or 12.345.
+/// like 12,345 or 12.345.
 nonisolated func fmtInt(_ n: Int) -> String { Catalogs.shared.number(n) }
 
 /// The language's form of a counted text for `n`, with `{count}` left in for the core to fill.
@@ -192,11 +191,11 @@ nonisolated func pluralTemplate(_ one: String, _ other: String, _ n: Int) -> Str
 /// A date from an ISO 8601 time with a short month, like Mar 4, 2025.
 nonisolated func fmtDate(_ iso: String?) -> String { Catalogs.shared.date(iso) }
 
-/// A decimal number with the language's mark, like 12.5 or 12,5.
+/// like 12.5 or 12,5.
 nonisolated func fmtDec(_ value: Double, _ digits: Int) -> String { Catalogs.shared.decimal(value, digits: digits) }
 /// A server time with its local time, for Get Info's Created and Changed.
 nonisolated func fmtDateTime(_ iso: String?) -> String { Catalogs.shared.dateTime(iso) }
-/// A release date: "2011", "March 2011" or "March 4, 2011" in the language's form.
+/// "2011", "March 2011" or "March 4, 2011" in the language's form.
 nonisolated func fmtRelease(year: Int, month: Int?, day: Int?) -> String { Catalogs.shared.release(year: year, month: month, day: day) }
 
 nonisolated private func fillPlaceholders(_ template: String, _ vars: [String: String]) -> String {

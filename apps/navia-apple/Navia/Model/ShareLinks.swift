@@ -70,7 +70,6 @@ import Observation
 
     static func nowMs() -> UInt64 { UInt64(Date().timeIntervalSince1970 * 1000) }
 
-    /// A day as the app writes dates.
     static func day(_ ms: UInt64) -> String { fmtDate(ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(ms) / 1000))) }
 
     /// The description, or empty when it's only the server's stand-in label.

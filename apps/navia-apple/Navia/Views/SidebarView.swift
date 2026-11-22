@@ -1,8 +1,19 @@
 import SwiftUI
 
+/// the sidebar's fixed pages, also the Go menu.
+enum SidebarPages {
+    static var top: [(Route, String, String)] {
+        [(.browse(), L("Search"), "magnifyingglass"), (.home, L("Home"), "house"), (.discover(.forYou), L("For You"), "sparkle"),
+         (.discover(.new), L("New"), "square.grid.2x2"), (.discover(.radio), L("Radio"), "dot.radiowaves.left.and.right")]
+    }
+    static var library: [(Route, String, String)] {
+        [(.liked, L("Liked Songs"), "heart"), (.songs(genre: nil), L("Songs"), "music.note"),
+         (.artists, L("Artists"), "music.microphone"), (.albums(.all), L("Albums"), "square.stack"), (.browse(genres: true), L("Genres"), "guitars")]
+    }
+}
+
 struct SidebarView: View {
     let shell: ShellModel
-    /// The width in points, from `ShellModel.sidebarPoints`.
     let width: CGFloat
     let toggle: () -> Void
     @State private var libraryOpen = true
@@ -14,15 +25,8 @@ struct SidebarView: View {
     @State private var contentHeight: CGFloat = 0
     @Environment(\.isSnapshot) private var isSnapshot
 
-    private let top: [(Route, String, String)] = [
-        (.browse(), L("Search"), "magnifyingglass"), (.home, L("Home"), "house"),
-        (.discover(.new), L("New"), "square.grid.2x2"), (.discover(.radio), L("Radio"), "dot.radiowaves.left.and.right"),
-    ]
-    private let library: [(Route, String, String)] = [
-        // Liked Songs first. Recently Added is a sort on Albums and Songs.
-        (.liked, L("Liked Songs"), "heart"), (.songs(genre: nil), L("Songs"), "music.note"),
-        (.artists, L("Artists"), "music.microphone"), (.albums(.all), L("Albums"), "square.stack"), (.browse(genres: true), L("Genres"), "guitars"),
-    ]
+    private let top = SidebarPages.top
+    private let library = SidebarPages.library
 
     var body: some View {
         VStack(spacing: 0) {
@@ -94,8 +98,8 @@ struct SidebarView: View {
                 item(route: .playlists, label: L("All Playlists"), symbol: "music.note.list")
                 SidebarPlaylists(shell: shell, section: .mine, scrollTop: $scrollTop, scrollHeight: $scrollHeight, contentHeight: $contentHeight)
             }
-            // Other people's public playlists. Hidden when there are none, as on a single-user server.
-            if shell.library.playlists.contains(where: { $0.section == .shared }) {
+            // hidden when there are none, as on a single-user server.
+            if shell.library.playlists.contains(where: { $0.section == .shared && shell.sidebarPins.isPinned($0) }) {
                 heading(L("Shared||playlists"), open: $sharedOpen)
                 if sharedOpen {
                     SidebarPlaylists(shell: shell, section: .shared, scrollTop: $scrollTop, scrollHeight: $scrollHeight, contentHeight: $contentHeight)
@@ -105,7 +109,6 @@ struct SidebarView: View {
         .padding(.horizontal, T.px(12))
         .padding(.top, T.sidebarListTop)
         .padding(.bottom, T.px(12))
-        // Songs carried near the top or bottom edge scroll the sidebar, so every playlist can be reached.
         .background(ScrollViewProbe { [songDrag = shell.songDrag] in songDrag.sidebarScroll = $0 })
     }
 
@@ -125,26 +128,47 @@ struct SidebarView: View {
     /// A heading's line, with the title and an optional item at its end.
     private func headingLine(_ title: String, @ViewBuilder end: () -> some View) -> some View {
         HStack {
-            Text(title).font(.navia(T.textSM, .semibold)).foregroundStyle(T.tSection.color)
+            Text(title).font(.navia(T.textSM, .semibold)).foregroundStyle(T.tNavSection.color)
             Spacer()
             end()
         }
-        .padding(.top, T.px(18))
-        .padding(.bottom, T.px(7))
+        .padding(.top, T.sidebarHeadingTop)
+        .padding(.bottom, T.sidebarHeadingPadY)
         .padding(.leading, T.px(14))
         .padding(.trailing, T.px(12))
     }
 
     private func heading(_ title: String, open: Binding<Bool>) -> some View {
-        headingLine(title) {
-            Button { open.wrappedValue.toggle() } label: {
-                Image(systemName: open.wrappedValue ? "chevron.down" : "chevron.right").font(.system(size: T.px(9), weight: .bold))
-                    .foregroundStyle(T.t3.color)
+        SidebarHeading(title: title, open: open)
+    }
+}
+
+/// the whole row folds its group; the chevron shows which way.
+private struct SidebarHeading: View {
+    let title: String
+    @Binding var open: Bool
+    @State private var hovering = false
+
+    var body: some View {
+        let label = open ? L("Collapse {section}", ["section": title]) : L("Expand {section}", ["section": title])
+        Button { open.toggle() } label: {
+            HStack {
+                Text(title).font(.navia(T.textSM, .semibold)).foregroundStyle(T.tNavSection.color)
+                Spacer()
+                Image(systemName: open ? "chevron.down" : "chevron.right").font(.system(size: T.px(9), weight: .bold))
+                    .foregroundStyle((hovering ? T.t1 : T.tNavSection).color)
             }
-            .buttonStyle(.plain)
-            .help(open.wrappedValue ? L("Collapse {section}", ["section": title]) : L("Expand {section}", ["section": title]))
-            .accessibilityLabel(open.wrappedValue ? L("Collapse {section}", ["section": title]) : L("Expand {section}", ["section": title]))
+            .padding(.vertical, T.sidebarHeadingPadY)
+            .padding(.leading, T.px(14))
+            .padding(.trailing, T.px(12))
+            .background(RoundedRectangle(cornerRadius: T.rMD, style: .continuous).fill(hovering ? T.row.color : .clear))
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .padding(.top, T.sidebarHeadingTop - T.sidebarHeadingPadY)
+        .help(label)
+        .accessibilityLabel(label)
     }
 }
 
@@ -155,22 +179,25 @@ private struct OfflineRow: View {
 
     var body: some View {
         HStack(spacing: T.px(8)) {
-            Image(systemName: "icloud.slash.fill").font(.system(size: T.px(20))).foregroundStyle(T.t2.color)
+            Image(systemName: "icloud.slash.fill").font(.system(size: T.px(20))).foregroundStyle(T.tNav.color)
             VStack(alignment: .leading, spacing: 0) {
                 Text(L("Offline")).font(.navia(T.textMD, .medium))
-                Text(L("Downloads only")).font(.navia(T.textXS)).foregroundStyle(T.t2.color).lineLimit(1).minimumScaleFactor(0.85)
+                Text(L("Downloads only")).font(.navia(T.textXS)).foregroundStyle(T.tNav.color).lineLimit(1).minimumScaleFactor(0.85)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            Button(action: retry) {
-                Text(L("Retry")).font(.navia(T.textXS, .medium))
-                    .padding(.horizontal, T.px(9))
-                    .frame(height: T.px(30))
-                    .contentShape(Capsule())
+            // the switch is the way back, so no Retry while it's on
+            if !shell.library.offlineSwitch {
+                Button(action: retry) {
+                    Text(L("Retry")).font(.navia(T.textXS, .medium))
+                        .padding(.horizontal, T.px(9))
+                        .frame(height: T.px(30))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(retrying)
+                .opacity(retrying ? 0.5 : 1)
+                .glassPill()
             }
-            .buttonStyle(.plain)
-            .disabled(retrying)
-            .opacity(retrying ? 0.5 : 1)
-            .glassPill()
         }
         .padding(.horizontal, T.px(10))
         .padding(.vertical, T.px(10))
@@ -210,7 +237,10 @@ private struct SidebarPlaylists: View {
     @State private var ignoreClick = false
 
     private var rowH: CGFloat { T.px(45) }
-    private var members: [PlaylistRef] { shell.library.playlists.filter { $0.section == section } }
+    private var members: [PlaylistRef] {
+        let pins = shell.sidebarPins
+        return shell.library.playlists.filter { $0.section == section && pins.isPinned($0) }
+    }
     private var ordered: [PlaylistRef] { SidebarOrder.merged(saved: saved, current: members) }
     private var gap: Int { max(0, min(ordered.count, Int(((pointer - listTop - grab) / rowH).rounded()))) }
 
@@ -224,11 +254,13 @@ private struct SidebarPlaylists: View {
                 // The user's own public playlists get a quiet mark, since others on the server can see them.
                 SidebarRow(label: row.name, on: shell.route == .playlist(row.id), mark: section == .mine && row.isPublic,
                            download: AnyView(DownloadMark(kind: .playlist, id: row.id, shell: shell))) {
-                    PlaylistCover(ref: row, small: true).frame(width: T.px(22), height: T.px(22))
+                    PlaylistCover(ref: row, small: true).frame(width: T.sidebarCover, height: T.sidebarCover)
                 } action: {
                     guard !ignoreClick else { return }
                     shell.go(.playlist(row.id))
                 }
+                .overlay(alignment: .leading) { CoverPlay(row: row, shell: shell).padding(.leading, T.sidebarItemPadX).allowsHitTesting(dragged == nil) }
+                .rightClickMenu { shell.library.playlist(id: row.id).map { PlaylistMenu.entries($0, shell: shell) } ?? [] }
                 .opacity(dragged == row.id ? 0.35 : 1)
                 .simultaneousGesture(drag(row))
                 // Songs dragged here are added.
@@ -247,7 +279,7 @@ private struct SidebarPlaylists: View {
         .overlay(alignment: .topLeading) {
             if let id = dragged, let row = list.first(where: { $0.id == id }) {
                 SidebarRow(label: row.name, on: false) {
-                    PlaylistCover(ref: row, small: true).frame(width: T.px(22), height: T.px(22))
+                    PlaylistCover(ref: row, small: true).frame(width: T.sidebarCover, height: T.sidebarCover)
                 } action: {}
                     .background(T.panel2.color, in: RoundedRectangle(cornerRadius: T.rMD, style: .continuous))
                     .shadow(T.shadowGhost)
@@ -287,14 +319,14 @@ private struct SidebarPlaylists: View {
         if let from = list.firstIndex(where: { $0.id == id }), SidebarOrder.move(&list, from: from, toGap: gap) {
             // The other group keeps its place in the shared list, read fresh in case it moved.
             let account = shell.library.accountKey
-            let others = SidebarOrder.merged(saved: SidebarOrder.load(account: account), current: shell.library.playlists.filter { $0.section != section })
-            saved = list.map(\.id) + others.map(\.id)
+            // the other group and unpinned playlists keep their places after this one.
+            let rest = SidebarOrder.merged(saved: SidebarOrder.load(account: account), current: shell.library.playlists).map(\.id).filter { id in !list.contains { $0.id == id } }
+            saved = list.map(\.id) + rest
             SidebarOrder.save(saved, account: account)
         }
         dragged = nil
     }
 
-    /// Scrolls while the pointer sits near the top or bottom of the visible list.
     private func autoScroll() async {
         guard dragged != nil else { return }
         let edge = T.px(36), speed = T.px(10)
@@ -316,12 +348,40 @@ private struct SidebarPlaylists: View {
     }
 }
 
+/// over a hovered cover, plays the playlist from the start; on the playlist that's playing it pauses and resumes.
+private struct CoverPlay: View {
+    let row: PlaylistRef
+    let shell: ShellModel
+    @State private var hovering = false
+
+    var body: some View {
+        let current = shell.player.queueSource?.link == .playlist(row.id)
+        let pause = current && shell.player.isPlaying
+        let label = pause ? L("Pause {name}", ["name": row.name]) : L("Play {name}", ["name": row.name])
+        if current || (shell.library.playlist(id: row.id)?.songCount ?? 0) > 0 {
+            Button {
+                if current { shell.player.togglePlayPause() }
+                else if let playlist = shell.library.playlist(id: row.id) { shell.playPlaylist(playlist, shuffle: false) }
+            } label: {
+                ArtOverlay(shown: hovering) {
+                    Image(systemName: pause ? "pause.fill" : "play.fill").font(.system(size: T.sidebarCoverGlyph))
+                }
+                .frame(width: T.sidebarCover, height: T.sidebarCover)
+                .clipShape(RoundedRectangle(cornerRadius: T.sidebarCoverR, style: .continuous))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
+            .help(label)
+            .accessibilityLabel(label)
+        }
+    }
+}
+
 private struct SidebarRow<Icon: View>: View {
     let label: String
     let on: Bool
-    /// A small "public" mark at the row's end.
     var mark = false
-    /// A kept playlist's download mark, before the public mark.
     var download: AnyView? = nil
     @ViewBuilder let icon: Icon
     let action: () -> Void
@@ -331,16 +391,16 @@ private struct SidebarRow<Icon: View>: View {
         Button(action: action) {
             HStack(spacing: T.px(12)) {
                 icon
-                Text(label).font(.navia(T.textMD)).foregroundStyle((on ? T.tEm : T.tNav).color).lineLimit(1).truncationMode(.tail)
+                Text(label).font(.navia(T.textMD, on ? T.sidebarActiveWeight : .regular)).foregroundStyle((on ? T.tEm : T.tNav).color).lineLimit(1).truncationMode(.tail).fullTextHelp(label)
                 Spacer(minLength: 0)
                 HStack(spacing: T.px(8)) {
                     if let download { download }
                     if mark {
-                        Image(systemName: "person.2").font(.system(size: T.px(11))).foregroundStyle(T.t3.color).accessibilityLabel(L("Public"))
+                        Image(systemName: "person.2").font(.system(size: T.px(11))).foregroundStyle(T.tNav.color).accessibilityLabel(L("Public"))
                     }
                 }
             }
-            .padding(.horizontal, T.px(14))
+            .padding(.horizontal, T.sidebarItemPadX)
             .frame(height: T.px(45))
             .background(RoundedRectangle(cornerRadius: T.rMD, style: .continuous).fill(on ? T.hover.color : hovering || HoverDebug.forced("Sidebar:" + label) ? T.row.color : .clear))
             .contentShape(Rectangle())

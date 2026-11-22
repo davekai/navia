@@ -8,7 +8,6 @@ import NaviaCoreFFI
 /// own. Reports are appended to the JSON file as they happen.
 /// For CPU and wakeup measurements use a fixed step list with `wait=`, since `driver=` polls its file every 50 ms.
 @MainActor enum CoreCheck {
-    /// The quality badge's facts in one line, for reports.
     static func describe(_ q: AudioQuality?) -> String {
         guard let q else { return "none" }
         return "\(q.label(short: false)) | \(q.detailLine) | source=\(q.source.map { "\($0)" } ?? "unknown") transcode=\(q.transcodeFormat ?? "-") \(q.transcodeKbps.map(String.init) ?? "")"
@@ -58,20 +57,52 @@ import NaviaCoreFFI
             NSApp.terminate(nil)
             return
         }
+        // `-naviaCheckKeepFocus YES`: real clicks need the app active.
+        if !UserDefaults.standard.bool(forKey: "naviaCheckKeepFocus") { keepFocusAway() } else { logClicks() }
         for step in steps {
+            current = step
             await perform(step, shell: shell, library: library, player: player, path: path)
             write(path, ["results": results])
         }
         write(path, ["results": results, "finished": true])
     }
 
-    /// `driver=<dir>` runs steps appended to `<dir>/cmds` and counts them in `<dir>/done`, so steps can interleave
-    /// with real input from `tools/navia-tool run`. Ends on a `quit` step.
+    private static var current = ""
+    /// real clicks while focus is kept (`clickLog`): each button event's own time and when the app got it.
+    private static var clicks: [[String: Any]] = []
+    private static var clickMonitor: Any?
+
+    private static func logClicks() {
+        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { event in
+            MainActor.assumeIsolated {
+                clicks.append(["type": event.type == .leftMouseDown ? "down" : "up", "event": event.timestamp, "got": CACurrentMediaTime(),
+                               "active": NSApp.isActive])
+
+            }
+            return event
+        }
+    }
+    private static var focusWatchers: [NSObjectProtocol] = []
+
+    /// A check run hands focus straight back whenever it becomes active, noting the step running then (`focusTaken`).
+    private static func keepFocusAway() {
+        var previous = NSWorkspace.shared.frontmostApplication.flatMap { $0 == .current ? nil : $0 }
+        focusWatchers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { note in
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication, app != .current { previous = app }
+        })
+        focusWatchers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { results.append(["focusTaken": current, "returnedTo": previous?.localizedName ?? "none"]) }
+            previous?.activate()
+        })
+    }
+
+    /// `driver=<dir>`: runs steps appended to `<dir>/cmds`, counting them in `<dir>/done`, until `quit`.
     private static func driver(dir: String, shell: ShellModel, library: CoreLibraryModel, player: CorePlayerModel, path: String) async {
         var done = 0
         while true {
             let lines = ((try? String(contentsOfFile: dir + "/cmds", encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
             while done < lines.count {
+                current = lines[done]
                 await perform(lines[done], shell: shell, library: library, player: player, path: path)
                 done += 1
                 try? String(done).write(toFile: dir + "/done", atomically: true, encoding: .utf8)
@@ -92,10 +123,50 @@ import NaviaCoreFFI
             case "activate":
                 NSApp.activate(ignoringOtherApps: true)
                 window?.makeKeyAndOrderFront(nil)
+            // `peek[=show]`: the window on the second display, in front without focus, so it draws; with one display, see-through.
+            case "peek":
+                if let window {
+                    if let second = NSScreen.screens.dropFirst().first {
+                        guard value.isEmpty else { break }
+                        let room = second.visibleFrame
+                        let size = NSSize(width: min(window.frame.width, room.width), height: min(window.frame.height, room.height))
+                        window.setFrame(NSRect(origin: NSPoint(x: room.minX, y: room.maxY - size.height), size: size), display: true)
+                    } else {
+                        window.ignoresMouseEvents = true
+                        window.alphaValue = value == "show" ? 1 : 0.01
+                    }
+                    // on whichever Space the second display shows now, a full-screen one too, so it's really on screen.
+                    if value.isEmpty { window.collectionBehavior.formUnion([.canJoinAllSpaces, .fullScreenAuxiliary]); window.orderFrontRegardless() }
+                    // A launch can still make the check app active: hand the focus straight back.
+                    if NSApp.isActive { NSApp.deactivate() }
+                }
             case "window":
                 let v = value.split(separator: ":").compactMap { Double($0) }
                 if v.count == 2, let window { window.setContentSize(NSSize(width: v[0], height: v[1])) }
                 recordWindow()
+            // `resizeBench=W1:H1:W2:H2:FRAMES:LIVE`: a timed corner drag in code; LIVE 1 sets `liveResizing`.
+            case "resizeBench":
+                let v = value.split(separator: ":").compactMap { Double($0) }
+                guard v.count == 6, let window else { break }
+                if v[5] == 1 { shell.liveResizing = true }
+                var times: [Double] = []
+                let frames = Int(v[4])
+                for i in 0..<frames {
+                    let t = Double(i) / Double(max(1, frames - 1)) * 2
+                    let k = t <= 1 ? t : 2 - t
+                    let start = CACurrentMediaTime()
+                    window.setContentSize(NSSize(width: v[0] + (v[2] - v[0]) * k, height: v[1] + (v[3] - v[1]) * k))
+                    window.contentView?.layoutSubtreeIfNeeded()
+                    window.displayIfNeeded()
+                    CATransaction.flush()
+                    times.append((CACurrentMediaTime() - start) * 1000)
+                    try? await Task.sleep(for: .milliseconds(16))
+                }
+                shell.liveResizing = false
+                let sorted = times.sorted()
+                func at(_ q: Double) -> Double { sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * q))] }
+                results.append(["resizeBench": value, "medianMs": at(0.5), "p90Ms": at(0.9), "maxMs": sorted.last ?? 0,
+                                "meanMs": times.reduce(0, +) / Double(max(1, times.count))])
             case "windowinfo": recordWindow()
             case "mode": shell.playerMode = value == "bar" ? .bar : .dock
             case "playerview": shell.playerView = PlayerView(rawValue: value) ?? .artwork
@@ -291,7 +362,104 @@ import NaviaCoreFFI
                 let all = shown()
                 find.debugType(parts.count > 1 ? parts[1] : "")
                 results.append(["addMenu": ["row": item.title, "items": all.count, "first": Array(all.prefix(4)), "filtered": shown()]])
-            // `addTo=PLAYLIST_ID:SONG_ID+SONG_ID` does what a playlist row in Add to Playlist does.
+            // `menuShow=song:ID[+ID…]:SECONDS[:HOVER[:remove[:picker[:light|dark]]]]`, `menuShow=playlist:ID:SECONDS`, `quickPress=ID[+ID…]:INDEX`.
+            case "menuShow", "quickPress":
+                let p = value.split(separator: ":").map(String.init)
+                guard p.count >= 2, let window, let content = window.contentView else { break }
+                let entries: [MenuEntry]
+                if p[0] == "playlist" {
+                    guard let row = library.playlist(id: p[1]) else { results.append([name: "no playlist"]); break }
+                    entries = PlaylistMenu.entries(row, shell: shell)
+                } else {
+                    let ids = name == "quickPress" ? p[0] : p[1]
+                    let songs = ids.split(separator: "+").compactMap { library.core?.songById(id: String($0)).map { SongRow(core: $0) } }
+                    guard !songs.isEmpty else { results.append([name: "no songs"]); break }
+                    let remove = p.count > 4 && p[4] == "remove" ? SongMenu.remove(count: songs.count) {} : nil
+                    entries = songs.count > 1 ? SongMenu.several(songs, shell: shell, remove: remove) : SongMenu.single(songs[0], shell: shell, remove: remove)
+                }
+                var menu = makeMenu(entries)
+                if p.count > 5, p[5] == "picker", let add = entries.first(where: { $0.quick && $0.submenu != nil }), let rows = add.submenu {
+                    menu = makeMenu(rows, find: add.find, empty: add.empty)
+                    if p.count > 6 { menu.appearance = NSAppearance(named: p[6] == "light" ? .aqua : .darkAqua) }
+                }
+                let quick = menu.items.first?.view as? MenuQuickRow
+                if name == "quickPress" {
+                    quick?.debugPress(Int(p[1]) ?? 0)
+                    try? await Task.sleep(for: .milliseconds(1500))
+                    results.append(["quickPress": value, "favorites": entries.first.map { $0.checked } ?? false, "toast": shell.toast ?? ""])
+                    break
+                }
+                if p.count > 3, let index = Int(p[3]) { quick?.debugHover(index) }
+                nonisolated(unsafe) let open = menu
+                let timer = Timer(timeInterval: Double(p[2]) ?? 3, repeats: false) { _ in MainActor.assumeIsolated { open.cancelTracking() } }
+                RunLoop.main.add(timer, forMode: .common)
+                menu.popUp(positioning: nil, at: NSPoint(x: content.bounds.midX, y: content.bounds.midY), in: content)
+                results.append(["menuShow": value, "width": menu.size.width,
+                                "quick": quick?.debugButtons.map { "\($0.title) x=\(Int($0.frame.minX)) w=\(Int($0.frame.width))" } ?? [],
+                                "quickRowWidth": quick?.bounds.width ?? 0,
+                                "rows": menu.items.filter { $0.view == nil }.map { $0.isSeparatorItem ? "—" : ($0.attributedTitle?.string ?? $0.title).trimmingCharacters(in: .whitespaces) + ($0.isEnabled ? "" : " (off)") }])
+            // `findSnap=light|dark:TEXT:PATH`: drawn in an off-screen window, so nothing pops up over the user's screen.
+            case "findSnap":
+                let p = value.split(separator: ":", maxSplits: 2).map(String.init)
+                guard p.count == 3 else { break }
+                let find = MenuFindField(placeholder: L("Find a playlist"))
+                let box = NSView(frame: NSRect(x: 0, y: 0, width: find.frame.width, height: find.frame.height + 10))
+                box.wantsLayer = true
+                box.layer?.backgroundColor = NSColor(white: p[0] == "light" ? 0.75 : 0.2, alpha: 1).cgColor
+                find.frame.origin.y = 5
+                box.addSubview(find)
+                let off = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: box.frame.width, height: box.frame.height), styleMask: [.borderless], backing: .buffered, defer: false)
+                off.isReleasedWhenClosed = false
+                off.appearance = NSAppearance(named: p[0] == "light" ? .aqua : .darkAqua)
+                off.contentView = box
+                off.orderBack(nil)
+                off.makeFirstResponder(find.field)
+                find.field.currentEditor()?.insertText(p[1])
+                box.layoutSubtreeIfNeeded()
+                try? await Task.sleep(for: .milliseconds(300))
+                if let rep = box.bitmapImageRepForCachingDisplay(in: box.bounds) {
+                    box.cacheDisplay(in: box.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: p[2]))
+                }
+                results.append(["findSnap": value, "editor": find.field.currentEditor() != nil])
+                off.close()
+            // `quickSnap=ID[+ID…]:HOVER:PATH`: drawn off screen, since menus open on top of every window.
+            case "quickSnap":
+                let p = value.split(separator: ":", maxSplits: 2).map(String.init)
+                guard p.count == 3 else { break }
+                let songs = p[0].split(separator: "+").compactMap { library.core?.songById(id: String($0)).map { SongRow(core: $0) } }
+                guard !songs.isEmpty else { break }
+                let menu = makeMenu(songs.count > 1 ? SongMenu.several(songs, shell: shell) : SongMenu.single(songs[0], shell: shell))
+                guard let row = menu.items.first?.view as? MenuQuickRow else { break }
+                let width = menu.size.width
+                let box = NSView(frame: NSRect(x: 0, y: 0, width: width, height: row.bounds.height + 10))
+                box.appearance = NSAppearance(named: .darkAqua)
+                box.wantsLayer = true
+                box.layer?.backgroundColor = NSColor(white: 0.17, alpha: 1).cgColor
+                row.frame = NSRect(x: 0, y: 5, width: width, height: row.bounds.height)
+                box.addSubview(row)
+                if let index = Int(p[1]), index >= 0 { row.debugHover(index) }
+                box.layoutSubtreeIfNeeded()
+                if let rep = box.bitmapImageRepForCachingDisplay(in: box.bounds) {
+                    box.cacheDisplay(in: box.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: p[2]))
+                }
+                results.append(["quickSnap": value, "menuWidth": width, "buttons": row.debugButtons.map { "\($0.title) x=\(Int($0.frame.minX)) w=\(Int($0.frame.width))" },
+                                "tooltips": row.subviews.map { $0.toolTip ?? "" }])
+            // `favoriteOf=ID`: whether that song is a favorite here.
+            case "favoriteOf":
+                if let row = library.core?.songById(id: value) { results.append(["favoriteOf": value, "on": library.isFavorite(song: SongRow(core: row))]) }
+            // `deleteAsk=PLAYLIST_ID`, `deleteConfirm`.
+            case "deleteAsk":
+                if let row = library.playlist(id: value) { shell.askDeletePlaylist(row) }
+                results.append(["deleteAsk": value, "title": shell.confirmation?.title ?? "", "message": shell.confirmation?.message ?? ""])
+            case "deleteConfirm":
+                guard let request = shell.confirmation else { results.append(["deleteConfirm": "no dialog"]); break }
+                shell.dismissConfirmation()
+                request.onConfirm()
+                try? await Task.sleep(for: .milliseconds(4000))
+                results.append(["deleteConfirm": value, "route": "\(shell.route)", "toast": shell.toast ?? "", "stillListed": library.playlists.contains { $0.id == value }, "stored": library.playlist(id: value) != nil])
+            // `addTo=PLAYLIST_ID:SONG_ID+SONG_ID`.
             case "addTo":
                 let parts = value.split(separator: ":").map(String.init)
                 let songs = (parts.count > 1 ? parts[1].split(separator: "+") : []).compactMap { library.core?.songById(id: String($0)).map { SongRow(core: $0) } }
@@ -701,6 +869,12 @@ import NaviaCoreFFI
                         if parts[1] == "1" { HoverLive.shared.pressed.insert(parts[0]) } else { HoverLive.shared.pressed.remove(parts[0]) }
                     }
                 }
+            // `clickLog`: real clicks since the last call, and when each grow probe first moved.
+            case "clickLog":
+                let first = Dictionary(HoverLive.samples.map { ($0.key, $0.time) }, uniquingKeysWith: min)
+                results.append(["clickLog": clicks, "firstSample": first])
+                clicks.removeAll()
+                HoverLive.samples.removeAll()
             case "hoverSamples":
                 let all = HoverLive.samples
                 let start = all.first?.time ?? 0
@@ -827,8 +1001,33 @@ import NaviaCoreFFI
                 }
             case "createPlaylist":
                 do { results.append(["created": try await library.createPlaylist(name: value, songs: []) ?? "(no id)"]) } catch { results.append(["createFailed": "\(error)"]) }
-            case "newPlaylistDialog": shell.openNewPlaylist()
-            // `selectPopup=X:Y` opens the select's list under the pill at that point.
+            // `playlistId=NAME`.
+            case "playlistId": results.append(["playlistId": library.playlists.filter { $0.name == value }.map(\.id), "route": "\(shell.route)"])
+            // `coverStyle=PLAYLIST_ID:STYLE_ID:TITLE`.
+            case "coverStyle":
+                let v = value.split(separator: ":", maxSplits: 2).map(String.init)
+                if v.count == 3, let style = CoverPicker.styles.first(where: { $0.id == v[1] }), let file = await writeCoverImage(style: style, title: v[2]) {
+                    let bytes = (try? Data(contentsOf: file))?.count ?? 0
+                    results.append(["coverStyle": await library.setPlaylistImage(id: v[0], path: file.path) ?? "ok", "bytes": bytes])
+                    try? FileManager.default.removeItem(at: file)
+                } else { results.append(["coverStyle": "not drawn"]) }
+            // `newPlaylistDialog[=SLOT[:NAME]]`.
+            case "newPlaylistDialog":
+                let v = value.split(separator: ":", maxSplits: 1).map(String.init)
+                shell.coverSlotSeed = v.first.flatMap { Int($0) }
+                if v.count == 2 { shell.openNewPlaylist(songs: [], name: v[1]) } else { shell.openNewPlaylist() }
+            // `editPlaylistDialog=PLAYLIST_ID[:SLOT]`.
+            case "editPlaylistDialog":
+                let v = value.split(separator: ":", maxSplits: 1).map(String.init)
+                shell.coverSlotSeed = v.count == 2 ? Int(v[1]) : nil
+                if let id = v.first, let playlist = library.playlist(id: id) {
+                    shell.closeEditPlaylist()
+                    // A frame apart, so a dialog already open is rebuilt on the new slot.
+                    try? await Task.sleep(for: .milliseconds(100))
+                    shell.openEditPlaylist(playlist)
+                    results.append(["editPlaylistDialog": playlist.name, "owned": playlist.isOwned])
+                } else { results.append(["editPlaylistDialog": "no such playlist"]) }
+            // `selectPopup=X:Y`.
             case "selectPopup":
                 let v = value.split(separator: ":").compactMap { Double($0) }
                 let options = ["Automatic", "Lossless", "High", "Normal", "Low"].map { SelectOption(value: $0, label: L($0)) }
@@ -841,6 +1040,32 @@ import NaviaCoreFFI
                 if v.count == 2 { results.append(["coverUpload": await library.setPlaylistImage(id: v[0], path: v[1]) ?? "ok"]) }
             case "coverRemove": results.append(["coverRemove": await library.removePlaylistImage(id: value) ?? "ok"])
             case "coverSupport": results.append(["canChangePlaylistImages": library.canChangePlaylistImages])
+            // `lyricsDump=FROM:TO`: start, end, word count and text of each lyric row, gap rows included.
+            case "lyricsDump":
+                let v = value.split(separator: ":").compactMap { Int($0) }
+                let lines = player.lyrics.withGaps()
+                let upper = min(lines.count, (v.last ?? lines.count - 1) + 1)
+                let range = min(v.first ?? 0, upper)..<upper
+                results.append(["lyricsDump": range.map { i in "\(i) \(lines[i].start ?? -1) end \(lines[i].endMs ?? -1) words \(lines[i].words.count) \(lines[i].text)" },
+                                "rows": lines.count])
+            // `lyricBuilds`.
+            case "lyricBuilds": results.append(["lyricBuilds": LyricFillView.builds, "alive": LyricFillView.census()]); LyricFillView.builds = []
+            // `lyricOrder`: reports where the line shown goes backwards, skips, or never shows.
+            case "lyricOrder":
+                let lines = player.lyrics.withGaps()
+                guard let last = lines.last?.start else { results.append(["lyricOrder": "no synced lyrics"]); break }
+                var shown = Set<Int>(), problems: [String] = [], previous = 0
+                for ms in stride(from: 0, through: last + 10_000, by: 10) {
+                    let index = lines.shownIndex(atMs: ms)
+                    if index < previous { problems.append("back \(previous)->\(index) at \(ms)") }
+                    if index > previous + 1 { problems.append("skip \(previous)->\(index) at \(ms)") }
+                    previous = index
+                    shown.insert(index)
+                }
+                let never = lines.indices.filter { !shown.contains($0) }
+                results.append(["lyricOrder": problems.isEmpty && never.isEmpty ? "ok" : "problems", "problems": Array(problems.prefix(20)), "neverShown": never])
+            // `dialogSubmit`.
+            case "dialogSubmit": shell.dialogSubmit += 1
             case "wait": try? await Task.sleep(for: .milliseconds(Int(value) ?? 0))
             case "syncReport":
                 let p = library.syncProgress
@@ -918,12 +1143,22 @@ import NaviaCoreFFI
             case "storageClear": library.storage?.clear()
             case "report": report(library, player, value.isEmpty ? name : value, extra: [:], path, shell: shell)
             case "visibility": setVisibility(value)
+            // `artAlias=KEY:COVER`; empty clears.
+            case "artAlias":
+                let v = value.split(separator: ":", maxSplits: 1).map(String.init)
+                if v.count == 2 { CoreArt.alias[v[0]] = v[1] } else { CoreArt.alias.removeAll() }
+                ArtworkLoader.shared.clear()
+            case "animReport": results.append(["animReport": AnimatedArtProbe.report()])
             case "reduceMotion":
                 Motion.shared.force(value == "system" ? nil : value == "on")
                 results.append(["reduceMotion": Motion.isReduced])
             case "motionSample": if let window { MotionCheck.start(value, window: window) }
             case "motionReport": results.append(MotionCheck.report(value))
-            // Overrides the window's shown state until the next occlusion change, so a check can run on a locked screen.
+            // `motionSeries=NAME:PROBE`.
+            case "motionSeries":
+                let parts = value.split(separator: ":").map(String.init)
+                if parts.count == 2 { results.append(["motionSeries": value, "values": MotionCheck.series(parts[0], parts[1])]) }
+            // `windowShown=0|1` holds until the next occlusion change, so a check can run on a locked screen.
             case "windowShown": shell.setWindowShown(value != "0")
             case "expandAnimated": MotionCheck.expand(shell, value != "0")
             case "visReport": visibilityReport(shell, player, name: value)
@@ -1041,7 +1276,7 @@ import NaviaCoreFFI
                         "shellShown": shell.windowShown,
                         "position": player.position, "heardPosition": player.heardPosition, "playing": player.isPlaying,
                         "lyricFrames": VisualStats.lyricFrames, "lyricsBodies": VisualStats.lyricsBodies,
-                        "barBodies": VisualStats.barBodies, "lyricGlides": VisualStats.lyricGlides, "lyricJumps": VisualStats.lyricJumps])
+                        "barBodies": VisualStats.barBodies, "lyricGlides": VisualStats.lyricGlides, "lyricJumps": VisualStats.lyricJumps, "writers": VisualStats.writers])
     }
 
     private static func toAppKit(_ p: CGPoint, _ window: NSWindow) -> NSPoint {
@@ -1145,7 +1380,8 @@ import NaviaCoreFFI
     static var barBodies = 0
     static var lyricGlides = 0
     static var lyricJumps = 0
-    /// `RowDragSlot` bodies so far and the slot's top in the last one, or -1 for none.
+    static var writers = ""
+    /// `RowDragSlot` bodies so far and the slot's top in the last one (-1: none), for `songDrop` reports.
     static var dragSlot: [String: Double] = [:]
 }
 #endif

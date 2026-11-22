@@ -1,15 +1,35 @@
 import AppKit
 import SwiftUI
 
-/// A section title and its rounded card of rows.
+extension EnvironmentValues {
+    /// the Settings search's words; empty shows every row.
+    @Entry var settingsQuery: [String] = []
+}
+
+/// the lowercased runs of letters and digits.
+func settingsSearchWords(_ text: String) -> [String] {
+    text.lowercased().split { !($0.isLetter || $0.isNumber) }.map(String.init)
+}
+
+/// every word starts a word of `texts`.
+func settingsMatch(_ words: [String], _ texts: String?...) -> Bool {
+    let hay = settingsSearchWords(texts.compactMap { $0 }.joined(separator: " "))
+    return words.allSatisfy { word in hay.contains { $0.hasPrefix(word) } }
+}
+
+/// hidden when the search left none of its rows.
 struct SettingsSection<Content: View>: View {
     let title: String
     @ViewBuilder let content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: T.px(10)) {
-            Text(title).font(.navia(T.textSection, .semibold)).tracking(-0.012 * T.textSection)
-            SettingsCard { content }
+        Group(subviews: content) { rows in
+            if !rows.isEmpty {
+                VStack(alignment: .leading, spacing: T.px(10)) {
+                    Text(title).font(.navia(T.textSection, .semibold)).tracking(-0.012 * T.textSection)
+                    SettingsCard { rows }
+                }
+            }
         }
     }
 }
@@ -18,9 +38,15 @@ struct SettingsSection<Content: View>: View {
 struct SettingsCard<Content: View>: View {
     @ViewBuilder let content: Content
     var body: some View {
-        VStack(spacing: 0) { content }
-            .clipShape(RoundedRectangle(cornerRadius: T.px(14), style: .continuous))
-            .panelGlass(radius: T.px(14))
+        Group(subviews: content) { rows in
+            VStack(spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                    row.overlay(alignment: .bottom) { if index < rows.count - 1 { Rectangle().fill(T.line.color).frame(height: 1) } }
+                }
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: T.px(14), style: .continuous))
+        .panelPlain(radius: T.px(14))
     }
 }
 
@@ -30,24 +56,20 @@ struct SettingsRow<Control: View>: View {
     let label: String
     var hint: String?
     var dim = false
-    /// The last row of a card has no separator.
-    var last = false
     @ViewBuilder let control: Control
-    @Environment(\.pageContext) private var ctx
+    @Environment(\.settingsQuery) private var query
 
     var body: some View {
-        let wrap = ctx.cssWidth <= 620
-        Group {
-            if wrap {
-                VStack(alignment: .leading, spacing: T.px(8)) { text; control }
-            } else {
-                HStack(spacing: T.px(24)) { text; control }
+        if settingsMatch(query, label, hint) {
+            let gap = T.px(24)
+            SettingsRowLayout(gap: gap, stackGap: T.px(8), textMin: T.settingsTextMin) {
+                text
+                HStack(spacing: gap) { control }
             }
+            .padding(.vertical, T.px(10))
+            .padding(.horizontal, T.px(16))
+            .frame(maxWidth: .infinity, minHeight: T.px(60), alignment: .leading)
         }
-        .padding(.vertical, T.px(10))
-        .padding(.horizontal, T.px(16))
-        .frame(maxWidth: .infinity, minHeight: T.px(60), alignment: .leading)
-        .overlay(alignment: .bottom) { if !last { Rectangle().fill(T.line.color).frame(height: 1) } }
     }
 
     private var text: some View {
@@ -61,36 +83,81 @@ struct SettingsRow<Control: View>: View {
     }
 }
 
-/// A row that opens another page, with a caret.
+/// the text and the control side by side while the text keeps `textMin`; narrower, the control goes under the text.
+private struct SettingsRowLayout: Layout {
+    let gap: CGFloat
+    let stackGap: CGFloat
+    let textMin: CGFloat
+
+    private func beside(_ width: CGFloat, _ control: CGSize) -> Bool { width - control.width - gap >= textMin }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let control = subviews[1].sizeThatFits(.unspecified)
+        guard let width = proposal.width, width.isFinite else {
+            let text = subviews[0].sizeThatFits(.unspecified)
+            return CGSize(width: text.width + gap + control.width, height: max(text.height, control.height))
+        }
+        if beside(width, control) {
+            let text = subviews[0].sizeThatFits(ProposedViewSize(width: width - control.width - gap, height: nil))
+            return CGSize(width: width, height: max(text.height, control.height))
+        }
+        let text = subviews[0].sizeThatFits(ProposedViewSize(width: width, height: nil))
+        let below = subviews[1].sizeThatFits(ProposedViewSize(width: min(control.width, width), height: nil))
+        return CGSize(width: width, height: text.height + stackGap + below.height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let control = subviews[1].sizeThatFits(.unspecified)
+        if beside(bounds.width, control) {
+            let textWidth = bounds.width - control.width - gap
+            subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(width: textWidth, height: nil))
+            subviews[1].place(at: CGPoint(x: bounds.maxX, y: bounds.midY), anchor: .trailing, proposal: ProposedViewSize(control))
+        } else {
+            let text = subviews[0].sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
+            subviews[0].place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: nil))
+            subviews[1].place(at: CGPoint(x: bounds.minX, y: bounds.minY + text.height + stackGap), proposal: ProposedViewSize(width: min(control.width, bounds.width), height: nil))
+        }
+    }
+}
+
+/// opens a sub-page. `terms` are that page's own settings, so the search finds them here; the matched ones replace the hint.
 struct SettingsLinkRow: View {
     let label: String
     let hint: String
-    var last = false
     /// Shown before the chevron, like a size.
     var value: String? = nil
+    var terms: [String] = []
     let action: () -> Void
     @State private var hovering = false
+    @Environment(\.settingsQuery) private var query
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: T.px(24)) {
-                VStack(alignment: .leading, spacing: T.px(1)) {
-                    Text(label).font(.navia(T.textMD, .medium)).foregroundStyle(T.t1.color)
-                    Text(hint).font(.navia(T.textSM)).foregroundStyle(T.t2.color)
+        if let shown = shownHint {
+            Button(action: action) {
+                HStack(spacing: T.px(24)) {
+                    VStack(alignment: .leading, spacing: T.px(1)) {
+                        Text(label).font(.navia(T.textMD, .medium)).foregroundStyle(T.t1.color)
+                        Text(shown).font(.navia(T.textSM)).foregroundStyle(T.t2.color)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    if let value { Text(value).font(.navia(T.textMD)).foregroundStyle(T.t2.color).fixedSize() }
+                    Image(systemName: "chevron.right").font(.system(size: T.px(14), weight: .bold)).foregroundStyle(T.t3.color)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                if let value { Text(value).font(.navia(T.textMD)).foregroundStyle(T.t2.color).fixedSize() }
-                Image(systemName: "chevron.right").font(.system(size: T.px(14), weight: .bold)).foregroundStyle(T.t3.color)
+                .padding(.vertical, T.px(10))
+                .padding(.horizontal, T.px(16))
+                .frame(maxWidth: .infinity, minHeight: T.px(60))
+                .background(hovering ? T.hover.color : .clear)
+                .contentShape(Rectangle())
             }
-            .padding(.vertical, T.px(10))
-            .padding(.horizontal, T.px(16))
-            .frame(maxWidth: .infinity, minHeight: T.px(60))
-            .background(hovering ? T.hover.color : .clear)
-            .overlay(alignment: .bottom) { if !last { Rectangle().fill(T.line.color).frame(height: 1) } }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
         }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
+    }
+
+    private var shownHint: String? {
+        if settingsMatch(query, label, hint) { return hint }
+        let found = terms.filter { settingsMatch(query, label, $0) }
+        return found.isEmpty ? nil : found.joined(separator: ", ")
     }
 }
 
@@ -114,7 +181,7 @@ struct DisabledPill: View {
 
 /// The native segmented control, at Settings' size or the larger size used in page toolbars.
 struct SegmentedChoice<Value: Hashable>: View {
-    struct Option { let value: Value; let label: String; var disabledReason: String? = nil }
+    struct Option { let value: Value; let label: String }
 
     /// `settings` for Settings' rows, `glass` for page toolbars.
     enum Look { case settings, glass }
@@ -126,65 +193,23 @@ struct SegmentedChoice<Value: Hashable>: View {
     let onChange: (Value) -> Void
 
     var body: some View {
-        // The native segmented control, tinted with the accent. A disabled option is a disabled segment with its reason
-        // as the tooltip.
-        NativeSegments(labels: options.map(\.label), selected: options.firstIndex { $0.value == value },
-                       disabled: options.map { $0.disabledReason }, accent: accent, large: look == .glass) { index in
-            let option = options[index]
-            if option.disabledReason == nil, option.value != value { onChange(option.value) }
+        Picker(label, selection: Binding(get: { value }, set: { if $0 != value { onChange($0) } })) {
+            ForEach(options.indices, id: \.self) { Text(options[$0].label).tag(options[$0].value) }
         }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .controlSize(look == .glass ? .large : .regular)
+        .tint(accent.color)
         .fixedSize()
-        .accessibilityLabel(label)
     }
 }
 
-/// `NSSegmentedControl`, which can disable and explain single segments and takes the accent as its selected color.
-private struct NativeSegments: NSViewRepresentable {
-    let labels: [String]
-    let selected: Int?
-    let disabled: [String?]
-    let accent: RGBA
-    let large: Bool
-    let onSelect: (Int) -> Void
-
-    func makeNSView(context: Context) -> NSSegmentedControl {
-        let control = NSSegmentedControl(labels: labels, trackingMode: .selectOne, target: context.coordinator, action: #selector(Coordinator.changed(_:)))
-        control.segmentStyle = .automatic
-        return control
-    }
-
-    func updateNSView(_ control: NSSegmentedControl, context: Context) {
-        context.coordinator.onSelect = onSelect
-        if control.segmentCount != labels.count { control.segmentCount = labels.count }
-        for (i, text) in labels.enumerated() {
-            control.setLabel(text, forSegment: i)
-            control.setEnabled(disabled[i] == nil, forSegment: i)
-            control.setToolTip(disabled[i], forSegment: i)
-            control.setWidth(0, forSegment: i)
-        }
-        control.selectedSegment = selected ?? -1
-        control.selectedSegmentBezelColor = NSColor(accent.color)
-        control.controlSize = large ? .large : .regular
-        control.font = NSFont.systemFont(ofSize: large ? T.textMD : T.textSM, weight: .medium)
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator(onSelect: onSelect) }
-
-    final class Coordinator: NSObject {
-        var onSelect: (Int) -> Void
-        init(onSelect: @escaping (Int) -> Void) { self.onSelect = onSelect }
-        @objc func changed(_ sender: NSSegmentedControl) { onSelect(sender.selectedSegment) }
-    }
-}
-
-/// The range control for Settings and the Equalizer.
 struct PlainSlider: View {
     enum Look: Equatable {
         /// The native slider, tinted with the accent.
         case native(accent: RGBA)
         /// The fill grows from `origin` in the accent color.
         case fill(origin: Double?, accent: RGBA)
-        /// The accent picker's rainbow.
         case hue
     }
 
@@ -217,7 +242,6 @@ struct PlainSlider: View {
         }
     }
 
-    /// The Equalizer's fill and the accent picker's rainbow, drawn by Navia.
     private var drawn: some View {
         GeometryReader { geo in
             let thumb = T.px(14)
@@ -281,7 +305,6 @@ struct PillTextField: View {
     let accent: RGBA
     var width: CGFloat? = nil
     var height: CGFloat = T.controlH
-    /// A red ring for a value that isn't valid.
     var invalid = false
     var font: Font = .navia(T.textMD)
     var onSubmit: () -> Void = {}
@@ -308,7 +331,7 @@ struct PillTextField: View {
             .frame(width: width, height: height)
             .frame(maxWidth: width == nil ? .infinity : nil)
             .modifier(FieldBackground(filled: filled))
-            .focusRing(focused || invalid, ring, width: invalid ? T.invalidRingWidth : T.focusRingWidth)
+            .focusRing(focused || invalid, ring, width: invalid ? T.invalidRingW : T.focusRingWidth)
             .task {
                 guard autoFocus else { return }
                 try? await Task.sleep(for: .milliseconds(150))
@@ -327,10 +350,6 @@ private struct FieldBackground: ViewModifier {
     }
 }
 
-/// The default accent and six others, matching GPUI's `ACCENT_PRESETS`.
-let accentPresets = ["5a93f5", "50ffff", "8b7cf6", "e879a6", "f2685c", "f5a33d", "4cc38a"]
-
-/// Presets, a hue slider and a hex field.
 struct AccentPicker: View {
     let theme: Theme
     @Environment(\.pageContext) private var ctx
@@ -341,6 +360,7 @@ struct AccentPicker: View {
         let layout = wrap ? AnyLayout(FlowLayoutWrap(spacing: T.px(12))) : AnyLayout(HStackLayout(spacing: T.px(12)))
         layout {
             HStack(spacing: T.px(7)) {
+                systemSwatch
                 ForEach(accentPresets, id: \.self) { swatch($0) }
             }
             PlainSlider(label: L("Accent hue"), value: theme.hue, min: 0, max: 359, look: .hue, width: T.px(96),
@@ -360,19 +380,44 @@ struct AccentPicker: View {
     }
 
     private func swatch(_ hex: String) -> some View {
-        let on = theme.hex == "#\(hex)"
+        let on = !theme.followsSystem && theme.hex == "#\(hex)"
         return Button { theme.setAccent(hex: "#\(hex)") } label: {
             ZStack {
                 Circle().fill(RGBA(hex: hex)!.color)
                 Circle().strokeBorder(T.glassEdge.color, lineWidth: 1)
-                if on { Image(systemName: "checkmark").font(.system(size: T.px(12), weight: .bold)).foregroundStyle(theme.onAccent.color) }
+                if on { check.foregroundStyle(theme.onAccent.color) }
             }
-            .frame(width: T.px(26), height: T.px(26))
-            .overlay(Circle().strokeBorder(T.t1.color, lineWidth: on ? 2 : 0).padding(on ? T.px(-4) : 0))
-            .contentShape(Circle())
+            .selectedSwatch(on)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(L("Use #{hex}", ["hex": hex]))
+    }
+
+    /// `--accent-wheel`: every hue at the accent's saturation and lightness, red at the top.
+    private var systemSwatch: some View {
+        let on = theme.followsSystem
+        let hues = stride(from: 0.0, through: 360, by: 30).map { RGBA.hsl($0, T.accentS, T.accentL).color }
+        return Button { theme.followSystem() } label: {
+            ZStack {
+                Circle().fill(AngularGradient(colors: hues, center: .center, startAngle: .degrees(-90), endAngle: .degrees(270)))
+                Circle().strokeBorder(T.glassEdge.color, lineWidth: 1)
+                if on { check.foregroundStyle(T.t1.color).shadow(color: T.accentWheelCheckShadow.color, radius: T.accentWheelCheckBlur / 2) }
+            }
+            .selectedSwatch(on)
+        }
+        .buttonStyle(.plain)
+        .help(L("System"))
+        .accessibilityLabel(L("System"))
+    }
+
+    private var check: some View { Image(systemName: "checkmark").font(.system(size: T.px(12), weight: .bold)) }
+}
+
+private extension View {
+    func selectedSwatch(_ on: Bool) -> some View {
+        frame(width: T.accentSwatch, height: T.accentSwatch)
+            .overlay(Circle().strokeBorder(T.t1.color, lineWidth: on ? 2 : 0).padding(on ? T.px(-4) : 0))
+            .contentShape(Circle())
     }
 }
 

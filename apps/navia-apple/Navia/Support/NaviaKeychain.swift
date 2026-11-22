@@ -52,7 +52,7 @@ nonisolated enum NaviaKeychain {
         return nil
     }
 
-    /// Replaces the secret. False when the Keychain refused.
+    /// false when the Keychain refused.
     @discardableResult static func write(_ account: String, _ data: Data) -> Bool {
         SecItemDelete(query(service: service, account: account) as CFDictionary)
         var q = query(service: service, account: account)

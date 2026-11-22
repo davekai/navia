@@ -50,12 +50,12 @@ private struct MixHeader: View {
                     .frame(width: T.heroArt, height: T.heroArt)
                     .artShadow()
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(mix.title).font(.navia(T.textTitle, .bold)).foregroundStyle(T.tEm.color).tracking(-0.024 * T.textTitle).lineLimit(2).truncationMode(.tail)
+                    Text(mix.title).font(.navia(T.textTitle, .bold)).foregroundStyle(T.tEm.color).tracking(-0.024 * T.textTitle).lineLimit(2).truncationMode(.tail).fullTextHelp(mix.title)
                     Text("\(songsAndLength(mix.songs.count, seconds: mix.duration)) • \(L("Updated today"))")
                         .font(.navia(T.textMD))
                         .padding(.top, T.px(14))
-                    Text(mix.artistsLine).font(.navia(T.textMD)).foregroundStyle(T.t2.color).lineLimit(3).truncationMode(.tail)
-                        .frame(maxWidth: T.px(520), alignment: .leading).padding(.top, T.px(14))
+                    HeaderDescription(about: AboutText(title: mix.title, subtitle: L("Mix"), art: .cover(PlaylistCover(mix: mix)), text: mix.artistsLine), shell: shell)
+                        .padding(.top, T.px(14))
                 }
             }
             HStack(spacing: T.px(8)) {

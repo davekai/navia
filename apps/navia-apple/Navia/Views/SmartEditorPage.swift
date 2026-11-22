@@ -28,13 +28,11 @@ private let previewMax = 200
 
     func attach(_ library: any LibraryViewModel) { self.library = library }
 
-    /// Starts from saved rules (Navidrome's JSON), with the playlist names rules can point at.
     func load(_ criteria: String?, playlists: [(id: String, name: String)]) {
         editor = NaviaSmartEditor(criteria: criteria, words: SmartText(playlists: playlists))
         sync()
     }
 
-    /// Applies an edit in the core, reads the rows back and runs the preview again.
     func edit(_ change: (NaviaSmartEditor) -> Void) {
         change(editor)
         sync()
@@ -54,7 +52,7 @@ private let previewMax = 200
         complete = editor.rowsComplete()
     }
 
-    /// Runs after typing pauses. Newer runs supersede older ones.
+    /// runs after typing pauses; newer runs supersede older ones.
     func refresh(delay: Bool = true) {
         generation &+= 1
         let current = generation
@@ -103,7 +101,7 @@ struct SmartEditorPage: View {
     private var trimmedName: String { model.name.trimmingCharacters(in: .whitespaces) }
     private var snapshot: String { trimmedName + "\n" + model.criteria }
 
-    /// Why these rules can't be saved now, by Save or Save As, or nil when they can.
+    /// why Save or Save As can't save these rules now, or nil.
     private func rulesBlocked(_ existing: PlaylistRow?) -> String? {
         if saving { return L("Saving…") }
         if existing != nil, !rulesLoaded {
@@ -114,7 +112,6 @@ struct SmartEditorPage: View {
         return shell.library.smartRulesProblem(name: trimmedName.isEmpty ? (existing?.name ?? "-") : trimmedName, criteria: model.criteria)
     }
 
-    /// Why Save can't be pressed now, or nil when it can.
     private func saveBlocked(_ existing: PlaylistRow?) -> String? {
         if trimmedName.isEmpty, !saving { return L("Add a name to save") }
         if let reason = rulesBlocked(existing) { return reason }
@@ -206,7 +203,6 @@ private struct SmartEditorForm: View {
     let shell: ShellModel
     let model: SmartEditorModel
     let existing: PlaylistRow?
-    /// Why the last save failed.
     let problem: String?
     @Environment(\.pageContext) private var ctx
     @FocusState private var nameFocused: Bool
@@ -489,7 +485,7 @@ private struct SmartGroupHead: View {
     }
 }
 
-/// One rule: field, condition, value and remove, or a read-only row for a rule the editor can't show.
+/// A rule the editor can't show gets a read-only row.
 private struct SmartRuleRowView: View {
     let shell: ShellModel
     let row: SmartRowView

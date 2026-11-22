@@ -4,12 +4,11 @@ import SwiftUI
 /// Artist, album and genre text in song rows are links. Hovering the text underlines it, and a click opens the page.
 /// Each credited artist is its own link. Anything without a page stays plain text.
 nonisolated enum SongLinks {
-    /// Each credited artist with an id, as its place in the row's artist text, in order.
     static func artists(_ song: SongRow) -> [(range: Range<String.Index>, id: String)] {
         artists(in: song.artist, credits: song.credits)
     }
 
-    /// Each credit with an id, as its place in `text` (a display artist like "A & B"), in order.
+    /// ranges in `text` (a display artist like "A & B"), in order.
     static func artists(in text: String, credits: [FeaturedArtist]) -> [(range: Range<String.Index>, id: String)] {
         var out: [(Range<String.Index>, String)] = []
         var from = text.startIndex
@@ -23,13 +22,11 @@ nonisolated enum SongLinks {
     }
 }
 
-/// One piece of a row's text: plain, or a link to a page.
 struct LinkPiece: Identifiable {
     let id: Int
     let text: String
     let route: Route?
 
-    /// The artist text split into its links and the plain text between them.
     static func artist(_ song: SongRow) -> [LinkPiece] { artists(song.artist, credits: song.credits) }
 
     /// An album's artist text, each credited album artist its own link. With no credits, the album's one artist id.
@@ -50,7 +47,7 @@ struct LinkPiece: Identifiable {
         return pieces
     }
 
-    /// Plain text joined onto pieces, keeping ids unique.
+    /// keeps ids unique.
     static func joined(_ groups: [[LinkPiece]], separator: String) -> [LinkPiece] {
         var out: [LinkPiece] = []
         for group in groups where !group.isEmpty {
@@ -62,7 +59,6 @@ struct LinkPiece: Identifiable {
 
     static func plain(_ text: String) -> [LinkPiece] { text.isEmpty ? [] : [LinkPiece(id: 0, text: text, route: nil)] }
 
-    /// The song's title, going to its album.
     static func title(_ song: SongRow) -> LinkPiece {
         LinkPiece(id: 0, text: song.title, route: song.albumID.isEmpty ? nil : .album(song.albumID))
     }
@@ -93,6 +89,7 @@ struct LinkedText: View {
                 }
             }
         }
+        .fullTextHelp(pieces.map(\.text).joined())
         .clipped()
     }
 }

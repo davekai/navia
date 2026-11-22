@@ -24,7 +24,7 @@ import Observation
     private(set) var outcome: Outcome?
     /// "<server> · <API>" once a check found the server, until the address changes.
     private(set) var serverLine: String?
-    /// The one-time Deezer step, with the account already open behind it.
+    /// shown with the account already open behind it.
     var deezerStep = false
     /// The saved login was refused. Cancel reads Browse Offline, since the app keeps what's on this device.
     private(set) var rejected = false
@@ -51,12 +51,11 @@ import Observation
     var isComplete: Bool { !address.trimmingCharacters(in: .whitespaces).isEmpty && !user.trimmingCharacters(in: .whitespaces).isEmpty && !password.isEmpty }
     /// Plain HTTP to a host outside the local network. A warning, not a block.
     var isInsecure: Bool { parseServerAddress(raw: address)?.unencrypted ?? false }
-    /// True when the form can be submitted.
     var canSubmit: Bool { isComplete && !isChecking }
     var title: String { mode == .change ? L("Change Server") : L("Sign in to a server") }
     var submitTitle: String { isSigningIn ? L("Signing In…") : mode == .change ? L("Save and Reconnect") : L("Sign In") }
 
-    /// Runs Test. True when the server accepted this login.
+    /// true when the server accepted this login.
     @discardableResult func test() async -> Bool { await check(test: true) != nil }
 
     /// Checks, and on success signs in through `shell`, which closes this form or moves on to the Deezer step.

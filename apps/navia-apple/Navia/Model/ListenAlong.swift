@@ -8,7 +8,6 @@ import Observation
 /// Spotify friends come from Lanyard through the core. They show in Private mode too, since following them reveals
 /// nothing.
 @MainActor @Observable final class ListenAlongModel {
-    /// The people listed in Listening Now.
     private(set) var listing: [NowPlayingRow] = []
     /// When `listing` was last read. It's dropped after `timing.listingKeepMs`, so failing checks never leave a stale
     /// list.
@@ -75,6 +74,7 @@ import Observation
         friendsTick()
         applyMarks()
         guard active else {
+            player?.sessionCheck()
             if !listing.isEmpty { listing = [] }
             return
         }
@@ -91,19 +91,23 @@ import Observation
             guard let self else { return }
             let entries = try? await core.nowPlaying()
             checking = false
-            // While listeners may control playback, check often enough to notice them join.
-            let every = player?.along != nil || controlOn ? timing.followPollMs : timing.listPollMs
+            // while listeners may control playback here, often enough to notice them join and act; faster at a session song's end
+            let session = listenCheckEveryMs(session: sessionOn, leftMs: player?.sessionLeftMs, waiting: player?.handover.waiting() ?? false)
+            let every = player?.along != nil || controlOn ? session : timing.listPollMs
             nextCheck = CFAbsoluteTimeGetCurrent() + Double(every) / 1000
             guard let entries else { return }
             listing = core.listeningNow(entries: entries, active: active)
             listingAt = CFAbsoluteTimeGetCurrent()
             if let player, let along = player.along, player.followingFriend == nil, let local = player.followLocal() {
                 let step = followStep(user: along.user, player: along.player, entries: entries, local: local)
-                let seen = followedPlaying(user: along.user, player: along.player, entries: entries)
+                let seen = followSeen(user: along.user, player: along.player, entries: entries, nowMs: listenNowMs())
+                let twoWay = followsBack(user: along.user, player: along.player, entries: entries, viewer: core.username())
                 player.applyFollowStep(step)
-                player.noteSeen(seen)
+                player.noteSeen(seen, twoWay: twoWay)
             }
             hostCheck(entries)
+            player?.sessionCheck()
+            applyMarks()
         }
     }
 
@@ -115,7 +119,7 @@ import Observation
         nextCheck = CFAbsoluteTimeGetCurrent() + Double(timing.followPollMs) / 1000
     }
 
-    /// The followed person stopped or went quiet: the player says so for a few seconds.
+    /// the player says so for a few seconds.
     func followingEnded(user: String) {
         ended = user
         endedGeneration &+= 1
@@ -139,9 +143,9 @@ import Observation
         }
     }
     private static let controlKey = "listenersControl"
-    /// People listening along with this Navia at the last look, while the setting applies.
+    /// at the last look, while the setting applies.
     private(set) var listeners: [ListenerRow] = []
-    @ObservationIgnored private var marks: (control: Bool, following: Bool)?
+    @ObservationIgnored private var marks: (control: Bool, following: Bool, queued: Bool)?
 
     /// Sharing on, Private mode off, and the setting on.
     var controlOn: Bool { active && listenersControl }
@@ -150,33 +154,52 @@ import Observation
     private func applyMarks() {
         let control = controlOn
         let following = player.map { $0.along != nil && $0.followingFriend == nil } ?? false
-        guard marks.map({ $0.control != control || $0.following != following }) ?? true else { return }
-        marks = (control, following)
-        core.setListenMarks(control: control, following: following)
-        if !control, !listeners.isEmpty { listeners = [] }
+        let queued = sessionOn && (player?.sessionMine ?? false)
+        guard marks.map({ $0.control != control || $0.following != following || $0.queued != queued }) ?? true else { return }
+        marks = (control, following, queued)
+        core.setListenMarks(control: control, following: following, queued: queued)
     }
 
     /// The host side, when not following anyone: who listens along, with their changes mirrored here.
     private func hostCheck(_ entries: [NowPlayingRow]) {
-        guard controlOn, let player, let host = player.hostRow() else {
+        guard active, let player, let host = player.hostRow() else {
             if !listeners.isEmpty { listeners = [] }
             return
         }
         let now = core.listeners(entries: entries, host: host, prev: listeners)
-        let action = hostMirror(host: host, prev: listeners, now: now, control: true)
+        let mirror = hostMirror(host: host, prev: listeners, now: now, control: controlOn)
         listeners = now
-        if let action { player.applyHostAction(action) }
+        if let mirror { player.applyHostMirror(mirror) }
+    }
+
+    /// a listening session: following someone whose Navia lets listeners control it, or hosting listeners with it on.
+    var sessionOn: Bool {
+        guard active, let player else { return false }
+        if let along = player.along { return player.followingFriend == nil && allowsControl(player: along.player) }
+        return controlOn && !listeners.isEmpty
+    }
+
+    /// who on the other side has songs queued for the session (their titles can't be sent).
+    var sessionTheirs: [String] {
+        guard let player else { return [] }
+        if let along = player.along { return hasSessionQueue(player: along.player) ? [along.user] : [] }
+        return listeners.filter(\.queued).map(\.user)
+    }
+
+    /// following them too would make two people follow each other.
+    func listensAlongWithMe(_ user: String) -> Bool {
+        listeners.contains { $0.user.lowercased() == user.lowercased() }
     }
 
     // MARK: Spotify friends
 
-    /// Friends show whenever there's a library to play from and the server is reachable, Private mode included.
+    /// whenever there's a library to play from and the server is reachable, Private mode included.
     var friendsActive: Bool { player.map { !$0.library.isOffline } ?? false }
 
-    /// The friends listed in Listening Now: those whose activity shows a song.
+    /// those whose activity shows a song.
     var listeningFriends: [SpotifyFriendRow] { friendsActive ? friends.filter(\.listening) : [] }
 
-    /// Settings > Spotify Friends > Add. False when the id isn't one or is already added.
+    /// false when the id isn't one or is already added.
     @discardableResult func addFriend(id text: String, name: String) -> Bool {
         guard let id = lanyardFriendId(text: text), !savedFriends.contains(where: { $0.id == id }) else { return false }
         let trimmed = name.trimmingCharacters(in: .whitespaces)
@@ -185,7 +208,7 @@ import Observation
         return true
     }
 
-    /// Settings > Spotify Friends > Remove. A friend followed now stops being followed.
+    /// A friend followed now stops being followed.
     func removeFriend(id: String) {
         savedFriends.removeAll { $0.id == id }
         friends.removeAll { $0.id == id }
@@ -193,7 +216,7 @@ import Observation
         saveFriends()
     }
 
-    /// The Lanyard address, applied once it's been entered.
+    /// applied once it's been entered.
     func applyAddress() {
         core.setSpotifyFriends(address: lanyardAddress, friends: savedFriends)
         friendsGeneration = nil

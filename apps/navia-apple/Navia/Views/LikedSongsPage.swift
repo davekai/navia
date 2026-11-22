@@ -15,7 +15,7 @@ struct LikedSongsPage: View {
             .padding(.trailing, T.gutter + ctx.dockUnder)
             .padding(.top, PagePadding.top)
             .padding(.bottom, T.sectionGap)
-        PageFrame(shell: shell, nav: .none, title: L("Liked Songs"), detail: songsAndLength(all.count, seconds: all.reduce(0) { $0 + $1.duration }), edgeFade: true) {
+        PageFrame(shell: shell, nav: .none, edgeFade: true) {
             EmptyView()
         } content: {
             ZStack(alignment: .top) {
@@ -54,13 +54,21 @@ private struct LikedHeader: View {
     @Environment(\.pageContext) private var ctx
 
     var body: some View {
-        HStack(spacing: T.px(8)) {
-            PlayActions(songs: tracks, shell: shell) { EmptyView() }
-            Spacer(minLength: 0)
-            GlassGroup {
-                SortButton(symbol: "arrow.up.arrow.down", label: L("Sort"), options: SongSort.likedSorts, title: \.label, current: songs.sort) { songs.sort = $0 }
+        VStack(alignment: .leading, spacing: T.sectionGap + T.px(6)) {
+            CoverHead(title: L("Liked Songs")) {
+                PlaylistCover.likedSongs
+            } meta: {
+                Text(songsAndLength(tracks.count, seconds: tracks.reduce(0) { $0 + $1.duration })).font(.navia(T.textMD))
+                HeaderDescription(about: AboutText(title: L("Liked Songs"), art: .cover(.likedSongs), text: L("Every song you've liked, newest first.")), shell: shell)
             }
-            SearchPill(placeholder: L("Search Songs"), text: Binding(get: { songs.query }, set: { songs.query = $0 }), accent: shell.theme.accent, width: pillSearchWidth(ctx))
+            HStack(spacing: T.px(8)) {
+                PlayActions(songs: tracks, shell: shell) { EmptyView() }
+                Spacer(minLength: 0)
+                GlassGroup {
+                    SortButton(symbol: "arrow.up.arrow.down", label: L("Sort"), options: SongSort.likedSorts, title: \.label, current: songs.sort) { songs.sort = $0 }
+                }
+                SearchPill(placeholder: L("Search Songs"), text: Binding(get: { songs.query }, set: { songs.query = $0 }), accent: shell.theme.accent, width: pillSearchWidth(ctx))
+            }
         }
     }
 }

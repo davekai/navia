@@ -53,11 +53,12 @@ nonisolated extension ForYouRows {
     init(core r: NaviaCoreFFI.ForYouRow) {
         self.init(mixes: r.mixes.map { MixInfo(core: $0) }, newToYou: r.newToYou.map { AlbumRow(core: $0) }, unplayed: r.unplayed.map { AlbumRow(core: $0) },
                   forgotten: r.forgotten.map { SongRow(core: $0) }, onThisDay: r.onThisDay.map { AlbumRow(core: $0) }, notPlayedRecently: r.notPlayedRecently.map { AlbumRow(core: $0) })
+        // an empty page while the mixes are being made isn't final.
+        loaded = !(r.building && isEmpty)
     }
 }
 
-/// Days since 1970 in the user's time zone, on the core's clock, so day-keyed rows turn over at local midnight
-/// together with the core's.
+/// days since 1970 in the local time zone on the core's clock, so day-keyed rows turn over with the core's.
 nonisolated func coreLocalDay() -> Int { Int(NaviaCoreFFI.localDay()) }
 
 /// A day of the year, such as "November 11", in the user's language. `day` is days since 1970, local.

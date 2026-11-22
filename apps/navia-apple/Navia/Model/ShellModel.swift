@@ -26,6 +26,8 @@ enum Route: Equatable, Hashable {
     case album(String)
     case artists
     case artist(String)
+    /// an artist's full Top Songs list.
+    case artistTop(String)
     case songs(genre: String?)
     case liked
     case playlists
@@ -37,6 +39,8 @@ enum Route: Equatable, Hashable {
     case shares
     case smartEditor(String?)
     case mix(String)
+    /// Deezer's album id.
+    case upcoming(UInt64)
 
     init(startName: String?) {
         guard let start = startName, !start.isEmpty else { self = .home; return }
@@ -65,6 +69,7 @@ enum Route: Equatable, Hashable {
         case "album": self = .album(value ?? "")
         case "artists": self = .artists
         case "artist": self = .artist(value ?? "")
+        case "artist-top": self = .artistTop(value ?? "")
         case "songs": self = .songs(genre: value)
         case "liked": self = .liked
         case "playlists": self = .playlists
@@ -76,6 +81,7 @@ enum Route: Equatable, Hashable {
         case "shares": self = .shares
         case "smart": self = .smartEditor(value)
         case "mix": self = .mix(value ?? "")
+        case "upcoming": self = .upcoming(UInt64(value ?? "") ?? 0)
         default: self = .home
         }
     }
@@ -91,6 +97,7 @@ enum Route: Equatable, Hashable {
         case .album(let id): "album-\(id)"
         case .artists: "artists"
         case .artist(let id): "artist-\(id)"
+        case .artistTop(let id): "artist-top-\(id)"
         case .songs(let genre): "songs-\(genre ?? "")"
         case .liked: "liked"
         case .playlists: "playlists"
@@ -102,11 +109,12 @@ enum Route: Equatable, Hashable {
         case .shares: "shares"
         case .smartEditor(let id): "smart-\(id ?? "")"
         case .mix(let id): "mix-\(id)"
+        case .upcoming(let id): "upcoming-\(id)"
         }
     }
 }
 
-enum BetweenSongs: String { case gapless, crossfade, smart }
+enum BetweenSongs: String { case gapless, crossfade, smart, mix }
 
 enum PlayerMode: String { case dock, bar }
 enum PlayerView: String { case lyrics, artwork, queue }
@@ -118,9 +126,9 @@ enum PlayerView: String { case lyrics, artwork, queue }
     private(set) var songs: any SongsViewModel
     private(set) var player: any PlayerViewModel
     private(set) var sessionEpoch = 0
-    /// The login in use, or nil for sample data or before sign-in.
+    /// nil for sample data or before sign-in.
     private(set) var activeLogin: CoreLogin?
-    /// The sign-in form, when it's showing. It replaces the whole shell.
+    /// replaces the whole shell while it shows.
     private(set) var connect: ConnectModel?
     private(set) var confirmation: ConfirmRequest?
     private(set) var newPlaylistOpen = false
@@ -128,24 +136,28 @@ enum PlayerView: String { case lyrics, artwork, queue }
     var smartPrefill: (rules: String, dropped: String?)?
     private(set) var shareRequest: ShareRequest?
     private(set) var info: InfoTarget?
-    private(set) var about: String?
-    /// Turning a playlist's or album's Download off asks first.
+    private(set) var about: AboutSubject?
     private(set) var stopDownload: StopDownloadRequest?
     /// Adding songs a playlist already holds asks first.
     private(set) var duplicates: DuplicatesRequest?
     let songDrag = SongDragModel()
-    /// The first selected song of the song table in front, for ⌘I.
+    /// for ⌘I.
     @ObservationIgnored var selectedSong: SongRow?
     /// From Add to Playlist. The new playlist gets these songs and this name, and the page stays put.
     private(set) var newPlaylistSeed: (songs: [SongRow], name: String)?
-    /// Save As from the smart playlist editor. The dialog names a copy of these rules, which is saved as a new smart
-    /// playlist and opened.
+    /// check runs: the cover slot New Playlist or Edit Details opens on.
+    var coverSlotSeed: Int?
+    /// check runs: a bump presses the dialog's Create or Save, since a sent click takes the focus.
+    var dialogSubmit = 0
+    /// rules (Navidrome's JSON) to save as a new smart playlist of the user's own.
     private(set) var smartSaveAs: String?
     let theme = Theme()
     let equalizer = EqualizerStore()
     let popups = PopupCenter()
 
     private(set) var route: Route
+    /// counts page changes, which way the last one went (1 forward, -1 Back) and when, for the page's entrance.
+    private(set) var pageEntry: (count: Int, direction: CGFloat, since: Date) = (0, 1, Date())
     @ObservationIgnored private var backStack: [Route] = []
     @ObservationIgnored private var forwardStack: [Route] = []
     private(set) var canGoBack = false
@@ -158,9 +170,51 @@ enum PlayerView: String { case lyrics, artwork, queue }
 
     var playerView: PlayerView { didSet { UserDefaults.standard.set(playerView.rawValue, forKey: "playerView") } }
     var expanded = false
-    /// A song without lyrics shows artwork without changing the saved view.
+    /// show what's left of the song instead of its length; a click on the times switches it.
+    var timeShowsRemaining = UserDefaults.standard.bool(forKey: "timeShowsRemaining") {
+        didSet { UserDefaults.standard.set(timeShowsRemaining, forKey: "timeShowsRemaining") }
+    }
+    /// nothing animates while the window is live-resized.
+    var liveResizing = false
+    /// narrower, the sidebar is a drawer. set by `RootView`.
+    var sidebarFits = true
+    var sidebarShown: Bool { sidebarFits ? sidebarPreferred : drawerOpen }
+
+    func toggleSidebar() {
+        if sidebarFits { sidebarPreferred.toggle() } else { drawerOpen.toggle() }
+    }
+
+    /// grows it out of the player and back.
+    func setExpanded(_ on: Bool) {
+        guard on != expanded, on == false || player.current != nil else { return }
+        withAnimation(ExpandClip.animation) { expanded = on }
+    }
+
+    /// lyricists, or composers when it has none; nil when the server credits neither.
+    func writers(of songID: String) -> String? {
+        guard let core = (library as? CoreLibraryModel)?.core, let song = core.songDetails(id: songID) else { return nil }
+        for role in ["lyricist", "composer"] {
+            let names = song.credits.filter { $0.role == role }.flatMap(\.names).map(\.name).filter { !$0.isEmpty }
+            if !names.isEmpty { return names.joined(separator: ", ") }
+        }
+        return nil
+    }
+
+    /// set by `RootView`.
+    var dockFits = true
+    var playerViewShown: Bool { expanded || (playerMode == .dock && dockFits) }
+
+    /// shows the view (docking the player, or full screen when too narrow), or goes back to artwork if already showing.
+    func togglePlayerView(_ view: PlayerView) {
+        if playerViewShown && shownPlayerView == view { playerView = .artwork; return }
+        playerView = view
+        guard !playerViewShown else { return }
+        if dockFits { playerMode = .dock } else { setExpanded(true) }
+    }
+    /// A song without lyrics shows artwork without changing the saved view. lyrics stays while a new song's lyrics load,
+    /// since core rows only learn they have lyrics once they arrive.
     var shownPlayerView: PlayerView {
-        playerView == .lyrics && (player.current?.hasLyrics != true || player.station != nil) ? .artwork : playerView
+        playerView == .lyrics && (!player.mayHaveLyrics || player.station != nil) ? .artwork : playerView
     }
 
 
@@ -168,7 +222,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
     var dockWidthSaved: CGFloat { didSet { UserDefaults.standard.set(Double(dockWidthSaved), forKey: "dockWidth") } }
     /// The width while dragging, or nil. Saving and other expensive work wait for the end of the drag.
     var dockDragWidth: CGFloat?
-    /// The token width to draw before the room rules are applied.
+    /// before the room rules are applied.
     var dockTokenWidth: CGFloat { dockDragWidth ?? dockWidthSaved }
 
     /// The saved sidebar width, in token pixels.
@@ -193,6 +247,12 @@ enum PlayerView: String { case lyrics, artwork, queue }
     }
 
     var lyricBlur: Bool { didSet { UserDefaults.standard.set(lyricBlur, forKey: "lyricBlur") } }
+    /// glow, word lift, springy line moves, gap bars and the previous line's peek; neither the sweep nor the backing line.
+    var lyricEffects: Bool { didSet { UserDefaults.standard.set(lyricEffects, forKey: "lyricEffects") } }
+    /// off, the current line lights whole, with no rising words.
+    var lyricSweep: Bool { didSet { UserDefaults.standard.set(lyricSweep, forKey: "lyricSweep") } }
+    /// off, bracketed backing vocals stay inline, as written.
+    var backingVocalsLine: Bool { didSet { UserDefaults.standard.set(backingVocalsLine, forKey: "backingVocalsLine") } }
 
     var betweenSongs: BetweenSongs {
         didSet {
@@ -209,9 +269,9 @@ enum PlayerView: String { case lyrics, artwork, queue }
 
     /// Crossfade and Smart both fade. Smart plays a song that continues the album gapless.
     private var crossfadeMs: Int { betweenSongs == .gapless ? 0 : crossfadeSeconds * 1000 }
-    private func applyCrossfade() { player.setCrossfade(ms: crossfadeMs, smart: betweenSongs == .smart) }
+    private func applyCrossfade() { player.setCrossfade(ms: crossfadeMs, smart: betweenSongs == .smart || betweenSongs == .mix, mix: betweenSongs == .mix) }
 
-    /// The output device id chosen in Settings, or nil for the system default.
+    /// nil for the system default.
     var outputDevice: String? {
         didSet {
             UserDefaults.standard.set(outputDevice, forKey: "outputDevice")
@@ -286,7 +346,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
         return outputOptions.first { $0.id == id }?.name ?? id
     }
 
-    /// Sends the equalizer's settings to the player, or bypass when it's off.
+    /// bypass when it's off.
     func applyEqualizer() {
         player.applyEqualizer(equalizer.state.plan(for: outputDevice ?? eqOutputDefault, sampleMode: CoreMode.useSample))
     }
@@ -316,7 +376,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
     func holdToast(hovered: Bool) {
         toastTask?.cancel()
         guard !hovered, toast != nil else { return }
-        let seconds = toastAction == nil ? T.toastSeconds : T.toastActionSeconds
+        let seconds = toastAction == nil ? T.toast : T.toastAction
         toastTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
@@ -372,14 +432,14 @@ enum PlayerView: String { case lyrics, artwork, queue }
 
     /// The saved translucency choice. On by default.
     var windowTranslucency: Bool { didSet { UserDefaults.standard.set(windowTranslucency, forKey: "windowTranslucency") } }
-    /// The system's Reduce transparency setting, which overrides the saved choice without changing it.
+    /// overrides the saved choice without changing it.
     var systemReduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
     var inFullScreen = false
 
     /// False while the window can't be seen, such as when minimized, covered, on another Space or hidden.
     /// Nothing redraws for position or animates then. Set through `setWindowShown`.
     private(set) var windowShown = true
-    /// When the window last came back, so the lyrics land on the current line instead of gliding to it.
+    /// so the lyrics land on the current line instead of gliding to it.
     @ObservationIgnored private(set) var shownAt: CFTimeInterval = 0
 
     /// Called by the window's observer. Coming back catches up in one update without animation, so the first frame
@@ -407,7 +467,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
         player.setViewsLive(windowShown || shown)
     }
 
-    /// Whether the window is actually see-through right now. In full screen there is no desktop behind it.
+    /// in full screen there is no desktop behind the window.
     var translucencyActive: Bool { windowTranslucency && !systemReduceTransparency && !inFullScreen }
 
     /// Scrobbling for this account. On unless turned off. Change it with `chooseScrobble`.
@@ -459,7 +519,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
             }
         }
     }
-    /// The periodic library refresh. The sync at launch happens either way.
+    /// the sync at launch happens either way.
     var backgroundSync: Bool {
         didSet {
             UserDefaults.standard.set(backgroundSync, forKey: "backgroundSync")
@@ -506,12 +566,15 @@ enum PlayerView: String { case lyrics, artwork, queue }
         sidebarPreferred = defaults.object(forKey: "sidebarOpen") as? Bool ?? true
         playerMode = defaults.string(forKey: "playerMode").flatMap(PlayerMode.init(rawValue:)) ?? .dock
         playerView = defaults.string(forKey: "playerView").flatMap(PlayerView.init(rawValue:)) ?? .artwork
-        dockWidthSaved = min(T.dockMaxTokens, max(T.dockMinTokens, CGFloat(defaults.object(forKey: "dockWidth") as? Double ?? T.dockDefaultTokens)))
-        sidebarWidthSaved = min(T.sidebarMaxTokens, max(T.sidebarMinTokens, CGFloat(defaults.object(forKey: "sidebarWidth") as? Double ?? T.sidebarDefaultTokens)))
+        dockWidthSaved = min(T.dockMaxW, max(T.dockMinW, CGFloat(defaults.object(forKey: "dockWidth") as? Double ?? T.dockW)))
+        sidebarWidthSaved = min(T.sidebarWMax, max(T.sidebarWMin, CGFloat(defaults.object(forKey: "sidebarWidth") as? Double ?? T.sidebarW)))
         windowTranslucency = defaults.object(forKey: "windowTranslucency") != nil ? defaults.bool(forKey: "windowTranslucency") : true
         interfaceSize = min(130, max(70, defaults.object(forKey: "interfaceSize") as? Int ?? 100))
         T.zoom = CGFloat(min(130, max(70, defaults.object(forKey: "interfaceSize") as? Int ?? 100))) / 100
         lyricBlur = defaults.object(forKey: "lyricBlur") as? Bool ?? true
+        lyricEffects = defaults.object(forKey: "lyricEffects") as? Bool ?? true
+        lyricSweep = defaults.object(forKey: "lyricSweep") as? Bool ?? true
+        backingVocalsLine = defaults.object(forKey: "backingVocalsLine") as? Bool ?? true
         miniOnMinimize = defaults.bool(forKey: "miniOnMinimize")
         betweenSongs = defaults.string(forKey: "betweenSongs").flatMap(BetweenSongs.init(rawValue:)) ?? .gapless
         crossfadeSeconds = min(12, max(1, defaults.object(forKey: "crossfadeSeconds") as? Int ?? 6))
@@ -538,6 +601,11 @@ enum PlayerView: String { case lyrics, artwork, queue }
             if event.keyCode == 53, let self, self.duplicates != nil { self.closeDuplicates(); return nil }
             if event.keyCode == 53, let self, self.popups.quality != nil { self.popups.closeQuality(unlessPinned: false); return nil }
             if event.keyCode == 53, let self, self.popups.filter != nil { self.popups.close(); return nil }
+            // Space and ⌘ arrows are menu shortcuts too; in a text field or on a focused button they stay there.
+            if let window = event.window, window.firstResponder is NSText || window.firstResponder is NSButton, NaviaCommands.passesToFocus(event) {
+                window.sendEvent(event)
+                return nil
+            }
             guard event.keyCode == 49, event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
                   !(event.window?.firstResponder is NSText), !(event.window?.firstResponder is NSButton) else { return event }
             self?.player.togglePlayPause()
@@ -610,7 +678,6 @@ enum PlayerView: String { case lyrics, artwork, queue }
         #endif
     }
 
-    /// Everything each account's player and library start with.
     private func configureSession() {
         applyCrossfade()
         if outputDevice != nil { player.setOutputDevice(outputDevice) }
@@ -670,6 +737,8 @@ enum PlayerView: String { case lyrics, artwork, queue }
 
     func setDeezerChoice(_ on: Bool) {
         deezerChoice = on
+        // the album tables' Heat column comes and goes with it.
+        NotificationCenter.default.post(name: .naviaSongColumnsChanged, object: nil)
         guard let core = (library as? CoreLibraryModel)?.core else { return }
         do { try core.setDeezerRecommendations(on: on) } catch { NSLog("navia: couldn't save the Deezer choice: \(error)") }
     }
@@ -683,7 +752,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
                                confirmTitle: L("Sign Out"), compact: true) { [weak self] in self?.signOut() })
     }
 
-    /// Forgets the login and returns to the sign-in screen. Downloads and other per-account data stay on this device.
+    /// Downloads and other per-account data stay on this device.
     func signOut() {
         LoginKeychain.delete()
         activate(nil)
@@ -699,7 +768,38 @@ enum PlayerView: String { case lyrics, artwork, queue }
     func openEditPlaylist(_ playlist: PlaylistRow) { editingPlaylist = playlist }
     func closeEditPlaylist() { editingPlaylist = nil }
 
-    /// Public settings shown ahead of the server. A toggle shows at once and reverts if the server refuses.
+    /// fetches its songs first when none are stored yet.
+    func playPlaylist(_ playlist: PlaylistRow, shuffle: Bool) {
+        Task { @MainActor in
+            let songs = await library.playlistSongsToPlay(id: playlist.id)
+            guard !songs.isEmpty else { showToast(L("No songs to play")); return }
+            player.nextSource = PlaySource(name: playlist.name, link: .playlist(playlist.id))
+            playAll(songs, shuffle: shuffle)
+        }
+    }
+
+    /// asks first, since it's removed from the server for everyone.
+    func askDeletePlaylist(_ playlist: PlaylistRow) {
+        let downloading = library.synced?.status(.playlist, playlist.id) != nil
+        let removed = downloading ? Int(library.synced?.removalPlan(.playlist, playlist.id).remove ?? 0) : 0
+        var message = L("It’s removed from the server for everyone.")
+        if removed > 0 { message += " " + Ln("Its {count} downloaded song is removed from this device too.", "Its {count} downloaded songs are removed from this device too.", removed) }
+        confirm(ConfirmRequest(title: L("Delete “{name}”?", ["name": playlist.name]), message: message, confirmTitle: L("Delete")) { [weak self] in
+            self?.deletePlaylist(playlist, stopDownload: downloading)
+        })
+    }
+
+    private func deletePlaylist(_ playlist: PlaylistRow, stopDownload: Bool) {
+        Task { @MainActor in
+            if let problem = await library.deletePlaylist(id: playlist.id) { showToast(problem); return }
+            if stopDownload { library.synced?.turnOff(.playlist, playlist.id, keepSongs: false) }
+            let account = library.accountKey
+            SidebarOrder.save(SidebarOrder.load(account: account).filter { $0 != playlist.id }, account: account)
+            if route == .playlist(playlist.id) || route == .smartEditor(playlist.id) { go(.playlists) }
+        }
+    }
+
+    /// A toggle shows at once and goes back if the server refuses.
     private(set) var publicShown: [String: Bool] = [:]
     func isPublic(_ playlist: PlaylistRow) -> Bool { publicShown[playlist.id] ?? playlist.isPublic }
 
@@ -742,6 +842,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
     func closeDuplicates() { duplicates = nil }
 
     private func addSongsNow(_ songs: [SongRow], to target: PlaylistRef, done: String, saved: ((Bool) -> Void)? = nil) {
+        RowFlash.shared.flash(songs.map(\.id))
         Task { @MainActor in
             switch await library.addToPlaylist(id: target.id, songs: songs) {
             case .saved:
@@ -757,12 +858,14 @@ enum PlayerView: String { case lyrics, artwork, queue }
     /// Songs dropped on the queue at Up Next offset `at`, into Next in Queue or the list.
     func queueSongs(_ songs: [SongRow], at: Int, queued: Bool) {
         player.queueSongs(songs, at: at, queued: queued)
+        RowFlash.shared.flash(songs.map(\.id))
     }
 
     /// Songs dropped on the queue tab or the bar's queue button go to the end of Next in Queue.
     func queueSongsAtEnd(_ songs: [SongRow]) {
         player.queueSongs(songs, at: player.queuedCount, queued: true)
-        showToast(L("Added to queue"))
+        RowFlash.shared.flash(songs.map(\.id))
+        showToast(player.sessionOn ? L("Added to the session queue") : L("Added to queue"))
     }
     func confirm(_ request: ConfirmRequest) { confirmation = request }
 
@@ -784,7 +887,8 @@ enum PlayerView: String { case lyrics, artwork, queue }
 
     func openInfo(_ target: InfoTarget) { info = target }
     func closeInfo() { info = nil }
-    func openAbout(_ artist: String) { about = artist }
+    func openAbout(_ artist: String) { about = .artist(artist) }
+    func openAbout(_ text: AboutText) { about = .text(text) }
     func closeAbout() { about = nil }
 
     /// ⌘I closes the sheet when it shows. Otherwise it opens for the selected song, the page's album, playlist or
@@ -839,19 +943,19 @@ enum PlayerView: String { case lyrics, artwork, queue }
     func dockPoints(windowWidth: CGFloat, sidebar: CGFloat?, tokens: CGFloat? = nil) -> CGFloat {
         let sidebarW = sidebar.map { $0 + T.windowInset } ?? 0
         let room = (windowWidth - sidebarW - T.windowInset - T.pageMinW) / T.scale
-        return T.px(min(tokens ?? dockTokenWidth, max(T.dockMinTokens, room)))
+        return T.px(min(tokens ?? dockTokenWidth, max(T.dockMinW, room)))
     }
 
     /// The sidebar's width in points, kept narrow enough that the page keeps `pageMinW` beside a dock at its
     /// narrowest when `docked`.
     func sidebarPoints(windowWidth: CGFloat, docked: Bool, tokens: CGFloat? = nil) -> CGFloat {
-        T.px(min(max(T.sidebarMinTokens, tokens ?? sidebarTokenWidth), sidebarRoomTokens(windowWidth: windowWidth, docked: docked)))
+        T.px(min(max(T.sidebarWMin, tokens ?? sidebarTokenWidth), sidebarRoomTokens(windowWidth: windowWidth, docked: docked)))
     }
 
     func sidebarRoomTokens(windowWidth: CGFloat, docked: Bool) -> CGFloat {
-        let dock = docked ? T.px(T.dockMinTokens) : 0
+        let dock = docked ? T.px(T.dockMinW) : 0
         let room = (windowWidth - dock - T.windowInset * 2 - T.pageMinW) / T.scale
-        return min(T.sidebarMaxTokens, max(T.sidebarMinTokens, room))
+        return min(T.sidebarWMax, max(T.sidebarWMin, room))
     }
 
     /// Opens Settings from the account menu, the app menu or ⌘,. The expanded player collapses first, since the page
@@ -862,7 +966,6 @@ enum PlayerView: String { case lyrics, artwork, queue }
         go(.settings)
     }
 
-    /// Opens Albums on a sort, such as Home's Recently Added opening it by date added.
     func openAlbums(_ scope: AlbumScope = .all, sort: AlbumSort) {
         albumsSortOnOpen = sort
         if case .albums(scope) = route { albumsSortOnOpen = nil }
@@ -877,21 +980,44 @@ enum PlayerView: String { case lyrics, artwork, queue }
 
     @ObservationIgnored private var albumsSortOnOpen: AlbumSort?
 
+    /// bumped each time Search is opened, so the field takes focus even when it's already showing.
+    private(set) var searchFocus = 0
+
+    /// sidebar pins by account, read from the device the first time each is asked for.
+    private var pinsByAccount: [String: SidebarPins] = [:]
+
+    var sidebarPins: SidebarPins { pinsByAccount[library.accountKey] ?? SidebarPins.load(account: library.accountKey) }
+
+    func setSidebarPinned(_ row: PlaylistRef, _ on: Bool) {
+        var pins = sidebarPins
+        pins.set(row, on: on)
+        pinsByAccount[library.accountKey] = pins
+        pins.save(account: library.accountKey)
+    }
+
+    /// "Pin to Sidebar" or "Unpin from Sidebar"; none for others' private playlists, which have no sidebar section.
+    func pinEntry(_ id: String) -> MenuEntry? {
+        guard let row = library.playlists.first(where: { $0.id == id }), row.section != .other else { return nil }
+        let on = sidebarPins.isPinned(row)
+        return MenuEntry(title: on ? L("Unpin from Sidebar") : L("Pin to Sidebar"), symbol: on ? "pin.slash" : "pin") { self.setSidebarPinned(row, !on) }
+    }
+
     func go(_ next: Route) {
         MiniPlayer.shared.close()
         drawerOpen = false
-        // A link in Get Info or an About sheet goes to its page and closes the sheet.
         info = nil
         about = nil
         selectedSong = nil
+        if case .browse = next { searchFocus += 1 }
         guard next != route else { return }
         backStack.append(route)
         forwardStack.removeAll()
         route = next
+        pageEntry = (pageEntry.count + 1, 1, Date())
         syncHistory()
     }
 
-    /// Changes the current page without a history step, for search typing.
+    /// without a history step, for search typing.
     func replace(_ next: Route) {
         guard next != route else { return }
         route = next
@@ -901,6 +1027,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
         guard let previous = backStack.popLast() else { return }
         forwardStack.append(route)
         route = previous
+        pageEntry = (pageEntry.count + 1, -1, Date())
         syncHistory()
     }
 
@@ -908,6 +1035,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
         guard let next = forwardStack.popLast() else { return }
         backStack.append(route)
         route = next
+        pageEntry = (pageEntry.count + 1, 1, Date())
         syncHistory()
     }
 
@@ -916,7 +1044,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
         canGoForward = !forwardStack.isEmpty
     }
 
-    /// Plays a whole list from the top, or from a random song when shuffling.
+    /// from the top, or from a random song when shuffling.
     func playAll(_ songs: [SongRow], shuffle: Bool = false) {
         guard !songs.isEmpty else { return }
         player.play(songs, at: shuffle ? Int.random(in: 0..<songs.count) : 0, shuffle: shuffle)
@@ -953,6 +1081,7 @@ enum PlayerView: String { case lyrics, artwork, queue }
         case .album(let id): library.album(id: id).map { PlaySource(name: $0.name, link: route) }
         case .playlist(let id): library.playlist(id: id).map { PlaySource(name: $0.name, link: route) }
         case .artist(let id): library.artist(id: id).map { PlaySource(name: $0.name, link: route) }
+        case .artistTop(let id): library.artist(id: id).map { PlaySource(name: L("{artist} Top Songs", ["artist": $0.name]), link: route) }
         case .mix(let id): library.mix(id: id).map { PlaySource(name: $0.title, link: route) }
         case .liked: PlaySource(name: L("Liked Songs"), link: .liked)
         case .songs(let genre): PlaySource(name: genre ?? L("Songs"), link: route)

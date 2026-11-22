@@ -97,13 +97,13 @@ final class ClickCatchingView: NSView {
     var onMenu: (NSEvent) -> NSMenu? = { _ in nil }
     var onReturn: () -> Void = {}
     var hold: RowHold?
-    /// Delete or Backspace, where the row can be removed.
     var onDelete: (() -> Void)?
     private var press: (event: NSEvent, deferred: Bool, timer: Timer)?
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) {
+        if TitlebarDoubleClick.handleInTopBar(event) || TitlebarDoubleClick.movesWindow(event) { return }
         window?.makeFirstResponder(self)
         let plain = event.modifierFlags.intersection([.command, .control, .shift, .option]).isEmpty
         guard let hold, plain, event.clickCount == 1 else { onClick(event); return }
@@ -146,7 +146,7 @@ final class ClickCatchingView: NSView {
     }
 }
 
-/// A row's state and click rules, shared by the mini lists and the queue.
+/// shared by the mini lists and the queue.
 struct SelectableRow<Lead: View, Text1: View, Trailing: View>: View {
     let index: Int
     let selection: RowSelection
@@ -162,6 +162,8 @@ struct SelectableRow<Lead: View, Text1: View, Trailing: View>: View {
     var trailPad: CGFloat = 0
     var hold: RowHold? = nil
     var onDelete: (() -> Void)? = nil
+    /// the song the row shows, so it lights when that song is queued or added to a playlist.
+    var flashID: String? = nil
     @ViewBuilder var lead: Lead
     @ViewBuilder var text: Text1
     @ViewBuilder var trailing: Trailing
@@ -207,12 +209,13 @@ struct SelectableRow<Lead: View, Text1: View, Trailing: View>: View {
         }
         .frame(height: height)
         .background(RoundedRectangle(cornerRadius: radius, style: .continuous).fill(selected ? selectedFill : hovering ? hoverFill : .clear))
+        .background { if let flashID { RowFlashFill(id: flashID, radius: radius) } }
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
     }
 }
 
-/// A row's download in flight: a progress ring, click to cancel.
+/// click to cancel.
 struct DownloadProgressButton: View {
     let fraction: Double
     let label: String
@@ -226,7 +229,7 @@ struct DownloadProgressButton: View {
                 Image(systemName: "xmark").font(.system(size: T.px(9), weight: .bold)).foregroundStyle(T.t2.color)
             }
             .frame(width: T.px(20), height: T.px(20))
-            .frame(height: T.iconH)
+            .frame(height: T.iconButtonH)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -279,7 +282,7 @@ struct SongColumnsView: View {
                     ForEach(row * columns..<(row + 1) * columns, id: \.self) { index in
                         if index < songs.count {
                             MiniSongRow(song: songs[index], index: index, shell: shell, showAlbum: showAlbum, selection: selection,
-                                        play: { playsAsRadio ? shell.playAsRadio(songs[$0]) : shell.play(songs, at: $0, from: source) },
+                                        play: { play($0) },
                                         menu: { menuEntries(at: $0) }, hold: hold(index))
                                 .frame(maxWidth: .infinity)
                         } else {
@@ -292,11 +295,13 @@ struct SongColumnsView: View {
         .padding(.horizontal, gutter)
     }
 
+    private func play(_ index: Int) { playsAsRadio ? shell.playAsRadio(songs[index]) : shell.play(songs, at: index, from: source) }
+
     private func menuEntries(at index: Int) -> [MenuEntry] {
         if selection.selected.count > 1, selection.selected.contains(index) {
             return SongMenu.several(selection.selected.sorted().map { songs[$0] }, shell: shell)
         }
-        return SongMenu.single(songs[index], shell: shell)
+        return SongMenu.single(songs[index], shell: shell, play: { play(index) })
     }
 
     /// A held row, or the selection it's in, lifts out as songs to drop on a playlist or the queue. These lists don't
@@ -325,7 +330,7 @@ private struct MiniSongRow: View {
     var body: some View {
         SelectableRow(index: index, selection: selection, height: T.miniRowH, radius: T.rMD, hoverFill: T.row.color,
                       selectedFill: shell.theme.rowSelected.color, leadWidth: T.thumb,
-                      onPlay: play, menu: menu, onReturn: { play(index) }, leadPad: T.px(5), trailPad: T.px(12), hold: hold) {
+                      onPlay: play, menu: menu, onReturn: { play(index) }, leadPad: T.px(5), trailPad: T.px(12), hold: hold, flashID: song.id) {
             ArtworkView(url: song.artworkURL, pixels: Int(T.thumb * 2))
                 .frame(width: T.thumb, height: T.thumb)
                 .clipShape(RoundedRectangle(cornerRadius: T.rSM, style: .continuous))
@@ -353,7 +358,6 @@ private struct MiniSongRow: View {
     }
 }
 
-/// Download, favorite and more, at the end of a song row.
 struct SongActions: View {
     let song: SongRow
     let shell: ShellModel
@@ -368,7 +372,7 @@ struct SongActions: View {
             } else {
                 IconButton(symbol: "arrow.down", label: L("Download"), width: T.actionW) { shell.library.setDownloaded(songs: [song], true) }
             }
-            IconButton(symbol: "heart", label: L("Favorite"), active: song.isFavorite, width: T.actionW) { shell.library.toggleFavorite(song: song) }
+            IconButton(symbol: "heart", label: L("Favorite"), active: song.isFavorite, width: T.actionW, pop: true) { shell.library.toggleFavorite(song: song) }
             MenuIconButton(symbol: "ellipsis", label: L("More"), width: T.actionW) { SongMenu.single(song, shell: shell) }
         }
         .padding(.trailing, T.px(12))

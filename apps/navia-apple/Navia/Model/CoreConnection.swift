@@ -5,7 +5,6 @@ import NaviaCoreFFI
 /// environment or a developer's `server.env` takes priority.
 enum LoginOrigin: Sendable { case environment, keychain }
 
-/// The server and account this app uses.
 struct CoreLogin: Sendable {
     let url: String
     let user: String
@@ -23,7 +22,6 @@ struct CoreLogin: Sendable {
 
     var isDeveloperOverride: Bool { origin == .environment }
 
-    /// The host part, for Settings.
     var host: String { parseServerAddress(raw: url)?.host ?? url.components(separatedBy: "://").last?.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? url }
 
     /// The login saved by the sign-in screen. Under `NAVIA_DEV=1` the `NAVIDROME_*` environment, then `server.env`,
@@ -43,7 +41,7 @@ struct CoreLogin: Sendable {
         return CoreLogin(url: stored.url, user: stored.user, password: stored.password, origin: .keychain)
     }
 
-    /// The login in `server.env`, if it has all three values. Nothing here prints or logs them.
+    /// nothing here prints or logs the login.
     private static func readFile() -> LoginKeychain.Stored? {
         guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return nil }
         var values: [String: String] = [:]
@@ -59,7 +57,7 @@ struct CoreLogin: Sendable {
     }
 }
 
-/// The saved login, one `NaviaKeychain` secret. Nothing here prints or logs its contents.
+/// one `NaviaKeychain` secret; nothing here prints or logs its contents.
 nonisolated enum LoginKeychain {
     struct Stored: Codable, Sendable { let url, user, password: String }
 
@@ -71,7 +69,7 @@ nonisolated enum LoginKeychain {
         NaviaKeychain.read(account, legacy: legacy).flatMap { try? JSONDecoder().decode(Stored.self, from: $0) }
     }
 
-    /// Replaces any saved login. Returns false if the Keychain refused.
+    /// false if the Keychain refused.
     @discardableResult static func save(_ login: Stored) -> Bool {
         guard let data = try? JSONEncoder().encode(login) else { return false }
         return NaviaKeychain.write(account, data)
@@ -110,7 +108,7 @@ enum AccountPrefs {
         let defaults = UserDefaults.standard
         guard !defaults.bool(forKey: "accountStateMigrated"), !CoreMode.isTestRun else { return }
         defaults.set(true, forKey: "accountStateMigrated")
-        defaults.removeObject(forKey: "albumPins") // Left by older builds and never read.
+        defaults.removeObject(forKey: "albumPins") // A stale key nothing reads.
         for name in ["localStars", "privateMode"] {
             if let value = defaults.object(forKey: name) {
                 defaults.set(value, forKey: key(name))

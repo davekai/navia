@@ -74,7 +74,7 @@ import Observation
         refresh()
     }
 
-    /// Cached songs, artwork and lyrics. Downloads and the library stay.
+    /// Downloads and the library stay.
     func clear() {
         let core = core
         Task {

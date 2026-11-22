@@ -20,6 +20,8 @@ import NaviaCoreFFI
         self.core = core
         paths.removeAll()
         tints.removeAll()
+        loggedFailures.removeAll()
+        placeholderUntil.removeAll()
         PlaylistTints.shared.reset()
         pending.removeAll()
         waiting.values.joined().forEach { $0.resume(returning: nil) }
@@ -30,6 +32,7 @@ import NaviaCoreFFI
     /// The core's artwork files were deleted, so paths are asked for again. Tints and decoded images stay.
     func forgetFiles() {
         paths.removeAll()
+        placeholderUntil.removeAll()
     }
 
     /// Dominant color per key, once the core has seen the image.
@@ -38,13 +41,28 @@ import NaviaCoreFFI
 
     func tint(for url: URL) -> String? { tints[Self.key(of: url)] }
 
-    private nonisolated static func key(of url: URL) -> String { url.path.removingPercentEncoding.map { String($0.dropFirst()) } ?? "" }
+    private nonisolated static func key(of url: URL) -> String {
+        let key = url.path.removingPercentEncoding.map { String($0.dropFirst()) } ?? ""
+        #if DEBUG
+        return alias[key] ?? key
+        #else
+        return key
+        #endif
+    }
+
+    #if DEBUG
+    /// check runs (`artAlias`).
+    nonisolated(unsafe) static var alias: [String: String] = [:]
+    #endif
 
     private var paths: [String: URL] = [:]
     private var waiting: [String: [CheckedContinuation<URL?, Never>]] = [:]
     /// Newest last, so on a fast scroll the rows the user stopped on load first.
     private var pending: [String] = []
     private var running = 0
+    private var loggedFailures: Set<String> = []
+    /// jobs whose file is the server's no-cover placeholder, and when to ask for them again.
+    private var placeholderUntil: [String: Date] = [:]
 
     /// Parallel requests to the core. The core's own limit is gentler still on the server.
     private let concurrency = 8
@@ -56,11 +74,23 @@ import NaviaCoreFFI
     /// The core keeps a few fixed sizes so Navidrome caches each one once.
     private static func size(for pixels: Int) -> UInt32? { [128, 256, 512].first { $0 >= pixels }.map(UInt32.init) }
 
+    private static func job(for url: URL, pixels: Int) -> String { "\(size(for: pixels).map(String.init) ?? "orig")@\(key(of: url))" }
+
+    /// the file last given for this art is the server's no-cover placeholder, so it isn't kept decoded.
+    func isPlaceholder(_ url: URL, pixels: Int) -> Bool { placeholderUntil[Self.job(for: url, pixels: pixels)] != nil }
+
     func file(for url: URL, pixels: Int) async -> URL? {
-        let key = Self.key(of: url)
-        let size = Self.size(for: pixels)
-        let job = "\(size.map(String.init) ?? "orig")@\(key)"
-        if let hit = paths[job] { return hit }
+        let job = Self.job(for: url, pixels: pixels)
+        // asked for again once it expires, in case a cover was added since.
+        if let until = placeholderUntil[job], until <= Date() {
+            paths[job] = nil
+            placeholderUntil[job] = nil
+        }
+        // the core may have trimmed or lost the file since; then it fetches again.
+        if let hit = paths[job] {
+            if FileManager.default.fileExists(atPath: hit.path) { return hit }
+            paths[job] = nil
+        }
         return await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
             if waiting[job] != nil {
                 waiting[job]?.append(cont)
@@ -91,16 +121,46 @@ import NaviaCoreFFI
             let key = parts.count > 1 ? String(parts[1]) : ""
             Task.detached(priority: .utility) {
                 var cover: CoverArtRow?
+                var failure: String?
                 do {
                     cover = try await core.cover(key: key, size: size)
                 } catch {
-                    #if DEBUG
-                    NSLog("navia: art failed for \(key): \(error)")
-                    #endif
+                    failure = String(describing: error)
                 }
-                await MainActor.run { [cover] in self.finished(job, key: key, cover: cover) }
+                await MainActor.run { [cover, failure] in
+                    if let failure { self.logFailure(key: key, failure) }
+                    self.finished(job, key: key, cover: cover)
+                }
             }
         }
+    }
+
+    /// once per key and run, so a cover that keeps failing doesn't flood the log while rows scroll.
+    private func logFailure(key: String, _ failure: String) {
+        guard loggedFailures.insert(key).inserted else { return }
+        Log.library.error("art failed for \(key, privacy: .public): \(failure, privacy: .public)")
+    }
+
+    /// animated covers are asked for at these sizes only, so each cover keeps a few cached files.
+    private static func animatedSize(for pixels: Int) -> UInt32 { UInt32([256, 512, 1024].first { $0 >= pixels } ?? 1024) }
+
+    /// frames shared by every view showing the same cover at the same size, dropped once none shows it.
+    private let animated = NSMapTable<NSString, AnimatedFrames>.strongToWeakObjects()
+
+    /// ask only where art is large.
+    func animatedFrames(for url: URL, pixels: Int) async -> AnimatedFrames? {
+        guard let core, url.scheme == Self.scheme else { return nil }
+        let key = Self.key(of: url)
+        let size = Self.animatedSize(for: pixels)
+        let job = "\(size)@\(key)" as NSString
+        if let hit = animated.object(forKey: job) { return hit }
+        if core.coverIsAnimated(key: key) == false { return nil }
+        let frames: AnimatedFrames? = await Task.detached(priority: .utility) {
+            guard let art = try? await core.animatedArtwork(key: key, size: size) else { return nil }
+            return AnimatedFrames(art)
+        }.value
+        if let frames { animated.setObject(frames, forKey: job) }
+        return frames
     }
 
     private func finished(_ job: String, key: String, cover: CoverArtRow?) {
@@ -109,6 +169,7 @@ import NaviaCoreFFI
         if let cover {
             url = URL(fileURLWithPath: cover.path)
             paths[job] = url
+            placeholderUntil[job] = cover.placeholder ? Date().addingTimeInterval(TimeInterval(placeholderTtlSeconds())) : nil
             let bytes = cover.tintRgb.prefix(3).map { String(format: "%02x", $0) }.joined()
             if tints[key] != bytes {
                 tints[key] = bytes
@@ -141,7 +202,25 @@ nonisolated extension AlbumRow {
                   artworkURL: CoreArt.url(for: a.id), tintHex: nil, blurb: "", isFavorite: a.starred,
                   isExplicit: a.explicit, discTitles: Dictionary(a.discTitles.map { (Int($0.disc), $0.title) }, uniquingKeysWith: { a, _ in a }),
                   credits: a.artists.map { FeaturedArtist(name: $0.name, photoURL: CoreArt.url(for: "ar-\($0.id)"), artistID: $0.id) },
-                  edition: a.edition)
+                  edition: a.edition, isNewRelease: a.newRelease)
+    }
+}
+
+nonisolated extension UpcomingAlbum {
+    init(core a: UpcomingAlbumRow) {
+        var unavailable: Set<String> = []
+        let tracks = a.tracks.enumerated().map { place, t in
+            var song = t.song.map { SongRow(core: $0) } ?? {
+                let id = "dz-\(t.id)"
+                unavailable.insert(id)
+                return SongRow(id: id, title: t.title, artist: t.artist, album: a.title, albumID: "", duration: Int(t.durationSeconds), genre: "", year: nil,
+                               plays: 0, isFavorite: false, isDownloaded: false, artworkURL: nil, tintHex: nil, isExplicit: t.explicit)
+            }()
+            song.trackNumber = place + 1
+            return song
+        }
+        self.init(id: a.id, title: a.title, artist: a.artist, artistID: a.artistId, coverURL: a.coverUrl.flatMap(URL.init(string:)), releaseDate: a.releaseDate,
+                  releaseMoment: Date(timeIntervalSince1970: TimeInterval(a.releaseMoment)), total: Int(a.total), isExplicit: a.explicit, tracks: tracks, unavailable: unavailable)
     }
 }
 

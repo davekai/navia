@@ -15,146 +15,178 @@ struct RootView: View {
             let mode: PlayerMode = shell.playerMode == .dock && !canDock ? .bar : shell.playerMode
             let hasPlayer = shell.player.current != nil
             let docked = hasPlayer && mode == .dock
-            let sidebarWidth = shell.sidebarPoints(windowWidth: width, docked: docked)
-            let settledSidebarWidth = shell.sidebarPoints(windowWidth: width, docked: docked, tokens: shell.sidebarWidthSaved)
-            let dockWidth = shell.dockPoints(windowWidth: width, sidebar: inlineSidebar ? sidebarWidth : nil)
-            let settledDockWidth = shell.dockPoints(windowWidth: width, sidebar: inlineSidebar ? settledSidebarWidth : nil, tokens: shell.dockWidthSaved)
-            let sidebarUnder = inlineSidebar ? sidebarWidth + T.windowInset : 0
-            let dockUnder = docked ? dockWidth + T.windowInset : 0
-            let settledUnder = docked ? settledDockWidth + T.windowInset : 0
-            let settledSidebarUnder = inlineSidebar ? settledSidebarWidth + T.windowInset : 0
-            let context = PageContext(sidebarUnder: sidebarUnder, shelfUnder: inlineSidebar ? sidebarWidth : 0, dockUnder: dockUnder,
-                                      hasBar: hasPlayer && mode == .bar, sidebarOpen: sidebarOpen,
-                                      pageWidth: width - sidebarUnder - dockUnder,
-                                      layoutWidth: width - settledSidebarUnder - settledUnder,
-                                      windowHeight: geo.size.height,
-                                      toggleSidebar: { toggleSidebar(fits: sidebarFits) })
+            // by mode alone, so a player appearing (a session restored at launch) is just there.
+            let target = PanelShown(sidebar: inlineSidebar ? 1 : 0, dock: mode == .dock ? 1 : 0, bar: mode == .bar ? 1 : 0)
+            PanelStage(target: target, live: shell.windowShown) { shown, staged, warming in
+                let sidebarIn = sidebarFits && (shown.sidebar > 0 || staged.sidebar > 0)
+                let dockIn = hasPlayer && (shown.dock > 0 || staged.dock > 0)
+                let barIn = hasPlayer && (shown.bar > 0 || staged.bar > 0)
+                let sidebarWidth = shell.sidebarPoints(windowWidth: width, docked: docked)
+                let settledSidebarWidth = shell.sidebarPoints(windowWidth: width, docked: docked, tokens: shell.sidebarWidthSaved)
+                let dockWidth = shell.dockPoints(windowWidth: width, sidebar: inlineSidebar ? sidebarWidth : nil)
+                let settledDockWidth = shell.dockPoints(windowWidth: width, sidebar: inlineSidebar ? settledSidebarWidth : nil, tokens: shell.dockWidthSaved)
+                let sidebarUnder = sidebarIn ? (sidebarWidth + T.windowInset) * shown.sidebar : 0
+                let dockUnder = dockIn ? (dockWidth + T.windowInset) * shown.dock : 0
+                let settledUnder = docked ? settledDockWidth + T.windowInset : 0
+                let settledSidebarUnder = inlineSidebar ? settledSidebarWidth + T.windowInset : 0
+                let context = PageContext(sidebarUnder: sidebarUnder, shelfUnder: sidebarIn ? sidebarWidth * shown.sidebar : 0, dockUnder: dockUnder,
+                                          dockShown: dockIn ? shown.dock : 0,
+                                          hasBar: hasPlayer && mode == .bar, sidebarOpen: sidebarOpen,
+                                          pageWidth: width - sidebarUnder - dockUnder,
+                                          layoutWidth: width - settledSidebarUnder - settledUnder,
+                                          windowHeight: geo.size.height,
+                                          pageSince: shell.pageEntry.since,
+                                          toggleSidebar: { shell.toggleSidebar() })
 
-            ZStack(alignment: .leading) {
-                backdrop
-                if let connect = shell.connect {
-                    ConnectScreen(shell: shell, model: connect, windowHeight: geo.size.height)
-                } else {
-                PageHost(shell: shell).environment(\.pageContext, context).environment(\.theme, shell.theme)
+                ZStack(alignment: .leading) {
+                    backdrop
+                    if let connect = shell.connect {
+                        ConnectScreen(shell: shell, model: connect, windowHeight: geo.size.height)
+                    } else {
+                    PageHost(shell: shell).environment(\.pageContext, context)
 
-                if hasPlayer && mode == .bar {
-                    PlayerBar(shell: shell, canDock: canDock)
-                        .padding(.leading, sidebarUnder)
-                        .frame(maxHeight: .infinity, alignment: .bottom)
-                }
-
-                if inlineSidebar {
-                    SidebarView(shell: shell, width: sidebarWidth, toggle: { toggleSidebar(fits: sidebarFits) })
-                        .padding([.leading, .vertical], T.windowInset)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .overlay(alignment: .leading) {
-                            if !isSnapshot {
-                                SidebarResizeHandle(shell: shell, windowWidth: width, docked: docked)
-                                    .frame(width: T.edgeGrabW)
-                                    .padding(.leading, T.windowInset + sidebarWidth - T.edgeGrabW / 2)
-                            }
-                        }
-                }
-
-                if docked {
-                    PlayerDock(shell: shell, width: dockWidth, settledWidth: settledDockWidth, windowHeight: geo.size.height)
-                        .padding([.trailing, .vertical], T.windowInset)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                        .overlay(alignment: .trailing) {
-                            if !isSnapshot {
-                                DockResizeHandle(shell: shell, windowWidth: width, sidebar: inlineSidebar ? sidebarWidth : nil)
-                                    .frame(width: T.edgeGrabW)
-                                    .padding(.trailing, T.windowInset + dockWidth - T.edgeGrabW / 2)
-                            }
-                        }
-                }
-
-                if sidebarOpen && !sidebarFits {
-                    T.scrim.color
-                        .contentShape(Rectangle())
-                        .onTapGesture { shell.drawerOpen = false }
-                    SidebarView(shell: shell, width: sidebarWidth, toggle: { toggleSidebar(fits: sidebarFits) })
-                        .shadow(T.shadowFloat)
-                }
-
-                if shell.expanded {
-                    PlayerExpanded(shell: shell, windowSize: geo.size).transition(ExpandClip.transition)
-                }
-
-                if let toast = shell.toast {
-                    HStack(spacing: T.toastPad) {
-                        Text(toast).lineLimit(1).truncationMode(.tail)
-                        if let action = shell.toastAction {
-                            ActionButton(title: action.label, small: true) { shell.runToastAction() }
-                        }
+                    if barIn {
+                        // keeps the centre it has without the dock's room, so it only moves down.
+                        PlayerBar(shell: shell, canDock: canDock, shown: max(shown.bar, warming.bar))
+                            .padding(.leading, sidebarUnder)
+                            .frame(maxHeight: .infinity, alignment: .bottom)
+                            .allowsHitTesting(shown.bar >= 1)
+                            .panelWarming(warming.bar)
+                            .transition(.identity)
                     }
-                    .font(.navia(T.textMD, .medium))
-                    // With an action, the button's inset from the end matches the top and bottom.
-                    .padding(.leading, T.toastPad)
-                    .padding(.trailing, shell.toastAction == nil ? T.toastPad : (T.toastH - T.buttonSmallH) / 2)
-                    .frame(height: T.toastH)
-                    // A glass toast, centered between the sidebar and the dock, `toastGap` above the bar.
-                    .glassPill(tint: T.dialogGlass)
-                    .shadow(T.shadowFloat)
-                    .onHover { shell.holdToast(hovered: $0) }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                    .padding(.leading, (inlineSidebar ? sidebarWidth + T.windowInset : T.windowInset) + T.windowInset)
-                    .padding(.trailing, (docked ? dockWidth + T.windowInset : T.windowInset) + T.windowInset)
-                    .padding(.bottom, (hasPlayer && mode == .bar ? T.barH + T.windowInset * 2 : T.windowInset) + T.toastGap)
-                }
 
-                }
+                    if sidebarIn {
+                        SidebarView(shell: shell, width: sidebarWidth, toggle: { shell.toggleSidebar() })
+                            .padding([.leading, .vertical], T.windowInset)
+                            .offset(x: -(sidebarWidth + T.windowInset) * (1 - max(shown.sidebar, warming.sidebar)))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .allowsHitTesting(inlineSidebar)
+                            .panelWarming(warming.sidebar)
+                            .transition(.identity)
+                            .overlay(alignment: .leading) {
+                                if !isSnapshot && shown.sidebar >= 1 {
+                                    SidebarResizeHandle(shell: shell, windowWidth: width, docked: docked)
+                                        .frame(width: T.sidebarGrabW)
+                                        .padding(.leading, T.windowInset + sidebarWidth - T.sidebarGrabW / 2)
+                                }
+                            }
+                    }
 
-                if let request = shell.popups.request {
-                    SelectPopupLayer(request: request, center: shell.popups, accent: shell.theme.accent, windowSize: geo.size)
+                    if dockIn {
+                        PlayerDock(shell: shell, width: dockWidth, settledWidth: settledDockWidth, windowHeight: geo.size.height)
+                            .padding([.trailing, .vertical], T.windowInset)
+                            .offset(x: (dockWidth + T.windowInset) * (1 - max(shown.dock, warming.dock)))
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                            .allowsHitTesting(docked)
+                            .panelWarming(warming.dock)
+                            .transition(.identity)
+                            .overlay(alignment: .trailing) {
+                                if !isSnapshot && shown.dock >= 1 {
+                                    DockResizeHandle(shell: shell, windowWidth: width, sidebar: inlineSidebar ? sidebarWidth : nil)
+                                        .frame(width: T.dockGrabW)
+                                        .padding(.trailing, T.windowInset + dockWidth - T.dockGrabW / 2)
+                                }
+                            }
+                    }
+
+                    if sidebarOpen && !sidebarFits {
+                        T.scrim.color
+                            .contentShape(Rectangle())
+                            .onTapGesture { shell.drawerOpen = false }
+                        SidebarView(shell: shell, width: sidebarWidth, toggle: { shell.toggleSidebar() })
+                            .shadow(T.shadowFloat)
+                    }
+
+                    if shell.expanded {
+                        PlayerExpanded(shell: shell, windowSize: geo.size).transition(ExpandClip.transition(fromDock: docked))
+                    }
+
+                    if let toast = shell.toast {
+                        HStack(spacing: T.toastPad) {
+                            Text(toast).lineLimit(1).truncationMode(.tail)
+                            if let action = shell.toastAction {
+                                ActionButton(title: action.label, small: true) { shell.runToastAction() }
+                            }
+                        }
+                        .font(.navia(T.textMD, .medium))
+                        // with an action, the button sits as far from the right edge as from the top and bottom.
+                        .padding(.leading, T.toastPad)
+                        .padding(.trailing, shell.toastAction == nil ? T.toastPad : (T.toastH - T.buttonSmallH) / 2)
+                        .frame(height: T.toastH)
+                        // centered in the visible content column (`.toastLane`), from the sidebar's right edge to the dock's left edge.
+                        .glassPill()
+                        .shadow(T.shadowFloat)
+                        .onHover { shell.holdToast(hovered: $0) }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                        .padding(.leading, sidebarUnder + T.windowInset * 2)
+                        .padding(.trailing, dockUnder + T.windowInset * 2)
+                        .padding(.bottom, (hasPlayer && mode == .bar ? T.barH + T.windowInset * 2 : T.windowInset) + T.toastGap)
+                    }
+
+                    }
+
+                    if let request = shell.popups.request {
+                        SelectPopupLayer(request: request, center: shell.popups, accent: shell.theme.accent, windowSize: geo.size)
+                    }
+                    if let rules = shell.popups.rules {
+                        SmartRulesLayer(request: rules, center: shell.popups, windowSize: geo.size)
+                    }
+                    if let filter = shell.popups.filter {
+                        FilterPopoverLayer(request: filter, center: shell.popups, accent: shell.theme.accent, windowSize: geo.size)
+                    }
+                    if let quality = shell.popups.quality {
+                        QualityPopoverLayer(shell: shell, request: quality, windowSize: geo.size)
+                    }
+                    if shell.newPlaylistOpen {
+                        NewPlaylistLayer(shell: shell)
+                    }
+                    if let request = shell.airplay.pin {
+                        AirPlayPinLayer(shell: shell, request: request).id(request.id)
+                    }
+                    if let playlist = shell.editingPlaylist {
+                        EditPlaylistLayer(playlist: playlist, shell: shell).id(playlist.id)
+                    }
+                    if let request = shell.shareRequest {
+                        ShareDialogLayer(request: request, shell: shell).id(request.id)
+                    }
+                    if let info = shell.info {
+                        GetInfoLayer(target: info, shell: shell)
+                    }
+                    switch shell.about {
+                    case let .artist(id): ArtistAboutLayer(id: id, shell: shell)
+                    case let .text(about): AboutTextLayer(about: about, shell: shell)
+                    case nil: EmptyView()
+                    }
+                    if let request = shell.stopDownload {
+                        StopDownloadLayer(request: request, shell: shell)
+                    }
+                    if let request = shell.duplicates {
+                        DuplicatesLayer(request: request, shell: shell)
+                    }
+                    if let user = shell.listenAlongAsk {
+                        ListenAlongLayer(user: user, shell: shell)
+                    }
+                    if let id = shell.listenAlongFriendAsk {
+                        ListenAlongFriendLayer(id: id, shell: shell)
+                    }
+                    if let request = shell.confirmation {
+                        ConfirmLayer(request: request) { shell.dismissConfirmation() }
+                    }
                 }
-                if let rules = shell.popups.rules {
-                    SmartRulesLayer(request: rules, center: shell.popups, windowSize: geo.size)
-                }
-                if let filter = shell.popups.filter {
-                    FilterPopoverLayer(request: filter, center: shell.popups, accent: shell.theme.accent, windowSize: geo.size)
-                }
-                if let quality = shell.popups.quality {
-                    QualityPopoverLayer(shell: shell, request: quality, windowSize: geo.size)
-                }
-                if shell.newPlaylistOpen {
-                    NewPlaylistLayer(shell: shell)
-                }
-                if let request = shell.airplay.pin {
-                    AirPlayPinLayer(shell: shell, request: request).id(request.id)
-                }
-                if let playlist = shell.editingPlaylist {
-                    EditPlaylistLayer(playlist: playlist, shell: shell).id(playlist.id)
-                }
-                if let request = shell.shareRequest {
-                    ShareDialogLayer(request: request, shell: shell).id(request.id)
-                }
-                if let info = shell.info {
-                    GetInfoLayer(target: info, shell: shell)
-                }
-                if let about = shell.about {
-                    ArtistAboutLayer(id: about, shell: shell)
-                }
-                if let request = shell.stopDownload {
-                    StopDownloadLayer(request: request, shell: shell)
-                }
-                if let request = shell.duplicates {
-                    DuplicatesLayer(request: request, shell: shell)
-                }
-                if let user = shell.listenAlongAsk {
-                    ListenAlongLayer(user: user, shell: shell)
-                }
-                if let id = shell.listenAlongFriendAsk {
-                    ListenAlongFriendLayer(id: id, shell: shell)
-                }
-                if let request = shell.confirmation {
-                    ConfirmLayer(request: request) { shell.dismissConfirmation() }
-                }
+                .environment(\.theme, shell.theme)
+                .id("\(shell.interfaceSize)-\(shell.sessionEpoch)-\(shell.language)")
             }
-            .id("\(shell.interfaceSize)-\(shell.sessionEpoch)-\(shell.language)")
+            .animation(shell.windowShown ? T.ease(T.panelSlide) : nil, value: target)
             .onChange(of: geo.size) { _, _ in shell.popups.close() }
+            .onChange(of: sidebarFits, initial: true) { _, fits in shell.sidebarFits = fits }
+            .onChange(of: canDock, initial: true) { _, fits in shell.dockFits = fits }
         }
         .ignoresSafeArea()
+        .environment(\.marqueeMoves, shell.windowShown && !shell.liveResizing)
+        .environment(\.motionLive, shell.windowShown)
+        .transaction { [resizing = shell.liveResizing] t in
+            if resizing { t.animation = nil; t.disablesAnimations = true }
+        }
         .environment(\.colorScheme, .dark)
         .foregroundStyle(T.t1.color)
         .background { if !isSnapshot { WindowConfigurator(translucent: shell.translucencyActive, shell: shell) } }
@@ -171,9 +203,6 @@ struct RootView: View {
         }
     }
 
-    private func toggleSidebar(fits: Bool) {
-        if fits { shell.sidebarPreferred.toggle() } else { shell.drawerOpen.toggle() }
-    }
 }
 
 /// The system's blur of what's behind the window. `.active` keeps it when the window isn't key, since a player
@@ -265,7 +294,6 @@ enum WindowServerBlur {
     }
 }
 
-/// Moves backdrop layers from the window server to the app (see `WindowBlurView`).
 enum InAppBackdrops {
     private static let key = "windowServerAware"
     private static let backdropClass: AnyClass? = NSClassFromString("CABackdropLayer")
@@ -278,7 +306,7 @@ enum InAppBackdrops {
 
     static func isBackdrop(_ layer: CALayer) -> Bool { backdropClass.map { layer.isKind(of: $0) } ?? false }
 
-    /// Turns one backdrop to the app's rendering. True if the window server had it.
+    /// true if the window server had it.
     @discardableResult @MainActor static func keepInApp(_ layer: CALayer) -> Bool {
         guard available, (layer.value(forKey: key) as? Bool) != false else { return false }
         layer.setValue(false, forKey: key)
@@ -336,12 +364,12 @@ struct PageGlow: View {
     }
 }
 
-/// The page for the current route. Pages take their width from the environment.
+/// pages take their width from the environment.
 struct PageHost: View {
     let shell: ShellModel
 
     var body: some View {
-        page.id(shell.route.pageKey)
+        page.modifier(PageEntrance(entry: shell.pageEntry.count > 0 ? shell.pageEntry.direction : nil)).id(shell.route.pageKey)
     }
 
     @ViewBuilder private var page: some View {
@@ -359,9 +387,11 @@ struct PageHost: View {
         case .album(let id): AlbumPage(shell: shell, id: id)
         case .artists: ArtistsPage(shell: shell)
         case .artist(let id): ArtistPage(shell: shell, id: id)
+        case .artistTop(let id): TopSongsPage(shell: shell, id: id)
         case .playlists: PlaylistsPage(shell: shell)
         case .playlist(let id): PlaylistPage(shell: shell, id: id)
         case .mix(let id): MixPage(shell: shell, id: id)
+        case .upcoming(let id): UpcomingPage(shell: shell, id: id)
         case .browse(genres: true): GenresPage(shell: shell)
         case .browse, .search: SearchPage(shell: shell)
         case .discover(let tab): DiscoverPage(shell: shell, tab: tab)

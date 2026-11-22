@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import NaviaCoreFFI
 import Observation
 
@@ -31,7 +31,7 @@ import Observation
     /// Discovery is running, for the first seconds after the menu opens or the service starts.
     private(set) var searching = false
     private(set) var pin: PinRequest?
-    /// The receiver playing or being reached, from the shell's output choice.
+    /// from the shell's output choice.
     private(set) var activeID: String?
     /// The active receiver went away after playing. The player paused, and the chip explains.
     private(set) var lost = false
@@ -39,6 +39,7 @@ import Observation
     @ObservationIgnored private(set) var service: NaviaAirPlay?
     @ObservationIgnored private var sampleState: String?
     @ObservationIgnored private var searchTask: Task<Void, Never>?
+    @ObservationIgnored private var wakeObserver: NSObjectProtocol?
     @ObservationIgnored private var lastActiveState: Receiver.State?
     @ObservationIgnored private var hasPlayed = false
     @ObservationIgnored var onLost: (() -> Void)?
@@ -71,6 +72,10 @@ import Observation
         self.service = service
         beginSearch()
         reload()
+        // receivers that went quiet while the Mac slept are only found again by asking.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+            service.rescan()
+        }
     }
 
     func reload() {
@@ -86,6 +91,7 @@ import Observation
     /// Shows the discovery spinner briefly when the menu opens, since it may still be finding receivers.
     func menuOpened() {
         guard sampleState == nil else { return }
+        service?.rescan()
         beginSearch()
     }
 

@@ -67,7 +67,7 @@ struct GetInfoLayer: View {
             art.frame(width: T.infoArt, height: T.infoArt)
             VStack(alignment: .leading, spacing: T.px(2)) {
                 Text(kind).font(.navia(T.textXS, .semibold)).foregroundStyle(T.tSection.color)
-                Text(title).font(.navia(T.textFeature, .bold)).foregroundStyle(T.tEm.color).lineLimit(3)
+                Text(title).font(.navia(T.textFeature, .bold)).foregroundStyle(T.tEm.color).lineLimit(3).fullTextHelp(title)
                 sub().font(.navia(T.textMD)).foregroundStyle(T.t2.color)
             }
         }
@@ -134,7 +134,9 @@ struct GetInfoLayer: View {
         // Playing Now shows only for the song playing, from the quality badge's data.
         var now: [InfoField] = []
         if shell.player.station == nil, shell.player.current?.id == s.id, let q = shell.player.quality {
-            now.append(q.transcodeFormat.map { InfoField.noted(L("Plays As"), "\($0) · \(L("{n} kbps", ["n": fmtInt(q.transcodeKbps ?? 0)]))", L("Transcoded by the server")) }
+            now.append(q.transcodeFormat.map { format in
+                InfoField.noted(L("Plays As"), q.transcodeKbps.map { "\(format) · \(L("{n} kbps", ["n": fmtInt($0)]))" } ?? format, L("Transcoded by the server"))
+            }
                 ?? .text(L("Plays As"), L("The original file")))
             if let source = q.source { now.append(.text(L("From||where a song plays from"), AudioQuality.sourceLabel(source))) }
         }

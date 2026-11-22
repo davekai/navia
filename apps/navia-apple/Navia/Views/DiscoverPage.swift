@@ -6,7 +6,7 @@ struct DiscoverPage: View {
     @Environment(\.pageContext) private var ctx
 
     var body: some View {
-        PageFrame(shell: shell, nav: .tabs(tab)) {
+        PageFrame(shell: shell, nav: .tabs(tab), refresh: tab == .forYou ? nil : .rows) {
             PageScroll { content }
         }
     }
@@ -72,8 +72,8 @@ struct DiscoverPage: View {
         Button { shell.go(.album(album.id)) } label: {
             VStack(alignment: .leading, spacing: 0) {
                 Text(L("NEW ALBUM")).font(.navia(T.textSM, .semibold)).tracking(0.03 * T.textSM).foregroundStyle(T.t2.color)
-                Text(album.name).font(.navia(T.textFeature, .medium)).lineLimit(1).padding(.top, T.px(4))
-                Text(album.artist).font(.navia(T.textFeature, .semibold)).foregroundStyle(T.t2.color).lineLimit(1).padding(.bottom, T.px(14))
+                Text(album.name).font(.navia(T.textFeature, .medium)).lineLimit(1).fullTextHelp(album.name).padding(.top, T.px(4))
+                Text(album.artist).font(.navia(T.textFeature, .semibold)).foregroundStyle(T.t2.color).lineLimit(1).fullTextHelp(album.artist).padding(.bottom, T.px(14))
                 ZStack {
                     (album.tintHex.flatMap(RGBA.init(hex:)) ?? T.tintFallback).color
                     ArtworkView(url: album.artworkURL, pixels: 200)
@@ -148,13 +148,14 @@ private struct StationCard: View {
             ZStack(alignment: .bottomLeading) {
                 LinearGradient(colors: [shell.theme.accent.color, shell.theme.accent.mixed(with: RGBA(0, 0, 0), amount: 0.4).color], startPoint: .topLeading, endPoint: .bottomTrailing)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(station.name).font(.navia(T.textFeature, .semibold)).lineLimit(1)
+                    Text(station.name).font(.navia(T.textFeature, .semibold)).lineLimit(1).fullTextHelp(station.name)
                     Text(on ? (playing ? L("Playing now") : L("Paused")) : L("Internet radio")).font(.navia(T.textMD)).foregroundStyle(T.t2.color)
                 }
                 .padding(T.px(16))
                 if hovering || on {
                     Image(systemName: playing ? "pause.fill" : "play.fill")
                         .font(.system(size: T.px(15)))
+                        .contentTransition(Motion.isReduced ? .identity : .symbolEffect(.replace))
                         .frame(width: T.px(34), height: T.px(34))
                         .background(Circle().fill(T.hover.color))
                         .padding(T.px(14))

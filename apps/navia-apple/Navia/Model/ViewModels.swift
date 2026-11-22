@@ -63,6 +63,38 @@ nonisolated struct AlbumRow: Identifiable, Equatable, Sendable {
     var credits: [FeaturedArtist] = []
     /// The album's version as a label, such as "Deluxe Edition". Nil for none, and for explicit or clean.
     var edition: String? = nil
+    /// by the first-release date, so a reissue isn't new.
+    var isNewRelease = false
+}
+
+/// the core's `UpcomingAlbumRow`.
+nonisolated struct UpcomingAlbum: Identifiable, Equatable, Sendable {
+    /// Deezer's album id.
+    let id: UInt64
+    let title: String
+    let artist: String
+    /// the library artist it was found for.
+    let artistID: String
+    /// never stored (Deezer's terms).
+    let coverURL: URL?
+    /// `YYYY-MM-DD`.
+    let releaseDate: String
+    /// local midnight of the release day.
+    let releaseMoment: Date
+    /// songs announced in all; `tracks` are those named so far, filled only on the page.
+    let total: Int
+    let isExplicit: Bool
+    /// Deezer's listing where the library has no copy; its id is in `unavailable`.
+    var tracks: [SongRow] = []
+    var unavailable: Set<String> = []
+}
+
+nonisolated enum UpcomingPageState: Equatable, Sendable {
+    case loading
+    case missing
+    case upcoming(UpcomingAlbum)
+    /// the server has it now: its library album's id.
+    case onServer(String)
 }
 
 nonisolated extension Array where Element == AlbumRow {
@@ -174,7 +206,12 @@ extension [LyricLine] {
 }
 
 extension PlayerViewModel {
-    /// Whether `lines` are really timed. Some tags give every line a start of 0, so this needs more than one distinct time.
+    /// the current song has lyrics, or it isn't known yet because they're still being asked for.
+    var mayHaveLyrics: Bool { current?.hasLyrics == true || lyricsPending }
+}
+
+extension PlayerViewModel {
+    /// whether `lines` are really timed, since some tags give every line a start of 0.
     func lyricsAreSynced(_ lines: [LyricLine]) -> Bool {
         guard lyricsSynced, lines.allSatisfy({ $0.start != nil }) else { return false }
         return Set(lines.compactMap(\.start)).count > 1
@@ -237,7 +274,6 @@ nonisolated enum SongSort: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// The header this sort belongs to, if any.
     var column: Int? {
         switch self {
         case .title: 0
@@ -291,6 +327,7 @@ protocol SongsViewModel: AnyObject, Observable {
     func setAllDownloaded(_ downloaded: Bool)
     /// True until the first answer for this list arrives, so an empty list isn't mistaken for no songs.
     var isLoading: Bool { get }
+    func canSort(_ sort: SongSort) -> Bool
 }
 
 extension SongsViewModel {
@@ -383,7 +420,6 @@ nonisolated enum PlaylistSort: String, CaseIterable, Identifiable, Sendable {
     var label: String { switch self { case .library: L("Library Order"); case .name: L("Name"); case .songs: L("Song Count") } }
 }
 
-/// All, Mine, Shared or Downloaded on the Playlists page.
 nonisolated enum PlaylistScope: String, CaseIterable, Identifiable, Sendable {
     case all, mine, shared, downloaded
     var id: String { rawValue }
@@ -446,7 +482,6 @@ nonisolated enum LibraryState: Equatable, Sendable {
     case ready
 }
 
-/// Everything the pages read beyond the song table.
 extension LibraryViewModel {
     func onRepeat() -> [SongRow] { [] }
     func backInRotation() -> [ArtistRow] { [] }
@@ -455,6 +490,12 @@ extension LibraryViewModel {
     func artistStations() -> [ArtistStation] { [] }
     func similarArtists(for artist: ArtistRow) -> [ArtistRow] { [] }
     func moreBy(album: AlbumRow) -> MoreBy? { nil }
+    func albumHeat(album: AlbumRow) -> [String: UInt64] { [:] }
+    func reaskMissingHeat(album: AlbumRow) {}
+    func upcoming(for artist: ArtistRow) -> [UpcomingAlbum] { [] }
+    func upcomingHome() -> [UpcomingAlbum] { [] }
+    func upcomingMatching(_ query: String) -> [UpcomingAlbum] { [] }
+    func upcomingPage(_ id: UInt64) -> UpcomingPageState { .missing }
     func playsOffline(song: SongRow) -> Bool { isDownloaded(song: song) }
     var storage: StorageSettings? { nil }
     var playThreshold: PlayThresholdSettings? { nil }
@@ -468,12 +509,20 @@ protocol LibraryViewModel: AnyObject, Observable {
     func syncMeterVisible(_ on: Bool)
     /// Share links. None without a server.
     var shareLinks: ShareLinks? { get }
-    /// What empty pages should say.
     var state: LibraryState { get }
     /// True when the server can't be reached. Local browsing and downloads keep working.
     var isOffline: Bool { get }
     /// Tries the server now. True when it answered.
     func retryConnection() async -> Bool
+    /// a page's refresh: brings in what changed on the server since the last look and reloads the rows from it,
+    /// keeping the old ones on screen meanwhile. does nothing while one runs.
+    func refreshNow()
+    /// whether a page's refresh runs, or with `library` also any library sync.
+    func isRefreshing(library: Bool) -> Bool
+    /// the account menu's Offline switch, kept per account: on, nothing goes to the server.
+    var offlineSwitch: Bool { get }
+    /// off reconnects at once, the way Retry does.
+    func setOfflineSwitch(_ on: Bool)
     var allSongs: any SongsViewModel { get }
     var playlists: [PlaylistRef] { get }
     /// Keeps this account's device-local data apart from another's.
@@ -505,8 +554,9 @@ protocol LibraryViewModel: AnyObject, Observable {
     func forYou() -> ForYouRows?
     /// One of today's mixes. Nil once the day has changed or before For You has loaded.
     func mix(id: String) -> MixInfo?
-    /// A mix's songs as a table list, in the mix's order.
     func songs(forMix mix: MixInfo) -> any SongsViewModel
+    /// in the server's order, which the table can't change.
+    func songs(forArtistTop rows: [SongRow]) -> any SongsViewModel
     func latestSongs(limit: Int) -> [SongRow]
     func topSongs(limit: Int) -> [SongRow]
     func topArtists(limit: Int) -> [ArtistRow]
@@ -521,13 +571,10 @@ protocol LibraryViewModel: AnyObject, Observable {
     var serverLabel: String { get }
     /// True when play reports reach the server. Favorites stay local while this is off.
     var reportsPlays: Bool { get }
-    /// Scrobbling, from Settings.
     func setReporting(_ on: Bool)
     /// Streaming, metered and download quality, and volume leveling.
     var quality: QualitySettings? { get }
-    /// The periodic library refresh, from Settings.
     func setBackgroundSync(_ on: Bool)
-    /// How many songs are saved on this device.
     var downloadedCount: Int { get }
     /// Every download with its size on disk.
     func downloadEntries() async -> [DownloadEntry]
@@ -546,6 +593,18 @@ protocol LibraryViewModel: AnyObject, Observable {
     func similarArtists(for artist: ArtistRow) -> [ArtistRow]
     /// "More by <album artist>" under an album, or nil to hide it.
     func moreBy(album: AlbumRow) -> MoreBy?
+    /// the album's Heat column: Deezer's `rank` by song id, only with the Deezer switch on; what's kept shows until a
+    /// fresh answer lands, and songs Deezer has no match for are left out.
+    func albumHeat(album: AlbumRow) -> [String: UInt64]
+    /// an empty answer (offline, or no match) is asked again each time the album opens, not kept for the session
+    func reaskMissingHeat(album: AlbumRow)
+    /// empty until the answer lands.
+    func upcoming(for artist: ArtistRow) -> [UpcomingAlbum]
+    func upcomingHome() -> [UpcomingAlbum]
+    /// never asks Deezer.
+    func upcomingMatching(_ query: String) -> [UpcomingAlbum]
+    func upcomingPage(_ id: UInt64) -> UpcomingPageState
+    func songs(forUpcoming album: UpcomingAlbum) -> any SongsViewModel
     func songs(by artist: ArtistRow, matching query: String) -> [SongRow]
     /// A queue for Song Radio from one song. Nil when the server has no similar-artist data for it.
     func radioQueue(for song: SongRow) -> [SongRow]?
@@ -580,7 +639,8 @@ protocol LibraryViewModel: AnyObject, Observable {
     func toggleFavorite(artist id: String)
     func toggleFavorite(song: SongRow)
     func isDownloaded(song: SongRow) -> Bool
-    /// Plays without the server, from downloads or the song cache.
+    func isFavorite(song: SongRow) -> Bool
+    /// Plays without the server: downloaded, or in the song cache.
     func playsOffline(song: SongRow) -> Bool
     /// Settings > Storage. Nil without a core.
     var storage: StorageSettings? { get }
@@ -598,7 +658,6 @@ protocol LibraryViewModel: AnyObject, Observable {
     func createPlaylist(name: String, songs: [SongRow]) async throws -> String?
     /// The user's own regular playlists, most recently changed first.
     func playlistTargets() -> [PlaylistRef]
-    /// Appends songs to a playlist the user owns.
     func addToPlaylist(id: String, songs: [SongRow]) async -> PlaylistEdit
     /// Which of these songs the playlist already has, so an add can warn about duplicates.
     func alreadyInPlaylist(id: String, songs: [SongRow]) -> Set<String>
@@ -613,6 +672,12 @@ protocol LibraryViewModel: AnyObject, Observable {
     /// Changes a playlist's name, description or Public setting. Nil leaves a field as it is, and an empty
     /// description clears it. Returns an error message, or nil.
     func updatePlaylistDetails(id: String, name: String?, comment: String?, isPublic: Bool?) async -> String?
+    /// A playlist's songs as stored on this device, read now (a playlist's menu). empty until the playlist was fetched.
+    func playlistSongsNow(id: String) -> [SongRow]
+    /// A playlist's songs to play from its menu: the stored ones, fetched first when none are stored yet.
+    func playlistSongsToPlay(id: String) async -> [SongRow]
+    /// deletes a playlist the user owns, on the server for everyone. returns the words to show when it didn't go, or nil.
+    func deletePlaylist(id: String) async -> String?
 }
 
 /// One position in the queue. The same song can appear twice, so entries have their own identity.
@@ -636,7 +701,6 @@ struct PlaySource: Equatable {
 
 /// What the queue's Autoplay section shows.
 enum AutoplayShown: Sendable {
-    /// Songs.
     case on
     /// The list is over and songs are being found. Shows the heading with placeholder rows.
     case finding
@@ -655,6 +719,8 @@ protocol PlayerViewModel: AnyObject, Observable {
     var lyrics: [LyricLine] { get }
     /// The server's flag for whether the lines are timed. Views also check the times themselves.
     var lyricsSynced: Bool { get }
+    /// the current song's lyrics are still being asked for, so it isn't known yet whether it has any.
+    var lyricsPending: Bool { get }
     var isPlaying: Bool { get }
     /// Seconds into the current song.
     var position: Double { get }
@@ -689,12 +755,12 @@ protocol PlayerViewModel: AnyObject, Observable {
     func playStation(_ station: RadioStation)
     func stopStation()
 
-    /// With `smart`, a song that continues the previous one's album plays gapless.
-    func setCrossfade(ms: Int, smart: Bool)
+    /// `smart`: a song that continues the previous one's album in order joins gapless. `mix`: each
+    /// join's length, place, beat and loudness come from the songs.
+    func setCrossfade(ms: Int, smart: Bool, mix: Bool)
     func setOutputDevice(_ id: String?)
     /// The chain the audio should use, or nil to play unprocessed.
     func applyEqualizer(_ plan: EqPlan?)
-    /// Discord "Listening to" status, from Settings.
     func setDiscordStatus(_ on: Bool)
     /// The public server address Discord should use for covers.
     func setDiscordPublicAddress(_ text: String)
@@ -706,7 +772,6 @@ protocol PlayerViewModel: AnyObject, Observable {
     /// Entries after the current one.
     var upcomingCount: Int { get }
     func upcoming(at offset: Int) -> QueueEntry?
-    /// Jumps to an upcoming entry.
     func jump(toUpcoming offset: Int)
     /// Moves upcoming entries, in order, to before the entry now at `before`. `upcomingCount` means the end.
     /// The playing song never moves.
@@ -721,7 +786,9 @@ protocol PlayerViewModel: AnyObject, Observable {
     var autoplayMode: AutoplayModeRow { get set }
     /// Fewer Repeats, the default, or Standard.
     var shuffleStyle: ShuffleStyle { get set }
-    /// Opt-in.
+    /// Settings > Playback > Match the song's sample rate, on by default.
+    var matchSampleRate: Bool { get set }
+    /// Settings > Share what I'm playing, off unless the listener opts in.
     var shareListening: Bool { get set }
     /// Listening Now. Nil in sample mode.
     var listen: ListenAlongModel? { get }
@@ -733,7 +800,12 @@ protocol PlayerViewModel: AnyObject, Observable {
     var followingWaiting: Bool { get }
     /// The listener paused while following. It stays paused and following.
     var followingHeld: Bool { get }
-    /// Ends following quietly.
+    var followingSending: Bool { get }
+    /// a listening session is on: Next in Queue is the session's.
+    var sessionOn: Bool { get }
+    /// who on the other side has songs queued for the session.
+    var sessionTheirs: [String] { get }
+    /// Ends following quietly (the chip's Stop, the row's headphones).
     func stopFollowing()
     /// The listener's own song, which carries on when following ends.
     var waitingSong: SongRow? { get }
@@ -804,6 +876,9 @@ extension LibraryViewModel {
     func syncMeterVisible(_ on: Bool) {}
     func savePlaylistOrder(id: String, expected: [String], order: [String]) async -> PlaylistEdit { .saved }
     func storedPlaylistSongs(id: String) async -> [SongRow]? { nil }
+    func deletePlaylist(id: String) async -> String? { L("Deleting a playlist needs the server.") }
+    func playlistSongsNow(id: String) -> [SongRow] { songs(forPlaylist: id).entireList() }
+    func playlistSongsToPlay(id: String) async -> [SongRow] { playlistSongsNow(id: id) }
     func playlistTargets() -> [PlaylistRef] { [] }
     func addToPlaylist(id: String, songs: [SongRow]) async -> PlaylistEdit { .failed(L("Playlists can't be changed without the server.")) }
     func alreadyInPlaylist(id: String, songs: [SongRow]) -> Set<String> { [] }
@@ -812,6 +887,10 @@ extension LibraryViewModel {
     var isOffline: Bool { false }
     var quality: QualitySettings? { nil }
     func retryConnection() async -> Bool { true }
+    func refreshNow() {}
+    func isRefreshing(library: Bool) -> Bool { false }
+    var offlineSwitch: Bool { false }
+    func setOfflineSwitch(_ on: Bool) {}
     func downloadProgress(song: SongRow) -> Double? { nil }
     func isDownloading(song: SongRow) -> Bool { downloadProgress(song: song) != nil }
     func radioQueue(startingFrom song: SongRow) async -> [SongRow]? { radioQueue(for: song) }
@@ -836,11 +915,15 @@ extension PlayerViewModel {
     var autoplayEnabled: Bool { get { false } set {} }
     var autoplayMode: AutoplayModeRow { get { .navia } set {} }
     var shuffleStyle: ShuffleStyle { get { .fewerRepeats } set {} }
+    var matchSampleRate: Bool { get { true } set {} }
     var shareListening: Bool { get { false } set {} }
     var listen: ListenAlongModel? { nil }
     var followingFriend: String? { nil }
     var followingWaiting: Bool { false }
     var followingHeld: Bool { false }
+    var followingSending: Bool { false }
+    var sessionOn: Bool { false }
+    var sessionTheirs: [String] { [] }
     var followingUser: String? { nil }
     func stopFollowing() {}
     var waitingSong: SongRow? { nil }
@@ -868,7 +951,7 @@ extension PlayerViewModel {
     func answerQueueOffer(accept: Bool) {}
     var quality: AudioQuality? { nil }
     func retryServer() {}
-    func setCrossfade(ms: Int, smart: Bool) {}
+    func setCrossfade(ms: Int, smart: Bool, mix: Bool) {}
     func setOutputDevice(_ id: String?) {}
     func applyEqualizer(_ plan: EqPlan?) {}
     func setDiscordStatus(_ on: Bool) {}

@@ -21,7 +21,7 @@ import NaviaCoreFFI
         self.favoriteArtists = favoriteArtists
     }
 
-    /// Runs after any change, so filtered lists can rebuild. The list must capture itself weakly.
+    /// runs after any change, so filtered lists can rebuild. the listener must capture itself weakly.
     func listen(_ action: @escaping () -> Void) { listeners.append(action) }
 
     /// Replaces the favorites after a server refresh, leaving downloads and covers alone.
@@ -32,7 +32,7 @@ import NaviaCoreFFI
         favoriteArtists = artists
         changed()
     }
-    /// Replaces the downloaded set after asking the core which files are finished.
+    /// after asking the core which files are finished.
     func replaceDownloads(_ ids: Set<String>) {
         guard ids != downloadedSongs else { return }
         downloadedSongs = ids
@@ -82,7 +82,8 @@ import NaviaCoreFFI
     @ObservationIgnored private var visible: [Int] = []
     @ObservationIgnored private let collection: LocalCollection
     @ObservationIgnored private let defaultSort: SongSort
-    /// Set on the real core, where a download is a real file. Sample mode only toggles the flag.
+    @ObservationIgnored private let sortable: Bool
+    /// Set on the real core, where a download is a real file. Sample mode only flips the flag.
     @ObservationIgnored var downloader: (([SongRow], Bool) -> Void)?
     /// Set on the real core, where a favorite also goes to the server. Sample mode only toggles the flag.
     @ObservationIgnored var toggle: ((String) -> Void)?
@@ -100,12 +101,14 @@ import NaviaCoreFFI
     var sort: SongSort { didSet { if sort != oldValue { descending = false; rebuild() } } }
     var descending = false { didSet { if descending != oldValue { rebuild() } } }
     var ownSort: SongSort { defaultSort }
+    func canSort(_ sort: SongSort) -> Bool { sortable }
     var filter: SongFilter = .all { didSet { if filter != oldValue { rebuild() } } }
 
-    init(rows: [SongRow], collection: LocalCollection, defaultSort: SongSort = .plays) {
+    init(rows: [SongRow], collection: LocalCollection, defaultSort: SongSort = .plays, sortable: Bool = true) {
         all = rows
         self.collection = collection
         self.defaultSort = defaultSort
+        self.sortable = sortable
         sort = defaultSort
         haystacks = rows.map { "\($0.title) \($0.artist) \($0.album)".lowercased() }
         rebuild()
@@ -147,7 +150,7 @@ import NaviaCoreFFI
         }
     }
 
-    /// Whether the rows shown are the whole list in its own order, which is when songs can be moved.
+    /// the whole list in its own order, which is when songs can be moved.
     var showsListOrder: Bool { sort == .order && filter == .all && query.trimmingCharacters(in: .whitespaces).isEmpty }
 
     /// Moves songs, by index in the list's own order, to before `before`. Only in list order, unfiltered.
@@ -158,7 +161,7 @@ import NaviaCoreFFI
         setRows(order.map { all[$0] })
     }
 
-    /// Replaces the rows once they've loaded in the background.
+    /// once they've loaded in the background.
     func setRows(_ rows: [SongRow]) {
         all = rows
         haystacks = rows.map { "\($0.title) \($0.artist) \($0.album)".lowercased() }

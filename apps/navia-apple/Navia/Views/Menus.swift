@@ -1,21 +1,20 @@
 import AppKit
 import SwiftUI
 
-/// One row of a menu. Menus are native, like the app's window controls.
 struct MenuEntry {
     var title = ""
     var checked = false
     var enabled = true
-    /// Why a disabled row can't be used, shown as its tooltip.
+    /// shown as the disabled row's tooltip.
     var reason: String? = nil
     var isDivider = false
-    /// A submenu in place of an action. The row's action isn't called.
+    /// the row's action isn't called.
     var submenu: [MenuEntry]? = nil
     /// With a submenu, the placeholder of a filter field at its top. Typing narrows the submenu's `filterable` rows.
     var find: String? = nil
-    /// With `find`: shown in place of the rows when the filter matches nothing.
+    /// shown in place of the rows when the filter matches nothing.
     var empty: String? = nil
-    /// A submenu row the filter narrows (the playlists, not New Playlist).
+    /// the playlists, not New Playlist.
     var filterable = false
     /// An SF Symbol for the row. Without one, `MenuIcons` looks the title up, so an action has the same icon in every
     /// menu.
@@ -23,14 +22,15 @@ struct MenuEntry {
     /// A key equivalent shown at the row's end, such as "," for Settings. Command unless `shortcutModifiers` says otherwise.
     var shortcut: String? = nil
     var shortcutModifiers: NSEvent.ModifierFlags = .command
-    /// Drawn as a switch that flips without closing the menu (needs `checked`).
+    /// flips without closing the menu (needs `checked`).
     var isSwitch = false
-    /// A custom row in place of a title, such as who is signed in.
     var view: NSView? = nil
     /// A section heading, drawn as the system's section header.
     var isHeader = false
-    /// A second, dimmer line under the title (a receiver's model, what it's doing, or why it can't be used).
+    /// A second, dimmer line under the title.
     var subtitle: String? = nil
+    /// an icon button in the row above the list; the title is its tooltip and accessible name, `checked` fills the icon.
+    var quick = false
     var action: () -> Void = {}
 
     static let divider = MenuEntry(isDivider: true)
@@ -46,14 +46,14 @@ enum MenuIcons {
             ("Play Next", "arrow.turn.up.right"), ("Add to Queue", "text.line.first.and.arrowtriangle.forward"),
             ("Add to Playlist", "text.badge.plus"), ("Remove Download", "xmark"), ("Cancel Download", "xmark"),
             ("Remove Downloads", "xmark"), ("Download Selected", "arrow.down"),
-            ("Go to Album", "opticaldisc"), ("Go to Artist", "music.microphone"), ("Start Song Radio", "radio"),
-            ("Start Artist Radio", "radio"), ("Share…", "square.and.arrow.up"), ("Stop Station", "stop"),
-            ("Private Mode", "eye.slash"), ("Mini Player", "pip"), ("Settings…", "gearshape"), ("Change Server", "server.rack"),
+            ("Go to Album", "opticaldisc"), ("Go to Artist", "music.microphone"), ("Song Radio", "radio"),
+            ("Artist Radio", "radio"), ("Share…", "square.and.arrow.up"), ("Stop Station", "stop"),
+            ("Private Mode", "eye.slash"), ("Offline", "icloud.slash"), ("Mini Player", "pip"), ("Settings…", "gearshape"), ("Change Server", "server.rack"),
             ("Sign Out", "rectangle.portrait.and.arrow.right"), ("Public on this server", "person.2"),
-            ("Create Share Link", "link"), ("Edit Details", "pencil"), ("Edit Rules", "bolt"),
+            ("Create Share Link", "link"), ("Edit Details…", "pencil"), ("Edit Rules", "bolt"),
             ("Album Collage", "photo"), ("Generated Cover", "sparkle"), ("Upload Image", "square.and.arrow.up.on.square"),
             ("Remove Image", "trash"), ("Export as M3U", "square.and.arrow.up.on.square"),
-            ("New Playlist", "music.note.list"), ("New Smart Playlist", "bolt"), ("Remove from This Playlist", "minus.circle"),
+            ("New Playlist", "music.note.list"), ("New Smart Playlist", "bolt"), ("Remove from Playlist", "minus.circle"),
         ]
         let built = Dictionary(pairs.map { (L($0.0), $0.1) }, uniquingKeysWith: { a, _ in a })
         cached = built
@@ -64,18 +64,16 @@ enum MenuIcons {
     @MainActor private static var cached: [String: String]?
     @MainActor private static var cachedLanguage = ""
 
-    /// Every icon sits centered in a cell of this size, so titles line up whatever the symbol's width.
-    static let cell = NSSize(width: 20, height: 16)
-
-    /// The icon at menu size, centered in `cell`, in the row's text color. A template image in a title attachment isn't
-    /// tinted by the menu, so the color goes on the symbol itself. `nil` gives an empty cell.
+    /// A template image in a title attachment isn't tinted by the menu, so the color is applied to the symbol itself.
+    /// `nil` gives an empty cell, for rows without an icon in a menu that has some.
     @MainActor static func image(_ symbol: String?, dimmed: Bool = false) -> NSImage {
         let color: NSColor = dimmed ? .disabledControlTextColor : .labelColor
-        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular).applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+        let config = NSImage.SymbolConfiguration(pointSize: T.menuIcon, weight: .regular).applying(NSImage.SymbolConfiguration(paletteColors: [color]))
         let glyph = symbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil)?.withSymbolConfiguration(config) }
-        let image = NSImage(size: cell, flipped: false) { rect in
+        let image = NSImage(size: T.menuIconCell, flipped: false) { rect in
             guard let glyph else { return true }
-            let s = glyph.size
+            let scale = min(1, T.menuIconFitW / glyph.size.width)
+            let s = NSSize(width: glyph.size.width * scale, height: glyph.size.height * scale)
             glyph.draw(in: NSRect(x: rect.midX - s.width / 2, y: rect.midY - s.height / 2, width: s.width, height: s.height))
             return true
         }
@@ -89,6 +87,7 @@ enum MenuIcons {
         let font = NSFont.menuFont(ofSize: 0)
         let attachment = NSTextAttachment()
         attachment.image = image(symbol, dimmed: !enabled)
+        let cell = T.menuIconCell
         attachment.bounds = NSRect(x: 0, y: (font.capHeight - cell.height) / 2, width: cell.width, height: cell.height)
         let out = NSMutableAttributedString(attachment: attachment)
         var attributes: [NSAttributedString.Key: Any] = [.font: font]
@@ -136,6 +135,13 @@ extension View {
 func makeMenu(_ entries: [MenuEntry], find: String? = nil, empty: String? = nil) -> NSMenu {
     let menu = NSMenu()
     menu.autoenablesItems = false
+    fill(menu, with: entries, find: find, empty: empty)
+    return menu
+}
+
+/// replaces the menu's rows; works while the menu is open.
+private func fill(_ menu: NSMenu, with entries: [MenuEntry], find: String? = nil, empty: String? = nil) {
+    menu.removeAllItems()
     var filter: MenuFindField?
     if let find {
         let field = MenuFindField(placeholder: find)
@@ -144,6 +150,19 @@ func makeMenu(_ entries: [MenuEntry], find: String? = nil, empty: String? = nil)
         menu.addItem(item)
         menu.delegate = field
         filter = field
+    }
+    let quick = entries.filter(\.quick)
+    var entries = entries.filter { !$0.quick }
+    var quickRow: MenuQuickRow?
+    if !quick.isEmpty {
+        let item = NSMenuItem()
+        let row = MenuQuickRow(quick)
+        quickRow = row
+        item.view = row
+        menu.addItem(item)
+        // the list under the row starts without its own divider: the row's rule separates them.
+        while entries.first?.isDivider == true { entries.removeFirst() }
+        if !entries.isEmpty { menu.addItem(.separator()) }
     }
     let symbols = entries.map { $0.isDivider || $0.isHeader || $0.view != nil ? nil : ($0.symbol ?? MenuIcons.symbol(for: $0.title)) }
     let anyIcon = symbols.contains { $0 != nil }
@@ -186,29 +205,314 @@ func makeMenu(_ entries: [MenuEntry], find: String? = nil, empty: String? = nil)
         filter.emptyItem = item
         menu.addItem(item)
     }
-    return menu
+    quickRow?.fit(menuWidth: menu.size.width)
 }
 
-/// The filter field at the top of a submenu. It takes the keyboard when the submenu opens, and Return picks the
-/// first match.
-final class MenuFindField: NSView, NSMenuDelegate, NSSearchFieldDelegate {
-    let field = NSSearchField()
+/// keeps an open menu's rows in step with the observable state its entries read.
+@MainActor private final class LiveMenu {
+    private let menu: NSMenu
+    private let entries: () -> [MenuEntry]
+    private var shown: [String]
+    private var open = true
+
+    init(_ menu: NSMenu, entries: @escaping () -> [MenuEntry], shown: [MenuEntry]) {
+        self.menu = menu
+        self.entries = entries
+        self.shown = shown.map(Self.key)
+    }
+
+    /// runs until `close`; the main queue it resumes on is still served while the menu tracks.
+    func follow() {
+        guard open else { return }
+        let next = withObservationTracking(entries) {
+            Task { @MainActor [weak self] in self?.follow() }
+        }
+        let keys = next.map(Self.key)
+        guard keys != shown else { return }
+        shown = keys
+        fill(menu, with: next)
+    }
+
+    func close() { open = false }
+
+    private static func key(_ e: MenuEntry) -> String {
+        [e.title, e.subtitle ?? "", e.checked ? "1" : "0", e.enabled ? "1" : "0", e.isHeader ? "h" : e.isDivider ? "d" : ""].joined(separator: "\u{1f}")
+    }
+}
+
+/// square icon buttons of one size in every menu, spread across the rows' width above the list.
+final class MenuQuickRow: NSView {
+    private let buttons: [MenuQuickButton]
+
+    init(_ entries: [MenuEntry]) {
+        buttons = entries.map(MenuQuickButton.init)
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.minWidth(count: entries.count), height: Self.height))
+        autoresizingMask = [.width]
+        buttons.forEach(addSubview)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private static func minWidth(count: Int) -> CGFloat {
+        let n = CGFloat(count)
+        return 2 * T.menuContentInset + T.menuQuickSize * (n + max(0, n - 1) * T.menuQuickGapRatio)
+    }
+
+    private static var height: CGFloat { T.menuQuickPadTop + T.menuQuickSize + T.menuQuickPadBottom }
+
+    func fit(menuWidth: CGFloat) {
+        setFrameSize(NSSize(width: menuWidth, height: Self.height))
+    }
+
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); place() }
+    override func viewDidMoveToWindow() { place() }
+
+    private func place() {
+        guard buttons.count > 0 else { return }
+        let size = T.menuQuickSize
+        let free = bounds.width - 2 * T.menuContentInset - CGFloat(buttons.count) * size
+        let gap = buttons.count > 1 ? max(0, free / CGFloat(buttons.count - 1)) : 0
+        for (index, button) in buttons.enumerated() {
+            button.frame = NSRect(x: T.menuContentInset + CGFloat(index) * (size + gap), y: T.menuQuickPadBottom, width: size, height: size)
+        }
+    }
+
+    #if DEBUG
+    /// for checks: the buttons' titles and frames, and runs one as a click would.
+    var debugButtons: [(title: String, frame: NSRect)] { buttons.map { ($0.entry.title, $0.frame) } }
+    func debugPress(_ index: Int) { buttons[index].press() }
+    func debugHover(_ index: Int) { buttons[index].debugHover() }
+    #endif
+}
+
+/// A click runs it and closes the menu; one with a submenu opens that list where the menu was.
+final class MenuQuickButton: NSView {
+    let entry: MenuEntry
+    private let icon = NSImageView()
+    private var hovering = false { didSet { needsDisplay = true; tint() } }
+
+    init(_ entry: MenuEntry) {
+        self.entry = entry
+        super.init(frame: NSRect(x: 0, y: 0, width: T.menuQuickSize, height: T.menuQuickSize))
+        icon.frame = bounds
+        icon.autoresizingMask = [.width, .height]
+        icon.imageScaling = .scaleNone
+        addSubview(icon)
+        tint()
+        toolTip = !entry.enabled ? entry.reason ?? entry.title : entry.title
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(entry.title)
+        setAccessibilityEnabled(entry.enabled)
+        if entry.checked { setAccessibilityValue(true) }
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        let base = entry.symbol ?? MenuIcons.symbol(for: entry.title) ?? "circle"
+        icon.image = NSImage(systemSymbolName: entry.checked ? base + ".fill" : base, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: newSize.width * T.menuQuickIconRatio, weight: .regular))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovering = entry.enabled
+        MenuTip.shared.show(toolTip ?? entry.title, under: self)
+    }
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        MenuTip.shared.hide()
+    }
+    override func mouseUp(with event: NSEvent) { if entry.enabled { press() } }
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { MenuTip.shared.hide() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard hovering else { return }
+        NSColor.selectedContentBackgroundColor.setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: T.menuQuickRadius, yRadius: T.menuQuickRadius).fill()
+    }
+
+    private func tint() {
+        icon.contentTintColor = !entry.enabled ? .disabledControlTextColor : hovering ? .alternateSelectedControlTextColor : .labelColor
+    }
+
+    #if DEBUG
+    func debugHover() { hovering = entry.enabled }
+    #endif
+
+    func press() {
+        MenuTip.shared.hide()
+        let menu = enclosingMenuItem?.menu
+        let spot = window.map { $0.convertPoint(toScreen: convert(NSPoint(x: bounds.minX, y: bounds.minY), to: nil)) }
+        menu?.cancelTracking()
+        let entry = entry
+        // after the menu has closed: the action may open a dialog, and the list replaces the menu.
+        Task { @MainActor in
+            guard let rows = entry.submenu else { entry.action(); return }
+            let list = makeMenu(rows, find: entry.find, empty: entry.empty)
+            list.popUp(positioning: nil, at: spot ?? NSEvent.mouseLocation, in: nil)
+        }
+    }
+}
+
+/// the system's tooltips never show inside an open menu, so the icon-only buttons get their own after the same delay.
+@MainActor final class MenuTip {
+    static let shared = MenuTip()
+    private var panel: NSPanel?
+    private let label = NSTextField(labelWithString: "")
+    private var timer: Timer?
+
+    func show(_ text: String, under view: NSView) {
+        hide()
+        let delay = UserDefaults.standard.object(forKey: "NSInitialToolTipDelay") as? Double ?? T.menuTipDelay * 1000
+        let t = Timer(timeInterval: delay / 1000, repeats: false) { [weak self, weak view] _ in
+            MainActor.assumeIsolated { if let view { self?.present(text, under: view) } }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    func hide() {
+        timer?.invalidate()
+        timer = nil
+        panel?.orderOut(nil)
+    }
+
+    private func present(_ text: String, under view: NSView) {
+        guard let window = view.window else { return }
+        let panel = self.panel ?? make()
+        label.stringValue = text
+        label.sizeToFit()
+        let size = NSSize(width: label.frame.width + T.menuTipPadX * 2, height: label.frame.height + T.menuTipPadY * 2)
+        label.setFrameOrigin(NSPoint(x: T.menuTipPadX, y: T.menuTipPadY))
+        let anchor = window.convertToScreen(view.convert(view.bounds, to: nil))
+        panel.setFrame(NSRect(x: anchor.midX - size.width / 2, y: anchor.minY - size.height - T.menuTipGap, width: size.width, height: size.height), display: true)
+        panel.orderFront(nil)
+    }
+
+    private func make() -> NSPanel {
+        let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        panel.level = .popUpMenu + 1
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        let body = NSVisualEffectView()
+        body.material = .toolTip
+        body.state = .active
+        body.wantsLayer = true
+        body.layer?.cornerRadius = T.menuTipRadius
+        label.font = .toolTipsFont(ofSize: 0)
+        label.textColor = .labelColor
+        body.addSubview(label)
+        panel.contentView = body
+        self.panel = panel
+        return panel
+    }
+}
+
+/// takes the keyboard when the submenu opens; Return picks the first match. system label colours, so it reads in a
+/// light menu and a dark one.
+final class MenuFindField: NSView, NSMenuDelegate, NSTextFieldDelegate {
+    /// the field editor paints an opaque background while typing unless it's told not to once it's in place.
+    private final class ClearField: NSTextField {
+        override func becomeFirstResponder() -> Bool {
+            let became = super.becomeFirstResponder()
+            clearEditor()
+            return became
+        }
+        override func textDidChange(_ notification: Notification) { super.textDidChange(notification); clearEditor() }
+        private func clearEditor() {
+            guard let editor = currentEditor() as? NSTextView else { return }
+            editor.drawsBackground = false
+            editor.backgroundColor = .clear
+            (editor.superview as? NSClipView)?.drawsBackground = false
+        }
+    }
+
+    let field: NSTextField = ClearField()
+    /// the search field's ✕ (`SearchClearButton`), only while there's text.
+    private let clear = NSButton()
     var filterable: [NSMenuItem] = []
     var emptyItem: NSMenuItem?
 
     init(placeholder: String) {
-        super.init(frame: NSRect(x: 0, y: 0, width: T.submenuW, height: T.px(34) + T.px(8)))
-        field.placeholderString = placeholder
+        super.init(frame: NSRect(x: 0, y: 0, width: T.submenuW, height: T.menuFindH + T.menuFindSpace))
+        let box = NSView()
+        box.wantsLayer = true
+        box.layer?.cornerRadius = T.menuFindRadius
+        box.layer?.cornerCurve = .continuous
+        let glyph = NSImageView(image: NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: T.menuFindGlyph, weight: .regular)) ?? NSImage())
+        glyph.contentTintColor = .secondaryLabelColor
+        field.placeholderAttributedString = NSAttributedString(string: placeholder, attributes: [
+            .foregroundColor: NSColor.tertiaryLabelColor, .font: NSFont.menuFont(ofSize: 0)])
+        field.font = .menuFont(ofSize: 0)
+        field.textColor = .labelColor
+        field.isBordered = false
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.backgroundColor = .clear
         field.focusRingType = .none
-        field.sendsSearchStringImmediately = true
+        field.usesSingleLineMode = true
+        field.cell?.isScrollable = true
         field.delegate = self
-        field.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(field)
+        clear.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: L("Clear Search"))?
+            .withSymbolConfiguration(.init(pointSize: T.searchClearSM, weight: .regular))
+        clear.isBordered = false
+        clear.contentTintColor = .tertiaryLabelColor
+        clear.toolTip = L("Clear Search")
+        clear.refusesFirstResponder = true
+        clear.target = self
+        clear.action = #selector(clearFind)
+        clear.isHidden = true
+        self.box = box
+        addSubview(box)
+        for view in [glyph, field, clear] { box.addSubview(view) }
+        for view in [box, glyph, field, clear] { view.translatesAutoresizingMaskIntoConstraints = false }
         NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-            field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            field.centerYAnchor.constraint(equalTo: centerYAnchor),
+            box.leadingAnchor.constraint(equalTo: leadingAnchor, constant: T.menuContentInset),
+            box.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -T.menuContentInset),
+            box.centerYAnchor.constraint(equalTo: centerYAnchor),
+            box.heightAnchor.constraint(equalToConstant: T.menuFindH),
+            glyph.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: T.menuFindPad),
+            glyph.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            field.leadingAnchor.constraint(equalTo: glyph.trailingAnchor, constant: T.menuFindGap),
+            field.trailingAnchor.constraint(equalTo: clear.leadingAnchor, constant: -T.menuFindGap),
+            field.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            clear.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -T.menuFindPad),
+            clear.centerYAnchor.constraint(equalTo: box.centerYAnchor),
         ])
+        glyph.setContentHuggingPriority(.required, for: .horizontal)
+        clear.setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    @objc private func clearFind() {
+        field.stringValue = ""
+        apply()
+        window?.makeFirstResponder(field)
+    }
+
+    private var box: NSView?
+
+    // layer colours don't follow the appearance on their own.
+    override func viewDidChangeEffectiveAppearance() { tint() }
+    override func viewDidMoveToWindow() { tint() }
+    private func tint() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            box?.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(CGFloat(T.row.a)).cgColor
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -225,7 +529,6 @@ final class MenuFindField: NSView, NSMenuDelegate, NSSearchFieldDelegate {
 
     func controlTextDidChange(_ obj: Notification) { apply() }
 
-    /// Return in the field: the first playlist that matches.
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
         guard selector == #selector(NSResponder.insertNewline(_:)), !field.stringValue.isEmpty,
               let first = filterable.first(where: { !$0.isHidden }), let menu = first.menu else { return false }
@@ -243,6 +546,7 @@ final class MenuFindField: NSView, NSMenuDelegate, NSSearchFieldDelegate {
             any = any || !item.isHidden
         }
         emptyItem?.isHidden = any || filterable.isEmpty && needle.isEmpty
+        clear.isHidden = field.stringValue.isEmpty
     }
 
     #if DEBUG
@@ -253,7 +557,6 @@ final class MenuFindField: NSView, NSMenuDelegate, NSSearchFieldDelegate {
 
 /// The song row menu.
 enum SongMenu {
-    /// Get Info, last in a song's, album's, playlist's or artist's menu, with ⌘I.
     static func info(_ target: InfoTarget, shell: ShellModel) -> MenuEntry {
         MenuEntry(title: L("Get Info"), symbol: "info.circle", shortcut: "i") { shell.openInfo(target) }
     }
@@ -269,9 +572,9 @@ enum SongMenu {
         return MenuEntry(title: title, submenu: rows, find: L("Find a playlist"), empty: L("No playlists match"), symbol: "text.badge.plus")
     }
 
-    /// Remove from This Playlist, for rows of a playlist the user can edit.
+    /// for rows of a playlist the user can edit.
     static func remove(count: Int, action: @escaping () -> Void) -> MenuEntry {
-        MenuEntry(title: count > 1 ? L("Remove {n} from This Playlist", ["n": fmtInt(count)]) : L("Remove from This Playlist"), symbol: "minus.circle", action: action)
+        MenuEntry(title: count > 1 ? L("Remove {n} from Playlist", ["n": fmtInt(count)]) : L("Remove from Playlist"), symbol: "minus.circle", action: action)
     }
 
     /// Remove from Queue. The X and Delete do the same.
@@ -279,29 +582,70 @@ enum SongMenu {
         MenuEntry(title: count > 1 ? L("Remove {n} from Queue", ["n": fmtInt(count)]) : L("Remove from Queue"), symbol: "minus.circle", action: action)
     }
 
-    static func single(_ song: SongRow, shell: ShellModel, remove: MenuEntry? = nil) -> [MenuEntry] {
+    /// for several songs each acts on all of them.
+    static func quick(_ songs: [SongRow], shell: ShellModel) -> [MenuEntry] {
         let library = shell.library
-        var entries = [
-            MenuEntry(title: L("Play Next")) { shell.player.playNext(song) },
-            MenuEntry(title: L("Add to Queue")) { shell.player.addToQueue(song) },
+        let one = songs.count == 1
+        let favorite = songs.allSatisfy { library.isFavorite(song: $0) }
+        let downloaded = songs.allSatisfy { library.isDownloaded(song: $0) }
+        let downloading = !downloaded && songs.contains { library.isDownloading(song: $0) } && songs.allSatisfy { library.isDownloaded(song: $0) || library.isDownloading(song: $0) }
+        // A song a downloaded playlist or album holds stays until that collection's download is turned off.
+        let singles = library.synced?.singleIDs()
+        let removable = singles.map { ids in songs.contains { ids.contains($0.id) } } ?? true
+        let download = downloaded
+            ? MenuEntry(title: one ? L("Remove Download") : L("Remove Downloads"), enabled: removable, reason: L("Kept by a downloaded playlist or album"), symbol: "arrow.down.circle", quick: true) { library.setDownloaded(songs: songs, false) }
+            : downloading
+            ? MenuEntry(title: L("Cancel Download"), symbol: "xmark", quick: true) { library.setDownloaded(songs: songs, false) }
+            : MenuEntry(title: one ? L("Download") : L("Download Selected"), symbol: "arrow.down", quick: true) { library.setDownloaded(songs: songs, true) }
+        var add = addToPlaylist(songs, name: one ? songs[0].title : "", title: one ? L("Add to Playlist") : L("Add {n} to Playlist", ["n": fmtInt(songs.count)]), shell: shell)
+        add.symbol = "plus"
+        add.quick = true
+        return [
+            MenuEntry(title: L("Favorite"), checked: favorite, symbol: "heart", quick: true) {
+                for song in songs where library.isFavorite(song: song) == favorite { library.toggleFavorite(song: song) }
+            },
+            download,
+            MenuEntry(title: one ? L("Play Next") : L("Play {n} Next", ["n": fmtInt(songs.count)]), symbol: "arrow.turn.up.right", quick: true) { songs.reversed().forEach { shell.player.playNext($0) }; RowFlash.shared.flash(songs.map(\.id)) },
+            add,
+        ]
+    }
+
+    /// what a double-click on the row does (`action`); without one, a queued song is jumped to, anything else plays as
+    /// its own list. on the current song it is Pause, or Play to resume.
+    static func play(_ songs: [SongRow], shell: ShellModel, action: (() -> Void)? = nil) -> MenuEntry {
+        let player = shell.player
+        if player.station == nil, songs.count == 1, let song = songs.first, player.current?.id == song.id {
+            return MenuEntry(title: player.isPlaying ? L("Pause") : L("Play"), symbol: player.isPlaying ? "pause" : "play") { player.togglePlayPause() }
+        }
+        return MenuEntry(title: L("Play"), enabled: !songs.isEmpty, symbol: "play") {
+            if let action { return action() }
+            if songs.count == 1, let song = songs.first {
+                if let offset = (0..<player.upcomingCount).first(where: { player.upcoming(at: $0)?.song.id == song.id }) { return player.jump(toUpcoming: offset) }
+            }
+            shell.play(songs, at: 0, from: nil)
+        }
+    }
+
+    static func single(_ song: SongRow, shell: ShellModel, remove: MenuEntry? = nil, play: (() -> Void)? = nil) -> [MenuEntry] {
+        let library = shell.library
+        var entries = quick([song], shell: shell) + [
+            Self.play([song], shell: shell, action: play),
+            .divider,
+            MenuEntry(title: L("Add to Queue")) { shell.player.addToQueue(song); RowFlash.shared.flash([song.id]) },
+            MenuEntry(title: L("Song Radio"), enabled: !library.knownNoRadio(song)) { shell.startSongRadio(song) },
+            .divider,
             addToPlaylist([song], name: song.title, shell: shell),
         ]
         if let remove { entries.append(remove) }
-        if library.isDownloaded(song: song) {
-            entries.append(MenuEntry(title: L("Remove Download")) { library.setDownloaded(songs: [song], false) })
-        } else if library.isDownloading(song: song) {
-            entries.append(MenuEntry(title: L("Cancel Download")) { library.setDownloaded(songs: [song], false) })
-        }
         entries.append(.divider)
         entries.append(MenuEntry(title: L("Go to Album")) { shell.goToAlbum(of: song) })
         entries.append(artistEntry(song, shell: shell))
-        entries.append(MenuEntry(title: L("Start Song Radio"), enabled: !library.knownNoRadio(song)) { shell.startSongRadio(song) })
         entries.append(shell.shareEntry(songs: [song]))
         entries.append(info(.song(song.id), shell: shell))
         return entries
     }
 
-    /// One artist goes straight there. A song with several credited artists lists them, in the song's own order.
+    /// one artist goes straight there; several credited artists are listed in the song's own order.
     private static func artistEntry(_ song: SongRow, shell: ShellModel) -> MenuEntry {
         let targets = shell.artistTargets(of: song)
         guard targets.count > 1 else {
@@ -313,53 +657,163 @@ enum SongMenu {
     }
 
     static func several(_ songs: [SongRow], shell: ShellModel, remove: MenuEntry? = nil) -> [MenuEntry] {
-        let library = shell.library
-        let downloaded = songs.allSatisfy { library.isDownloaded(song: $0) }
-        return [
-            MenuEntry(title: L("Play {n} Next", ["n": fmtInt(songs.count)]), symbol: "text.line.first.and.arrowtriangle.forward") { songs.reversed().forEach { shell.player.playNext($0) } },
-            MenuEntry(title: L("Add {n} to Queue", ["n": fmtInt(songs.count)]), symbol: "text.line.first.and.arrowtriangle.forward") { songs.forEach { shell.player.addToQueue($0) } },
+        quick(songs, shell: shell) + [
+            play(songs, shell: shell),
+            .divider,
+            MenuEntry(title: L("Add {n} to Queue", ["n": fmtInt(songs.count)]), symbol: "text.line.first.and.arrowtriangle.forward") { songs.forEach { shell.player.addToQueue($0) }; RowFlash.shared.flash(songs.map(\.id)) },
+            .divider,
             addToPlaylist(songs, name: "", title: L("Add {n} to Playlist", ["n": fmtInt(songs.count)]), shell: shell),
         ] + (remove.map { [$0] } ?? []) + [
+            .divider,
             shell.shareEntry(songs: songs),
-            downloaded
-                ? MenuEntry(title: L("Remove Downloads")) { library.setDownloaded(songs: songs, false) }
-                : MenuEntry(title: L("Download Selected")) { library.setDownloaded(songs: songs, true) },
         ]
     }
 }
 
-/// A button that opens a native menu. Sits over any label, so the button keeps its own look.
-struct MenuHitArea: NSViewRepresentable {
-    /// Lines the menu's right edge up with the button's, for buttons at the window's right.
-    var trailing = false
-    let entries: () -> [MenuEntry]
-
-    func makeNSView(context: Context) -> MenuOpeningView {
-        let view = MenuOpeningView()
-        view.entries = entries
-        view.trailing = trailing
-        return view
+/// editing and deleting only on playlists the user owns (admins count).
+enum PlaylistMenu {
+    static func entries(_ playlist: PlaylistRow, shell: ShellModel) -> [MenuEntry] {
+        let none = playlist.songCount == 0
+        var items = [
+            MenuEntry(title: L("Play"), enabled: !none, reason: L("No songs to play"), symbol: "play") { shell.playPlaylist(playlist, shuffle: false) },
+            MenuEntry(title: L("Shuffle"), enabled: !none, reason: L("No songs to play"), symbol: "shuffle") { shell.playPlaylist(playlist, shuffle: true) },
+            .divider,
+        ]
+        if let synced = shell.library.synced {
+            let on = synced.status(.playlist, playlist.id) != nil
+            items.append(MenuEntry(title: on ? L("Remove Download") : L("Download"), enabled: !none, reason: L("No songs to download"), symbol: on ? "xmark" : "arrow.down") {
+                shell.toggleCollectionDownload(.playlist, id: playlist.id, name: playlist.name)
+            })
+        }
+        items += [
+            shell.shareEntry(playlist: playlist),
+            SongMenu.addToPlaylist(shell.library.playlistSongsNow(id: playlist.id), name: playlist.name, shell: shell),
+            SongMenu.info(.playlist(playlist.id), shell: shell),
+        ]
+        if let pin = shell.pinEntry(playlist.id) { items.append(pin) }
+        if playlist.isOwned { items += [.divider, editDetails(playlist, shell: shell), delete(playlist, shell: shell)] }
+        return items
     }
 
-    func updateNSView(_ nsView: MenuOpeningView, context: Context) { nsView.entries = entries; nsView.trailing = trailing }
+    static func editDetails(_ playlist: PlaylistRow, shell: ShellModel) -> MenuEntry {
+        MenuEntry(title: L("Edit Details…"), symbol: "pencil") { shell.openEditPlaylist(playlist) }
+    }
+
+    static func delete(_ playlist: PlaylistRow, shell: ShellModel) -> MenuEntry {
+        MenuEntry(title: L("Delete Playlist…"), symbol: "trash") { shell.askDeletePlaylist(playlist) }
+    }
+}
+
+/// sits over any label so sort, filter and "more" buttons keep their look.
+struct MenuHitArea: NSViewRepresentable {
+    /// for buttons at the window's right.
+    var trailing = false
+    /// the open menu follows changes to what `entries` reads.
+    var live = false
+    /// runs as the menu opens, before `entries`.
+    var opened: (() -> Void)? = nil
+    let entries: () -> [MenuEntry]
+    /// drawn inside the view, where Core Animation can press it.
+    var glyph: AnyView? = nil
+    var press = false
+    /// the held fill's diameter, where the surface has one.
+    var fill: CGFloat? = nil
+
+    func makeNSView(context: Context) -> MenuOpeningView { MenuOpeningView() }
+
+    func updateNSView(_ view: MenuOpeningView, context: Context) {
+        view.entries = entries
+        view.live = live
+        view.opened = opened
+        view.trailing = trailing
+        view.press = press
+        view.fill = fill
+        view.show(glyph.map { AnyView($0.environment(\.self, context.environment)) })
+    }
 }
 
 final class MenuOpeningView: NSView {
     var entries: () -> [MenuEntry] = { [] }
+    var live = false
+    var opened: (() -> Void)?
     var trailing = false
+    var press = false
+    var fill: CGFloat?
+    private var host: NSHostingView<AnyView>?
+    private let fillLayer = CALayer()
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) { open() }
-    /// Opens the menu below the button, or above it when it fits better there, so macOS doesn't clip it with a scroll
-    /// arrow. Kept on screen sideways.
+    override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
+
+    func show(_ glyph: AnyView?) {
+        guard let glyph else { host?.removeFromSuperview(); host = nil; return }
+        wantsLayer = true
+        if let host { host.rootView = glyph; return }
+        let made = NSHostingView(rootView: glyph)
+        made.sizingOptions = []
+        made.wantsLayer = true
+        made.frame = bounds
+        made.autoresizingMask = [.width, .height]
+        fillLayer.backgroundColor = CGColor(srgbRed: T.activeFill.r, green: T.activeFill.g, blue: T.activeFill.b, alpha: T.activeFill.a)
+        fillLayer.opacity = 0
+        layer?.addSublayer(fillLayer)
+        addSubview(made)
+        host = made
+    }
+
+    override func layout() {
+        super.layout()
+        host?.frame = bounds
+        guard let fill else { return }
+        fillLayer.frame = CGRect(x: bounds.midX - fill / 2, y: bounds.midY - fill / 2, width: fill, height: fill)
+        fillLayer.cornerRadius = fill / 2
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if press { playPress() }
+        open()
+    }
+
+    /// squash, past its size, and back; the fill shows through it. run by the window server, so it plays over the open menu.
+    private func playPress() {
+        guard let layer = host?.layer else { return }
+        let total = T.pressIn + 2 * T.pressOut
+        let times = [0, T.pressIn / total, (T.pressIn + T.pressOut) / total, 1].map { NSNumber(value: $0) }
+        func around(_ scale: CGFloat) -> NSValue {
+            let mid = CGPoint(x: bounds.midX, y: bounds.midY)
+            var t = CATransform3DMakeTranslation(mid.x, mid.y, 0)
+            t = CATransform3DScale(t, scale, scale, 1)
+            return NSValue(caTransform3D: CATransform3DTranslate(t, -mid.x, -mid.y, 0))
+        }
+        let squash = CAKeyframeAnimation(keyPath: "transform")
+        squash.values = [1, T.pressSquash, T.pressOver, 1].map(around)
+        squash.keyTimes = times
+        squash.timingFunctions = [.init(name: .easeOut), .init(name: .easeInEaseOut), .init(name: .easeInEaseOut)]
+        squash.duration = total
+        layer.add(squash, forKey: "press")
+        guard fill != nil else { return }
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values = [0, 1, 1, 0]
+        fade.duration = total + T.activeFillFade
+        fade.keyTimes = [0, NSNumber(value: T.pressIn / fade.duration), NSNumber(value: total / fade.duration), 1]
+        fillLayer.add(fade, forKey: "fill")
+    }
+
+    /// below the button, or above when it fits only or better there, so macOS doesn't clip it with a scroll arrow.
     func open() {
+        opened?()
         let items = entries()
         guard !items.isEmpty else { return }
         let menu = makeMenu(items)
         MenuOpeningView.lastOpened = menu
+        let follower = live ? LiveMenu(menu, entries: entries, shown: items) : nil
+        follower?.follow()
+        // returns when the menu closes.
         menu.popUp(positioning: nil, at: placement(for: menu.size).point, in: self)
+        follower?.close()
     }
 
-    /// Where a menu of `size` opens: its top-left corner in this view's coordinates, and whether that's above the button.
+    /// its top-left corner in this view's coordinates, and whether that's above the button.
     func placement(for size: NSSize) -> (point: NSPoint, above: Bool) {
         let gap: CGFloat = 4
         var left = trailing ? bounds.maxX - size.width : 0
@@ -375,42 +829,55 @@ final class MenuOpeningView: NSView {
         return (NSPoint(x: left, y: top), above)
     }
 
-    /// The menu this view opened last, for checks.
+    /// for checks.
     nonisolated(unsafe) static weak var lastOpened: NSMenu?
 }
 
-/// An icon button that opens a menu.
 struct MenuIconButton: View {
     let symbol: String
     let label: String
     var size: CGFloat = T.px(17)
     var width: CGFloat = T.iconW
-    var height: CGFloat = T.iconH
+    var height: CGFloat = T.iconButtonH
     var tint: Color? = nil
-    /// Set when nothing in the menu can be used yet: the button dims like a disabled one and says why.
+    /// the button dims like a disabled one and says why.
     var disabledReason: String? = nil
+    /// see `MenuHitArea`.
+    var live = false
+    var opened: (() -> Void)? = nil
     let entries: () -> [MenuEntry]
     @State private var hovering = false
     @Environment(\.isSnapshot) private var isSnapshot
+    @Environment(\.springPress) private var spring
+    @Environment(\.activeFills) private var activeFills
 
     var body: some View {
         let disabled = disabledReason != nil
-        Image(systemName: symbol)
+        let glyph = Image(systemName: symbol)
             .font(.system(size: size))
             .foregroundStyle(tint.map { AnyShapeStyle($0) } ?? AnyShapeStyle(.foreground))
             .frame(width: width, height: height)
             .modifier(HoverBrighten(on: !disabled && (hovering || HoverDebug.forced(label))))
-            .opacity(disabled ? 0.3 : (hovering ? 1 : 0.88))
-            .overlay { if !isSnapshot && !disabled { MenuHitArea(entries: entries) } }
-            .contentShape(Capsule())
-            .onHover { hovering = $0 }
-            .help(disabledReason.map { "\(label): \($0)" } ?? label)
-            .accessibilityLabel(label)
-            .accessibilityAddTraits(.isButton)
+        Group {
+            if isSnapshot || disabled {
+                glyph
+            } else if spring && !Motion.isReduced {
+                // the glyph lives in the hit area's own layer, so its press animates while the menu tracks.
+                MenuHitArea(live: live, opened: opened, entries: entries, glyph: AnyView(glyph), press: true, fill: activeFills ? size * T.activeFillSize : nil)
+                    .frame(width: width, height: height)
+            } else {
+                glyph.overlay { MenuHitArea(live: live, opened: opened, entries: entries) }
+            }
+        }
+        .opacity(disabled ? 0.3 : (hovering || spring ? 1 : T.iconRest))
+        .contentShape(Capsule())
+        .onHover { hovering = $0 }
+        .help(disabledReason.map { "\(label): \($0)" } ?? label)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(.isButton)
     }
 }
 
-/// A text pill that opens a menu, for the Search page's scope picker.
 struct MenuTextButton: View {
     let title: String
     let entries: () -> [MenuEntry]
@@ -423,7 +890,7 @@ struct MenuTextButton: View {
             Image(systemName: "chevron.up.chevron.down").font(.system(size: T.px(11), weight: .bold))
         }
         .padding(.horizontal, T.px(12))
-        .frame(height: T.iconH)
+        .frame(height: T.iconButtonH)
         .background(HoverFillBackground(on: hovering || HoverDebug.forced(title)))
         .contentShape(Capsule())
         .overlay { if !isSnapshot { MenuHitArea(entries: entries) } }
@@ -456,12 +923,12 @@ final class MenuSwitchRow: NSView {
             addSubview(view)
         }
         NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: T.menuContentInset),
             icon.centerYAnchor.constraint(equalTo: centerYAnchor),
             label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
             toggle.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 18),
-            toggle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            toggle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -T.menuContentInset),
             toggle.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
         setAccessibilityElement(false)

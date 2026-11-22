@@ -8,31 +8,32 @@ struct PageContext {
     /// How far horizontal rows extend under the glass sidebar.
     var shelfUnder: CGFloat = 0
     var dockUnder: CGFloat = 0
+    /// how far the side player is in, 0 to 1, as it slides.
+    var dockShown: CGFloat = 0
     var hasBar = false
     var sidebarOpen = true
-    /// The visible page width. Follows a dock drag live.
     var pageWidth: CGFloat = 0
     /// The page width ignoring a dock drag in progress. Grids reflow from this, so they settle when the drag ends.
     var layoutWidth: CGFloat = 0
     var windowHeight: CGFloat = 0
+    /// when the page was opened, so sections arriving after its entrance fade in (`LandSection`).
+    var pageSince = Date.distantPast
     /// The page's side margin: `T.gutter`, or `T.splitGutter` for the page beside the split list.
     var gutter: CGFloat = T.gutter
-    /// `T.splitEnd` beside the split list.
     var end: CGFloat = 0
     var toggleSidebar: () -> Void = {}
 
     var cssWidth: CGFloat { pageWidth / T.scale }
     var tableLeading: CGFloat { sidebarUnder + gutter - T.gutter }
     var tableTrailing: CGFloat { gutter - T.gutter + end + dockUnder }
-    var shelfFade: CGFloat { dockUnder > 0 ? T.shelfFade : 0 }
-    var shelfGap: CGFloat { dockUnder > 0 ? T.shelfGap : 0 }
+    var shelfFade: CGFloat { T.shelfFade * dockShown }
+    var shelfGap: CGFloat { T.shelfGap * dockShown }
 }
 
 extension EnvironmentValues {
     @Entry var pageContext = PageContext()
 }
 
-/// The vertical padding every list page shares.
 enum PagePadding {
     static func bottom(hasBar: Bool) -> CGFloat { T.px(48) + (hasBar ? T.barH + T.windowInset + T.px(24) : 0) }
     static var top: CGFloat { T.topbarH + T.contentTop }
@@ -49,9 +50,14 @@ struct PageScroll<Content: View>: View {
     @Environment(\.isSnapshot) private var isSnapshot
 
     var body: some View {
-        // The top bar floats over this in `PageFrame`, and the content clears it with padding, not a content inset.
-        // NSScrollView keeps every point of its inset for itself, so cards under the bar would take no clicks or hover.
-        let inner = VStack(alignment: .leading, spacing: T.sectionGap) { content }
+        // padding, not a content inset: NSScrollView keeps its inset for itself, so content under the top bar took no clicks.
+        let inner = VStack(alignment: .leading, spacing: T.sectionGap) {
+            Group(subviews: content) { sections in
+                ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
+                    section.modifier(LandSection(index: index, pageSince: ctx.pageSince))
+                }
+            }
+        }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, top ?? T.topbarH + T.contentTop)
             .padding(.bottom, PagePadding.bottom(hasBar: ctx.hasBar))
@@ -260,8 +266,7 @@ struct SectionTitle: View {
     }
 }
 
-/// A titled, horizontally scrolling row of cards. Arrows show on hover when there is more that way.
-/// Rows run under the sidebar and stop just before the dock, fading out.
+/// A titled, horizontally scrolling row of cards that runs under the sidebar and fades out before the dock.
 struct Shelf<Content: View>: View {
     let title: String
     var action: (() -> Void)? = nil
@@ -278,11 +283,8 @@ struct Shelf<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: T.shelfHeadGap) {
             HStack(alignment: .center, spacing: T.shelfHeadGap) {
-                VStack(alignment: .leading, spacing: T.px(2)) {
-                    SectionTitle(title: title, action: action)
-                    if let note { Text(note).font(.navia(T.textSM)).foregroundStyle(T.t2.color) }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                SectionHeading(title: title, note: note, action: action)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 if let more { ActionButton(title: more.title, small: true, action: more.action) }
             }
             .padding(.leading, ctx.gutter)
@@ -294,33 +296,42 @@ struct Shelf<Content: View>: View {
     }
 }
 
-/// The button at a `Shelf` heading's right.
+struct SectionHeading: View {
+    let title: String
+    var note: String? = nil
+    var action: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: T.px(2)) {
+            SectionTitle(title: title, action: action)
+            if let note, !note.isEmpty { Text(note).font(.navia(T.textSM)).foregroundStyle(T.t2.color) }
+        }
+    }
+}
+
+/// [`Shelf`]'s heading button.
 struct ShelfMore {
     let title: String
     let action: () -> Void
 }
 
-private struct TrailingFade: ViewModifier {
+/// a mask, opaque throughout at 0. it stays in place at 0, since adding or dropping a mask rebuilds the whole row.
+private struct TrailingFade: View {
     let fade: CGFloat
     let gap: CGFloat
 
-    func body(content: Content) -> some View {
-        if fade <= 0 { content } else {
-            content.mask {
-                GeometryReader { geo in
-                    let w = max(1, geo.size.width)
-                    LinearGradient(stops: [.init(color: .black, location: max(0, 1 - (fade + gap) / w)),
-                                           .init(color: .black.opacity(0.62), location: max(0, 1 - (fade * 0.62 + gap) / w)),
-                                           .init(color: .black.opacity(0.22), location: max(0, 1 - (fade * 0.28 + gap) / w)),
-                                           .init(color: .clear, location: max(0, 1 - gap / w))],
-                                   startPoint: .leading, endPoint: .trailing)
-                }
-            }
+    var body: some View {
+        GeometryReader { geo in
+            let w = max(1, geo.size.width)
+            LinearGradient(stops: [.init(color: .black, location: max(0, 1 - (fade + gap) / w)),
+                                   .init(color: .black.opacity(0.62), location: max(0, 1 - (fade * 0.62 + gap) / w)),
+                                   .init(color: .black.opacity(0.22), location: max(0, 1 - (fade * 0.28 + gap) / w)),
+                                   .init(color: .clear, location: max(0, 1 - gap / w))],
+                           startPoint: .leading, endPoint: .trailing)
         }
     }
 }
 
-/// The horizontal scroller shared by shelves and the dock's Featured Artists row.
 struct HScrollRow<Content: View>: View {
     var leading: CGFloat
     var trailing: CGFloat
@@ -356,8 +367,8 @@ struct HScrollRow<Content: View>: View {
             .padding(.leading, leading)
             .padding(.trailing, trailing)
         if isSnapshot {
-            // A fixed width, or the row's natural width would widen the whole page in an offscreen render.
-            row.frame(width: max(1, ctx.pageWidth + ctx.shelfUnder), alignment: .leading).clipped().modifier(TrailingFade(fade: trailingFade, gap: trailingGap))
+            // A fixed width: unconstrained, the row's natural width would widen the whole page in the offscreen render.
+            row.frame(width: max(1, ctx.pageWidth + ctx.shelfUnder), alignment: .leading).clipped().mask(TrailingFade(fade: trailingFade, gap: trailingGap))
         } else {
             ScrollView(.horizontal) { row }
                 .scrollIndicators(.never)
@@ -365,8 +376,10 @@ struct HScrollRow<Content: View>: View {
                 .onScrollGeometryChange(for: RowGeometry.self) { g in
                     RowGeometry(offset: g.contentOffset.x, content: g.contentSize.width, container: g.containerSize.width)
                 } action: { _, new in geo = new }
-                .mask { if edgeFade > 0 { edgeMask } else { Rectangle() } }
-                .modifier(TrailingFade(fade: trailingFade, gap: trailingGap))
+                .mask {
+                    Group { if edgeFade > 0 { edgeMask } else { Rectangle() } }
+                        .mask(TrailingFade(fade: trailingFade, gap: trailingGap))
+                }
                 .overlay(alignment: .topLeading) { if geo.canLeft && (hovering || HoverDebug.forced("ShelfArrows")) { arrow("chevron.left", -1).padding(.leading, arrowLeading ?? leading - T.controlH / 2 - T.px(9)).padding(.top, arrowInset) } }
                 .overlay(alignment: .topTrailing) { if geo.canRight && (hovering || HoverDebug.forced("ShelfArrows")) { arrow("chevron.right", 1).padding(.trailing, T.px(10) + trailingGap).padding(.top, arrowInset) } }
                 .onHover { hovering = $0 }
@@ -399,48 +412,68 @@ struct HScrollRow<Content: View>: View {
     }
 
     private func arrow(_ symbol: String, _ direction: CGFloat) -> some View {
-        Button {
+        RoundArrowButton(symbol: symbol, label: direction < 0 ? L("Scroll left") : L("Scroll right"), key: "ShelfArrow") {
             let target = min(max(0, geo.offset + direction * max(200, geo.container * 0.85)), max(0, geo.content - geo.container))
             withAnimation(T.easeOut(T.shelfScroll)) { position.scrollTo(x: target) }
-        } label: {
-            Image(systemName: symbol).font(.system(size: T.px(15), weight: .bold))
-                .frame(width: T.controlH, height: T.controlH).contentShape(Circle())
         }
-        .buttonStyle(HoverFillStyle(key: "ShelfArrow"))
-        .glassPill()
     }
 }
 
-/// A grid laid out as lazily built rows, so a library of any size only creates what's on screen.
+/// the round glass arrow at a scrolling row's edge: a shelf's, the cover row's.
+struct RoundArrowButton: View {
+    let symbol: String
+    let label: String
+    let key: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.system(size: T.px(15), weight: .bold))
+                .frame(width: T.controlH, height: T.controlH).contentShape(Circle())
+        }
+        .buttonStyle(HoverFillStyle(key: key))
+        .glassPill()
+        .help(label)
+        .accessibilityLabel(label)
+    }
+}
+
+/// columns of at least `cell` and the width each stretches to (GPUI `grid_fit`).
+func gridFit(width: CGFloat, cell: CGFloat, gap: CGFloat) -> (columns: Int, width: CGFloat) {
+    let columns = max(1, Int((width + gap) / (cell + gap)))
+    return (columns, (width - gap * CGFloat(columns - 1)) / CGFloat(columns))
+}
+
+/// lazily built rows, so a library of any size only creates what's on screen; `cell` gets the index and card width.
 struct LazyCardGrid<Cell: View>: View {
     let count: Int
     var cardWidth: CGFloat = T.gridCard
     var rowSpacing: CGFloat = T.gridRowGap
     var gutter: CGFloat = T.gutter
-    @ViewBuilder let cell: (Int) -> Cell
+    @ViewBuilder let cell: (Int, CGFloat) -> Cell
     @Environment(\.pageContext) private var ctx
     @Environment(\.isSnapshot) private var isSnapshot
 
     var body: some View {
         let usable = max(cardWidth, (ctx.layoutWidth > 0 ? ctx.layoutWidth : ctx.pageWidth) - 2 * gutter)
-        let columns = max(1, Int((usable + T.cardGap) / (cardWidth + T.cardGap)))
-        let rows = (count + columns - 1) / columns
+        let fit = gridFit(width: usable, cell: cardWidth, gap: T.cardGap)
+        let rows = (count + fit.columns - 1) / fit.columns
         Group {
             if isSnapshot {
-                VStack(alignment: .leading, spacing: rowSpacing) { rowsView(0..<min(rows, 12), columns: columns) }
+                VStack(alignment: .leading, spacing: rowSpacing) { rowsView(0..<min(rows, 12), columns: fit.columns, width: fit.width) }
             } else {
-                LazyVStack(alignment: .leading, spacing: rowSpacing) { rowsView(0..<rows, columns: columns) }
+                LazyVStack(alignment: .leading, spacing: rowSpacing) { rowsView(0..<rows, columns: fit.columns, width: fit.width) }
             }
         }
         .padding(.leading, gutter)
         .padding(.trailing, gutter)
     }
 
-    private func rowsView(_ range: Range<Int>, columns: Int) -> some View {
+    private func rowsView(_ range: Range<Int>, columns: Int, width: CGFloat) -> some View {
         ForEach(range, id: \.self) { row in
             HStack(alignment: .top, spacing: T.cardGap) {
                 ForEach(row * columns..<min(row * columns + columns, count), id: \.self) { index in
-                    cell(index)
+                    cell(index, width).frame(width: width, alignment: .topLeading)
                 }
             }
         }
@@ -492,7 +525,7 @@ struct LibraryEmptyState: View {
         case .opening: Color.clear.frame(height: T.px(240))
         case .noServer: EmptyStateView(symbol: "music.note.list", title: L("No server connected"),
                                        hint: L("Navia plays music from a Navidrome server. Sign in from Settings."))
-        case .syncing: EmptyStateView(symbol: "music.note.list", title: L("Syncing your library"), hint: L("Music shows up here as soon as it arrives."),
+        case .syncing: EmptyStateView(symbol: "music.note.list", title: L("Syncing library"), hint: L("Music shows up here as soon as it arrives."),
                                       accessory: AnyView(SyncPageMeter(library: library)))
         case .unreachable: EmptyStateView(symbol: "exclamationmark.triangle.fill", title: L("Can't reach the server"), hint: L("Check the address and your connection. The music shows up once Navia can connect."))
         case .syncFailed: EmptyStateView(symbol: "exclamationmark.triangle.fill", title: L("Couldn't finish syncing"), hint: L("Part of your library may be missing. Navia will try again."))
