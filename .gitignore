@@ -13,3 +13,4 @@ apps/navia-apple/NaviaCoreKit/.swiftpm/
 /vendor/gpui/zed/
 /vendor/gpui/wgpu/
 /vendor/gpui/*.part/
+__pycache__/
