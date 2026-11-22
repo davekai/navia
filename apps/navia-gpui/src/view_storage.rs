@@ -11,7 +11,7 @@ use navia_core::songcache::LIMIT_CHOICES;
 
 use crate::focus::FocusStop;
 use crate::i18n::{tr, trf, trn};
-use crate::shell::{Layout, Route, Shell};
+use crate::shell::{Route, Shell};
 use crate::theme::size::*;
 use crate::ui_controls::SelectOption;
 use crate::view_downloads::format_size as format_bytes;
@@ -25,9 +25,9 @@ fn format_size(bytes: u64) -> String {
 pub fn limit_label(bytes: u64) -> String {
     if bytes == 0 { tr("Off").to_string() } else { trf("{size} GB", &[("size", &crate::i18n::fmt_int((bytes / navia_core::songcache::GB) as i64))]) }
 }
-use crate::view_settings::{RowPos, section_title, settings_row};
+use crate::view_settings::{ClickHandler, SettingRow, settings_card};
 
-/// What Navia keeps on this device, measured off the UI thread.
+/// measured off the UI thread.
 #[derive(Clone, Default)]
 pub struct StorageInfo {
     pub songs: u64,
@@ -114,7 +114,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Clears cached songs, artwork and lyrics. Downloads and the library stay.
+    /// downloads and the library stay.
     pub fn clear_caches(&mut self, cx: &mut Context<Self>) {
         let Some(lib) = self.core.as_ref().map(|c| c.lib.clone()) else { return };
         cx.spawn(async move |this, cx| {
@@ -134,9 +134,8 @@ impl Shell {
         .detach();
     }
 
-    pub fn render_settings_storage(&mut self, layout: &Layout, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_settings_storage(&mut self, _main_tokens: f32, _window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let t = self.theme;
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         if self.core.is_some() && self.storage.measured.is_none_or(|at| at.elapsed() > MEASURE_EVERY) {
             self.refresh_storage(cx);
         }
@@ -159,22 +158,12 @@ impl Shell {
                 (value(trf("{used} of {limit}", &[("used", &format_size(i.songs)), ("limit", &limit_label(i.limit))])), hint.into())
             }
         };
-        // Opens the Cached Songs list.
-        let cached = crate::view_settings::settings_link_row(&t, "storage-cached", tr("Cached songs"), used_hint, Some(used), RowPos::Middle, main_tokens)
-            .when(self.core.is_some(), |d| d.stop(&t).on_click(cx.listener(|this, _, _, cx| this.navigate(Route::CachedSongs, cx))));
+        let open_cached: Option<ClickHandler> = self.core.is_some().then(|| Box::new(cx.listener(|this, _, _, cx| this.navigate(Route::CachedSongs, cx))) as ClickHandler);
+        let cached = SettingRow::link(&t, "storage-cached", tr("Cached songs"), used_hint, Some(used), open_cached);
         let size_of = |f: fn(&StorageInfo) -> u64| value(info.as_ref().map(|i| format_size(f(i))).unwrap_or_default());
         let count = self.downloads_count();
-        let downloads = crate::view_settings::settings_link_row(
-            &t,
-            "storage-downloads",
-            tr("Downloads"),
-            trn("{count} song on this device", "{count} songs on this device", count).into(),
-            Some(size_of(|i| i.downloads)),
-            RowPos::Middle,
-            main_tokens,
-        )
-        .stop(&t)
-        .on_click(cx.listener(|this, _, _, cx| this.navigate(Route::Downloads, cx)));
+        let open_downloads: ClickHandler = Box::new(cx.listener(|this, _, _, cx| this.navigate(Route::Downloads, cx)));
+        let downloads = SettingRow::link(&t, "storage-downloads", tr("Downloads"), trn("{count} song on this device", "{count} songs on this device", count).into(), Some(size_of(|i| i.downloads)), Some(open_downloads));
         let clear = div()
             .id("clear-cache")
             .flex()
@@ -195,16 +184,14 @@ impl Shell {
             .child(tr("Clear Cache"))
             .when(self.core.is_none(), |d| d.opacity(0.4))
             .into_any_element();
-        let col = div()
-            .flex()
-            .flex_col()
-            .child(section_title(&t, tr("Storage")))
-            .child(settings_row(&t, tr("Song cache"), Some(cache_hint), picker, RowPos::First, main_tokens))
-            .child(cached)
-            .child(settings_row(&t, tr("Artwork"), None, size_of(|i| i.artwork), RowPos::Middle, main_tokens))
-            .child(settings_row(&t, tr("Lyrics"), None, size_of(|i| i.lyrics), RowPos::Middle, main_tokens))
-            .child(downloads)
-            .child(settings_row(&t, tr("Clear cache"), Some(tr("Removes cached songs, artwork and lyrics. Downloads and your library stay.").into()), clear, RowPos::Last, main_tokens));
-        div().w(layout.main_width).child(div().w_full().max_w(t.s(780.0)).mx_auto().px(t.s(GUTTER)).child(col)).into_any_element()
+        let rows = vec![
+            SettingRow::new(&t, tr("Song cache"), Some(cache_hint), false, Some(picker)),
+            cached,
+            SettingRow::new(&t, tr("Artwork"), None, false, Some(size_of(|i| i.artwork))),
+            SettingRow::new(&t, tr("Lyrics"), None, false, Some(size_of(|i| i.lyrics))),
+            downloads,
+            SettingRow::new(&t, tr("Clear cache"), Some(tr("Removes cached songs, artwork and lyrics. Downloads and your library stay.").into()), false, Some(clear)),
+        ];
+        settings_card(&t, &self.settings_words(), tr("Storage"), rows)
     }
 }

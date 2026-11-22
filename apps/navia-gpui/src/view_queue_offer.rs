@@ -10,13 +10,13 @@ use crate::shell::Shell;
 use crate::theme::size::*;
 use crate::ui::{hover_track, icon, ink, ink_button};
 
-/// What the chip's label does when clicked, and its end control.
+/// its end control, and what the label does when clicked.
 enum ChipEnd {
     /// A text button, like Stop.
     Text(SharedString),
-    /// An X to dismiss.
-    Close,
-    /// Nothing to press.
+    /// dismiss, not now: the label is its tip.
+    Close(&'static str),
+    /// nothing to press.
     None,
     /// Several text buttons, each with its own action. `on_end` isn't used.
     Actions(Vec<(SharedString, ChipAction)>),
@@ -36,9 +36,11 @@ impl Shell {
             };
             return Some(self.player_chip("airplay-lost", above_bar, "nv-airplay", label.into(), Some(receiver.name.into()), false, ChipEnd::Actions(ends), rest, hover, cx, |_, _| {}));
         }
-        if let Some((user, waiting, held)) = self.listen.following.as_ref().map(|f| (f.followed.user.clone(), f.waiting, f.held)) {
+        if let Some((user, waiting, held, sending)) = self.listen.following.as_ref().map(|f| (f.followed.user.clone(), f.waiting, f.held, f.sending)) {
             let label = if waiting {
                 trf("Waiting for a song you have from {user}", &[("user", &user)])
+            } else if sending {
+                trf("Sending to {user}…", &[("user", &user)])
             } else if held {
                 trf("Listening along with {user} · paused", &[("user", &user)])
             } else {
@@ -54,7 +56,7 @@ impl Shell {
         }
         if let Some(user) = self.listen.ended.clone() {
             let label = trf("{user} stopped listening", &[("user", &user)]);
-            return Some(self.player_chip("listen-ended", above_bar, "headphones-regular", label.into(), None, false, ChipEnd::Close, rest, hover, cx, |this, cx| this.dismiss_listen_ended(cx)));
+            return Some(self.player_chip("listen-ended", above_bar, "headphones-regular", label.into(), None, false, ChipEnd::Close("Dismiss"), rest, hover, cx, |this, cx| this.dismiss_listen_ended(cx)));
         }
         // On the host, show who's listening along while they're allowed to control playback.
         if self.listeners_control() && !self.listen.listeners.is_empty() {
@@ -66,7 +68,7 @@ impl Shell {
         }
         let device = self.core.as_ref()?.queue_offer.as_ref()?.device.clone();
         let label = trf("Continue from {device}?", &[("device", &device)]);
-        let offer = self.player_chip("queue-offer", above_bar, "device-mobile-speaker-regular", label.into(), None, true, ChipEnd::Close, rest, hover, cx, |this, cx| this.dismiss_queue_offer(cx));
+        let offer = self.player_chip("queue-offer", above_bar, "device-mobile-speaker-regular", label.into(), None, true, ChipEnd::Close("Not now"), rest, hover, cx, |this, cx| this.dismiss_queue_offer(cx));
         Some(offer)
     }
 
@@ -124,8 +126,8 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| on_end(this, cx)))
                     .into_any_element()
             }
-            ChipEnd::Close => ink_button(&t, end_key, "x-bold", 14.0, rest, hover).w(t.s(24.0)).h(t.s(24.0)).on_click(cx.listener(move |this, _, _, cx| on_end(this, cx))).into_any_element(),
-            // Same height as the others, without a button.
+            ChipEnd::Close(label) => ink_button(&t, end_key, tr(label), "x-bold", 14.0, rest, hover).w(t.s(24.0)).h(t.s(24.0)).on_click(cx.listener(move |this, _, _, cx| on_end(this, cx))).into_any_element(),
+            // The same height as the others, without a button.
             ChipEnd::None => div().flex_none().w(t.s(6.0)).h(t.s(24.0)).into_any_element(),
             ChipEnd::Actions(actions) => div()
                 .flex()
@@ -167,7 +169,7 @@ impl Shell {
             .when_some(tip, |d, tip| d.tooltip(crate::ui::tip(&t, tip)))
             .map(|d| {
                 if above_bar {
-                    crate::ui::glass_layers(d, &t, t.s(14.0), BAR_BLUR, BAR_SATURATION, t.bar_frost_fill(), t.bar_fill(), crate::ui::edge_and(crate::ui::shadow_float(&t)))
+                    crate::ui::glass_layers(d, &t, t.s(14.0), BAR_BLUR, BAR_SATURATION, t.bar_glass(), t.bar_fill(), crate::ui::edge_and(crate::ui::shadow_float(&t)))
                 } else {
                     crate::ui::glass_layers(d, &t, t.s(14.0), GLASS_BLUR, GLASS_SATURATION, t.switcher_glass(), t.switcher_glass(), vec![crate::ui::inset_ring(t.switcher_edge())])
                 }

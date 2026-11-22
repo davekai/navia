@@ -1,0 +1,88 @@
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -60,6 +60,8 @@
+     pub(crate) current_rounded_clip: u32,
+     /// the transform primitives inserted now are drawn with (`Window::with_paint_transform`).
+     pub(crate) transform: Option<PaintTransform>,
++    /// quads and shadows inserted now keep fractional bounds (`Window::with_exact_paint`).
++    pub(crate) exact: bool,
+     /// filter groups, in draw order once `finish` has run. each is drawn after every primitive
+     /// of its order: its own scene goes to an offscreen target that is filtered and composited.
+     pub filter_groups: Vec<FilterGroup>,
+@@ -259,6 +261,7 @@
+         self.rounded_clips.clear();
+         self.current_rounded_clip = 0;
+         self.transform = None;
++        self.exact = false;
+         self.filter_groups.clear();
+         self.open_filter_groups.clear();
+     }
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -3596,6 +3596,9 @@
+     #[inline]
+     fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
+         let scale_factor = self.scale_factor();
++        if self.next_frame.scene.exact {
++            return bounds.scale(scale_factor);
++        }
+         let left = round_to_device_pixel(bounds.left().0, scale_factor);
+         let top = round_to_device_pixel(bounds.top().0, scale_factor);
+         let right = round_to_device_pixel(bounds.right().0, scale_factor).max(left);
+@@ -4504,6 +4507,20 @@
+         }
+     }
+ 
++    /// paints the quads and shadows `f` draws at the fractional bounds they are given rather than
++    /// on whole device pixels, for shapes whose size moves smoothly, such as a bar growing.
++    pub fn with_exact_paint<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
++        let previous = std::mem::replace(&mut self.next_frame.scene.exact, true);
++        let result = f(self);
++        self.next_frame.scene.exact = previous;
++        result
++    }
++
++    /// a shadow's bounds: on device pixels that cover it, or as given inside `with_exact_paint`.
++    fn shadow_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
++        if self.next_frame.scene.exact { bounds.scale(self.scale_factor()) } else { self.cover_bounds(bounds) }
++    }
++
+     /// draws what `f` paints scaled by `scale` around `origin`, then moved by `offset`, without
+     /// changing layout or hit testing: a press shrink, a cover easing to a size, a panel sliding in.
+     /// masks entered before stay where they are; masks inside move with the content. nested
+@@ -5011,7 +5028,7 @@
+         let scale_factor = self.scale_factor();
+         let content_mask = self.snapped_content_mask();
+         let opacity = self.element_opacity();
+-        let element_bounds = self.cover_bounds(bounds);
++        let element_bounds = self.shadow_bounds(bounds);
+         let element_corner_radii = corner_radii.scale(scale_factor);
+         for shadow in shadows {
+             if shadow.inset {
+@@ -5021,7 +5038,7 @@
+             self.next_frame.scene.insert_primitive(Shadow {
+                 order: 0,
+                 blur_radius: shadow.blur_radius.scale(scale_factor),
+-                bounds: self.cover_bounds(shadow_bounds),
++                bounds: self.shadow_bounds(shadow_bounds),
+                 content_mask,
+                 corner_radii: corner_radii.scale(scale_factor),
+                 color: shadow.color.opacity(opacity),
+@@ -5047,7 +5064,7 @@
+         let scale_factor = self.scale_factor();
+         let content_mask = self.snapped_content_mask();
+         let opacity = self.element_opacity();
+-        let element_bounds = self.cover_bounds(bounds);
++        let element_bounds = self.shadow_bounds(bounds);
+         let element_corner_radii = corner_radii.scale(scale_factor);
+         for shadow in shadows {
+             if !shadow.inset {
+@@ -5066,7 +5083,7 @@
+             self.next_frame.scene.insert_primitive(Shadow {
+                 order: 0,
+                 blur_radius: shadow.blur_radius.scale(scale_factor),
+-                bounds: self.cover_bounds(hole),
++                bounds: self.shadow_bounds(hole),
+                 content_mask,
+                 corner_radii: hole_corner_radii.scale(scale_factor),
+                 color: shadow.color.opacity(opacity),

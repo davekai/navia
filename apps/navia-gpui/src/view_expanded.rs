@@ -2,7 +2,7 @@
 
 use gpui::prelude::*;
 use crate::focus::FocusStop;
-use gpui::{AnyElement, BoxShadow, Context, div, point, px};
+use gpui::{AnyElement, Context, div, px};
 
 use crate::color::{glow_scrim_alpha, player_fg, player_fg_dim};
 use crate::persist::DockView;
@@ -32,21 +32,28 @@ impl Shell {
         let gap = (vw * 0.12).clamp(36.0, 193.0);
         let view = self.shown_view();
         let solo = view == DockView::Artwork;
+        if solo {
+            crate::ui::swap("expanded-view", &None::<DockView>, crate::theme::motion::VIEW_FADE);
+        }
 
         let col_w = if solo { 420.0 } else { 412.0 };
         let art_px = (f32::from(t.s(420.0)) * layout.scale).round() as u32;
         let art = self.thumb_faded(&song.album_id, art_px);
-        // Square by its own size. GPUI's img gives an auto height the image's pixel height, which overrides
-        // `aspect_ratio` and makes the art tall at display scales above 1.
-        let art_el: AnyElement = match art {
-            Some((image, fade)) => crate::ui::image(image)
+        // square by its own size: GPUI's img gives an auto height the image's pixel height, overriding `aspect_ratio`.
+        let moving = self.moving_cover(&song.album_id, art_px, "full", Some(t.s(R_LG)), cx);
+        let art_el: AnyElement = match (moving, art) {
+            (Some(view), _) => div().size(t.s(col_w)).rounded(t.s(R_LG)).shadow(vec![crate::ui::shadow_player_art(&t)]).child(view).into_any_element(),
+            (None, Some((image, fade))) => crate::ui::image(image)
                 .size(t.s(col_w))
                 .rounded(t.s(R_LG))
                 .opacity(fade)
                 .shadow(vec![crate::ui::shadow_player_art(&t)])
                 .into_any_element(),
-            None => div().size(t.s(col_w)).rounded(t.s(R_LG)).bg(t.on_art_placeholder()).into_any_element(),
+            (None, None) => div().size(t.s(col_w)).rounded(t.s(R_LG)).bg(t.on_art_placeholder()).into_any_element(),
         };
+        // smaller while paused.
+        let (playing, ticker) = crate::ui::ease_to("expanded-cover", self.player.playing, crate::theme::motion::COVER_PAUSE, crate::theme::motion::LYRIC_EASE);
+        let art_el = div().relative().size(t.s(col_w)).paint_scale(COVER_PAUSED_SCALE + (1.0 - COVER_PAUSED_SCALE) * playing).child(ticker).child(art_el).into_any_element();
         let player_col = div()
             .flex()
             .flex_col()
@@ -60,19 +67,12 @@ impl Shell {
                     .child(bounds_slot(self.expanded_controls.clone(), 1))
                     // A blurred black box past the controls at the sides and below.
                     .when(scrim > 0.0, |d| {
-                        d.child(div().absolute().top(px(0.0)).bottom(t.s(-GLOW_SCRIM_REACH)).left(t.s(-GLOW_SCRIM_REACH)).right(t.s(-GLOW_SCRIM_REACH)).rounded(t.s(GLOW_SCRIM_REACH)).shadow(vec![BoxShadow {
-                            color: gpui::black().opacity(scrim),
-                            offset: point(px(0.0), px(0.0)),
-                            // A shadow's blur radius is about twice CSS blur()'s deviation.
-                            blur_radius: t.s(GLOW_SCRIM_BLUR * 2.0),
-                            spread_radius: px(0.0),
-                            inset: false,
-                        }]))
+                        d.child(crate::ui::blurred_fill(gpui::black().opacity(scrim), t.s(GLOW_SCRIM_REACH), t.s(GLOW_SCRIM_BLUR)).top(px(0.0)).bottom(t.s(-GLOW_SCRIM_REACH)).left(t.s(-GLOW_SCRIM_REACH)).right(t.s(-GLOW_SCRIM_REACH)))
                     })
-                    .child(div().pt(t.s(22.0)).when_some(self.render_player_chip(false, dim, fg, cx), |d, offer| d.child(offer)).child(self.render_meta_row(&song, fg, dim, cx)))
-                    .child(self.render_scrubber(crate::view_dock::ScrubVariant::Stacked, t.player_track(), fg, dim, cx))
-                    .child(self.render_transport(fg, cx))
-                    .child(self.render_volume_row(dim, fg, cx)),
+                    .child(div().pt(t.s(22.0)).when_some(self.render_player_chip(false, dim, fg, cx), |d, offer| d.child(offer)).child(self.render_meta_row(&song, fg, dim, crate::ui::Feel::PLAYER, cx)))
+                    .child(self.render_scrubber(crate::view_dock::ScrubVariant::Stacked, t.player_track(), fg, dim, crate::ui::Feel::PLAYER, cx))
+                    .child(self.render_transport(fg, crate::ui::Feel::PLAYER, cx))
+                    .child(self.render_volume_row(dim, fg, crate::ui::Feel::PLAYER, cx)),
             );
 
         // Wide windows put the player left and lyrics or queue right. The 820px breakpoint is in window pixels. Narrow
@@ -88,11 +88,25 @@ impl Shell {
             let tokens_w = layout.tokens_w;
             // The panel's width, so lyrics wrap at the right measure.
             let panel_tokens = if stacked { tokens_w - 52.0 } else { (tokens_w - side_pad * 2.0 - gap - 412.0).max(240.0) };
-            let top_inset = t.s(if stacked { 0.0 } else { 54.0 });
-            let panel: AnyElement = match view {
-                DockView::Lyrics => self.render_lyrics_panel(true, t.s(panel_tokens), top_inset, layout, cx),
-                _ => self.render_queue_panel(top_inset, layout.scale, cx),
+            let top_inset = px(0.0);
+            let mut panel_of = |this: &mut Self, view: DockView| -> AnyElement {
+                match view {
+                    DockView::Lyrics => this.render_lyrics_panel(true, t.s(panel_tokens), top_inset, layout, cx),
+                    _ => this.render_queue_panel(top_inset, layout.scale, cx),
+                }
             };
+            // coming from the artwork alone the layout changes instead, so there's nothing to cross-fade from.
+            let (swap, swap_ticker) = crate::ui::swap("expanded-view", &Some(view), crate::theme::motion::VIEW_FADE);
+            let (shown, leaving) = match swap.leaving {
+                Some(Some(old)) => (swap.shown, Some(old)),
+                _ => (1.0, None),
+            };
+            let rise = t.s(crate::theme::motion::VIEW_RISE);
+            let mut panel = div().relative().size_full().child(swap_ticker);
+            if let Some(old) = leaving {
+                panel = panel.child(crate::ui::swap_layer(panel_of(self, old), shown, rise, false));
+            }
+            let panel = panel.child(crate::ui::swap_layer(panel_of(self, view), shown, rise, true));
             let area = if stacked {
                 // The switcher heads the panel here, leaving the top-right corner for the account button and Collapse.
                 let switcher = self.render_view_switcher(50.0, fg, cx);
@@ -105,12 +119,12 @@ impl Shell {
                     .child(div().flex().flex_row().justify_center().mb(t.s(10.0)).child(div().occlude().child(switcher)))
                     .child(div().relative().flex_1().min_h(px(0.0)).child(panel))
             } else {
-                div().relative().flex_1().min_w(px(0.0)).h_full().pt(t.s(178.0)).pb(t.s(40.0)).child(div().relative().size_full().child(panel))
+                div().relative().flex_1().min_w(px(0.0)).h_full().pt(t.s(EXPANDED_PANEL_TOP)).pb(t.s(EXPANDED_EDGE)).child(panel)
             };
             layout_row = layout_row.child(area);
         }
 
-        let close = crate::ui::ink_button(&t, "collapse", "nv-collapse", 24.0, t.t_on_art(), t.t_on_art())
+        let close = crate::ui::player_button(&t, "collapse", crate::i18n::tr("Collapse player"), "nv-collapse", 24.0, t.t_on_art(), t.t_on_art(), crate::ui::Feel::PLAYER)
             .occlude()
             .stop(&t).on_click(cx.listener(|this, _, _, cx| {
                 this.expanded = false;
@@ -126,7 +140,7 @@ impl Shell {
             let switcher_inner = self.render_view_switcher(50.0, fg, cx);
             // Over the panel. Its top is 178 tokens down and the switcher sits 26 above that.
             let panel_left = (layout.tokens_w - 412.0 - gap - side_pad * 2.0).max(0.0);
-            div().absolute().top(t.s(152.0)).right(t.s(side_pad)).w(t.s(panel_left)).flex().justify_center().child(div().occlude().child(switcher_inner))
+            div().absolute().top(t.s(24.0)).right(t.s(side_pad)).w(t.s(panel_left)).flex().justify_center().child(div().occlude().child(switcher_inner))
         };
         // Window buttons sit in the desktop's corner, beside Collapse on the right. There's no account button here, but
         // Ctrl+, still opens Settings.

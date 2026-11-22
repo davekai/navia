@@ -1,0 +1,261 @@
+diff -ruN a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -164,8 +164,28 @@
+     pub corner_radii: Corners<ScaledPixels>,
+     /// The enclosing mask, one-based, or 0.
+     pub parent: u32,
+-    /// Keeps the node a whole number of texels.
+-    pub pad: [u32; 3],
++    /// how far in from the right edge the mask fades out to clear, or 0 for a hard edge.
++    pub fade_right: ScaledPixels,
++    /// [`ClipFade::stops`], each a place (low half) and an opacity (high half) as 16-bit unorms.
++    pub fade_stops: [u32; 2],
++}
++
++/// a mask's right edge fading out over `width`: clear at the edge, through `stops`, opaque at
++/// `width` in. each stop is a place in the fade (0 at the clear edge, 1 at the opaque end) and
++/// the opacity there; between them it's linear.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct ClipFade {
++    /// how far in from the right edge the fade reaches.
++    pub width: Pixels,
++    /// two points on the way from clear to opaque, in order.
++    pub stops: [(f32, f32); 2],
++}
++
++impl ClipFade {
++    fn packed_stops(&self) -> [u32; 2] {
++        let unorm = |v: f32| (v.clamp(0., 1.) * 65535.).round() as u32;
++        self.stops.map(|(place, opacity)| unorm(place) | unorm(opacity) << 16)
++    }
+ }
+ 
+ #[expect(missing_docs)]
+@@ -188,9 +208,9 @@
+         self.transform = None;
+     }
+ 
+-    /// `clip`, when one of its rounded corners (or its parents') reaches into `bounds`, else 0:
+-    /// a primitive clear of every corner is already cut by its rectangular content mask, and
+-    /// skipping the mask spares its pixels the per-pixel corner test.
++    /// `clip`, when one of its rounded corners or its fade (or its parents') reaches into `bounds`,
++    /// else 0: a primitive clear of them all is already cut by its rectangular content mask, and
++    /// skipping the mask spares its pixels the per-pixel test.
+     fn clip_reaching(&self, bounds: Bounds<ScaledPixels>, clip: u32) -> u32 {
+         let mut index = clip;
+         while index != 0 {
+@@ -200,7 +220,8 @@
+                 w.0 > 0. && !Bounds { origin: point(x, y), size: Size { width: w, height: h } }.intersect(&bounds).is_empty()
+             };
+             let (right, bottom) = (b.right(), b.bottom());
+-            if corner(b.left(), b.top(), r.top_left, r.top_left)
++            if corner(right - node.fade_right, b.top(), node.fade_right, b.size.height)
++                || corner(b.left(), b.top(), r.top_left, r.top_left)
+                 || corner(right - r.top_right, b.top(), r.top_right, r.top_right)
+                 || corner(right - r.bottom_right, bottom - r.bottom_right, r.bottom_right, r.bottom_right)
+                 || corner(b.left(), bottom - r.bottom_left, r.bottom_left, r.bottom_left)
+@@ -213,12 +234,23 @@
+     }
+ 
+     /// Adds a rounded mask inside the current one and returns its one-based index.
+-    pub fn push_rounded_clip(&mut self, mut bounds: Bounds<ScaledPixels>, mut corner_radii: Corners<ScaledPixels>, parent: u32) -> u32 {
++    pub fn push_rounded_clip(&mut self, bounds: Bounds<ScaledPixels>, corner_radii: Corners<ScaledPixels>, parent: u32) -> u32 {
++        self.push_clip(RoundedClipNode { bounds, corner_radii, parent, ..Default::default() })
++    }
++
++    /// [`Self::push_rounded_clip`] whose right edge fades out (`fade.width` already scaled).
++    pub fn push_faded_clip(&mut self, bounds: Bounds<ScaledPixels>, corner_radii: Corners<ScaledPixels>, fade: ClipFade, parent: u32) -> u32 {
++        let fade_right = ScaledPixels(f32::from(fade.width));
++        self.push_clip(RoundedClipNode { bounds, corner_radii, parent, fade_right, fade_stops: fade.packed_stops() })
++    }
++
++    fn push_clip(&mut self, mut node: RoundedClipNode) -> u32 {
+         if let Some(transform) = self.transform {
+-            bounds = transform.bounds(bounds);
+-            corner_radii = transform.corners(corner_radii);
++            node.bounds = transform.bounds(node.bounds);
++            node.corner_radii = transform.corners(node.corner_radii);
++            node.fade_right = transform.len(node.fade_right);
+         }
+-        self.rounded_clips.push(RoundedClipNode { bounds, corner_radii, parent, pad: [0; 3] });
++        self.rounded_clips.push(node);
+         self.rounded_clips.len() as u32
+     }
+ 
+@@ -233,7 +265,7 @@
+         }
+         let node = prev.rounded_clips[index as usize - 1];
+         let parent = self.copy_rounded_clip(prev, node.parent, copied);
+-        let new = self.push_rounded_clip(node.bounds, node.corner_radii, parent);
++        let new = self.push_clip(RoundedClipNode { parent, ..node });
+         copied.insert(index, new);
+         new
+     }
+diff -ruN a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -9,7 +9,7 @@
+ use crate::{
+     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
+     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
++    Capslock, ClipFade, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+@@ -1032,6 +1032,8 @@
+ pub(crate) struct RoundedClipRegion {
+     bounds: Bounds<Pixels>,
+     corners: Corners<Pixels>,
++    /// drawing only: the faded part still takes hits.
++    fade: Option<ClipFade>,
+     parent: Option<Arc<RoundedClipRegion>>,
+ }
+ 
+@@ -4558,13 +4560,34 @@
+         if corners == Corners::default() {
+             return self.with_content_mask(Some(ContentMask { bounds }), f);
+         }
++        self.with_clip_region(RoundedClipRegion { bounds, corners, fade: None, parent: None }, f)
++    }
++
++    /// clips what `f` draws to `bounds`, fading out towards the right edge as `fade` says: what's
++    /// under the fade is drawn partly transparent, so whatever is behind shows through. hit tests
++    /// take the whole rect. nested clips intersect.
++    pub fn with_faded_clip<R>(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        fade: ClipFade,
++        f: impl FnOnce(&mut Self) -> R,
++    ) -> R {
++        self.invalidator.debug_assert_paint_or_prepaint();
++        if fade.width <= Pixels::ZERO {
++            return self.with_content_mask(Some(ContentMask { bounds }), f);
++        }
++        self.with_clip_region(RoundedClipRegion { bounds, corners: Corners::default(), fade: Some(fade), parent: None }, f)
++    }
++
++    fn with_clip_region<R>(&mut self, mut region: RoundedClipRegion, f: impl FnOnce(&mut Self) -> R) -> R {
++        let bounds = region.bounds;
+         let previous = self.rounded_clip.take();
+-        self.rounded_clip = Some(Arc::new(RoundedClipRegion { bounds, corners, parent: previous.clone() }));
++        region.parent = previous.clone();
++        let region = Arc::new(region);
++        self.rounded_clip = Some(region.clone());
+         let parent = self.next_frame.scene.current_rounded_clip;
+         if self.invalidator.is_painting() {
+-            let scale_factor = self.scale_factor();
+-            self.next_frame.scene.current_rounded_clip =
+-                self.next_frame.scene.push_rounded_clip(bounds.scale(scale_factor), corners.scale(scale_factor), parent);
++            self.next_frame.scene.current_rounded_clip = self.push_clip_region(&region, parent);
+         }
+         let result = self.with_content_mask(Some(ContentMask { bounds }), f);
+         self.next_frame.scene.current_rounded_clip = parent;
+@@ -4576,13 +4599,24 @@
+     fn install_rounded_clip(&mut self, clip: Option<Arc<RoundedClipRegion>>) {
+         fn insert(window: &mut Window, clip: &RoundedClipRegion) -> u32 {
+             let parent = clip.parent.as_ref().map_or(0, |parent| insert(window, parent));
+-            let scale_factor = window.scale_factor();
+-            window.next_frame.scene.push_rounded_clip(clip.bounds.scale(scale_factor), clip.corners.scale(scale_factor), parent)
++            window.push_clip_region(clip, parent)
+         }
+         self.next_frame.scene.current_rounded_clip = clip.as_ref().map_or(0, |clip| insert(self, clip));
+         self.rounded_clip = clip;
+     }
+ 
++    fn push_clip_region(&mut self, clip: &RoundedClipRegion, parent: u32) -> u32 {
++        let scale_factor = self.scale_factor();
++        let (bounds, corners) = (clip.bounds.scale(scale_factor), clip.corners.scale(scale_factor));
++        match clip.fade {
++            Some(fade) => {
++                let fade = ClipFade { width: Pixels::from(f32::from(fade.width) * scale_factor), ..fade };
++                self.next_frame.scene.push_faded_clip(bounds, corners, fade, parent)
++            }
++            None => self.next_frame.scene.push_rounded_clip(bounds, corners, parent),
++        }
++    }
++
+     /// Updates the global element offset relative to the current offset. This is used to implement
+     /// scrolling. This method should only be called during the prepaint phase of element drawing.
+     pub fn with_element_offset<R>(
+diff -ruN a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -1534,7 +1534,7 @@
+ // --- rounded clips --- //
+ 
+ // `Scene::rounded_clips`, three texels a clip: its bounds, its corner radii, and its parent
+-// (one-based, 0 for none) in the first word of the third.
++// (one-based, 0 for none), right fade width and two packed fade stops in the third.
+ @group(0) @binding(2) var t_rounded_clips: texture_2d<u32>;
+ 
+ fn rounded_clip_texel(index: u32) -> vec4<u32> {
+@@ -1554,11 +1554,25 @@
+         let distance = quad_sdf(position, Bounds(rectangle.xy, rectangle.zw),
+             Corners(radii.x, radii.y, radii.z, radii.w));
+         coverage = min(coverage, saturate(0.5 - distance));
+-        index = rounded_clip_texel(offset + 2u).x;
++        let link = rounded_clip_texel(offset + 2u);
++        let fade = bitcast<f32>(link.y);
++        if (fade > 0.0) {
++            let along = saturate((rectangle.x + rectangle.z - position.x) / fade);
++            coverage *= clip_fade(along, unpack2x16unorm(link.z), unpack2x16unorm(link.w));
++        }
++        index = link.x;
+     }
+     return coverage;
+ }
+ 
++// opacity at `along` (0 at the clear edge, 1 at the opaque end) through stops `a` and `b`
++// (place, opacity), linear between them.
++fn clip_fade(along: f32, a: vec2<f32>, b: vec2<f32>) -> f32 {
++    if (along < a.x) { return a.y * along / max(a.x, 1e-4); }
++    if (along < b.x) { return mix(a.y, b.y, (along - a.x) / max(b.x - a.x, 1e-4)); }
++    return mix(b.y, 1.0, (along - b.x) / max(1.0 - b.x, 1e-4));
++}
++
+ fn rounded_clip_color(color: vec4<f32>, coverage: f32) -> vec4<f32> {
+     if (globals.premultiplied_alpha != 0u) { return color * coverage; }
+     return vec4<f32>(color.rgb, color.a * coverage);
+diff -ruN a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -321,11 +321,25 @@
+     Bounds bounds;
+     Corners corner_radii;
+     uint parent;
+-    uint3 pad;
++    // the right fade width, then two stops as (place, opacity) 16-bit unorm pairs.
++    float fade_right;
++    uint2 fade_stops;
+ };
+ 
+ StructuredBuffer<RoundedClip> rounded_clips: register(t2);
+ 
++float2 unpack_unorm2x16(uint packed) {
++    return float2(packed & 0xffffu, packed >> 16) / 65535.0;
++}
++
++// opacity at `along` (0 at the clear edge, 1 at the opaque end) through stops `a` and `b`
++// (place, opacity), linear between them.
++float clip_fade(float along, float2 a, float2 b) {
++    if (along < a.x) return a.y * along / max(a.x, 1e-4);
++    if (along < b.x) return lerp(a.y, b.y, (along - a.x) / max(b.x - a.x, 1e-4));
++    return lerp(b.y, 1.0, (along - b.x) / max(1.0 - b.x, 1e-4));
++}
++
+ // How much of the pixel at `position` is inside clip `first` and every clip around it.
+ float rounded_clip_coverage(uint first, float2 position) {
+     uint index = first;
+@@ -334,6 +348,10 @@
+     for (uint depth = 0u; depth < 64u && index != 0u; depth++) {
+         RoundedClip clip = rounded_clips[index - 1u];
+         coverage = min(coverage, saturate(0.5 - quad_sdf(position, clip.bounds, clip.corner_radii)));
++        if (clip.fade_right > 0.0) {
++            float along = saturate((clip.bounds.origin.x + clip.bounds.size.x - position.x) / clip.fade_right);
++            coverage *= clip_fade(along, unpack_unorm2x16(clip.fade_stops.x), unpack_unorm2x16(clip.fade_stops.y));
++        }
+         index = clip.parent;
+     }
+     return coverage;

@@ -1,0 +1,288 @@
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -58,6 +58,99 @@
+     pub rounded_clips: Vec<RoundedClipNode>,
+     /// The mask primitives inserted now are given (`Window::with_rounded_clip`).
+     pub(crate) current_rounded_clip: u32,
++    /// the transform primitives inserted now are drawn with (`Window::with_paint_transform`).
++    pub(crate) transform: Option<PaintTransform>,
++}
++
++/// scales device points by `scale` and then moves them by `offset`, with every mask the scope
++/// was entered in kept untransformed as `clip`.
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct PaintTransform {
++    pub scale: f32,
++    pub offset: Point<ScaledPixels>,
++    pub clip: Bounds<ScaledPixels>,
++}
++
++impl PaintTransform {
++    fn point(&self, p: Point<ScaledPixels>) -> Point<ScaledPixels> {
++        point(ScaledPixels(p.x.0 * self.scale + self.offset.x.0), ScaledPixels(p.y.0 * self.scale + self.offset.y.0))
++    }
++    fn len(&self, l: ScaledPixels) -> ScaledPixels {
++        ScaledPixels(l.0 * self.scale)
++    }
++    fn bounds(&self, b: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
++        Bounds { origin: self.point(b.origin), size: Size { width: self.len(b.size.width), height: self.len(b.size.height) } }
++    }
++    fn corners(&self, c: Corners<ScaledPixels>) -> Corners<ScaledPixels> {
++        Corners { top_left: self.len(c.top_left), top_right: self.len(c.top_right), bottom_right: self.len(c.bottom_right), bottom_left: self.len(c.bottom_left) }
++    }
++    fn edges(&self, e: Edges<ScaledPixels>) -> Edges<ScaledPixels> {
++        Edges { top: self.len(e.top), right: self.len(e.right), bottom: self.len(e.bottom), left: self.len(e.left) }
++    }
++    fn mask(&self, m: ContentMask<ScaledPixels>) -> ContentMask<ScaledPixels> {
++        ContentMask { bounds: self.bounds(m.bounds).intersect(&self.clip) }
++    }
++    /// a sprite's own matrix composed after this transform, for the bounds this moves it to.
++    fn matrix(&self, m: TransformationMatrix) -> TransformationMatrix {
++        let [[a, b], [c, d]] = m.rotation_scale;
++        // M'(q) = S M S^-1 q with S(p) = k p + o: the matrix part stays, the translation becomes k t + o - A o.
++        let (k, o) = (self.scale, [self.offset.x.0, self.offset.y.0]);
++        TransformationMatrix {
++            rotation_scale: m.rotation_scale,
++            translation: [k * m.translation[0] + o[0] - (a * o[0] + b * o[1]), k * m.translation[1] + o[1] - (c * o[0] + d * o[1])],
++        }
++    }
++
++    fn apply(&self, primitive: &mut Primitive) {
++        match primitive {
++            Primitive::Shadow(p) => {
++                p.bounds = self.bounds(p.bounds);
++                p.corner_radii = self.corners(p.corner_radii);
++                p.blur_radius = self.len(p.blur_radius);
++                p.element_bounds = self.bounds(p.element_bounds);
++                p.element_corner_radii = self.corners(p.element_corner_radii);
++                p.content_mask = self.mask(p.content_mask.clone());
++            }
++            Primitive::Quad(p) => {
++                p.bounds = self.bounds(p.bounds);
++                p.corner_radii = self.corners(p.corner_radii);
++                p.border_widths = self.edges(p.border_widths);
++                p.content_mask = self.mask(p.content_mask.clone());
++            }
++            Primitive::Path(p) => {
++                p.bounds = self.bounds(p.bounds);
++                p.content_mask = self.mask(p.content_mask.clone());
++                for v in &mut p.vertices {
++                    v.xy_position = self.point(v.xy_position);
++                    v.content_mask = self.mask(v.content_mask.clone());
++                }
++            }
++            Primitive::Underline(p) => {
++                p.bounds = self.bounds(p.bounds);
++                p.thickness = self.len(p.thickness);
++                p.content_mask = self.mask(p.content_mask.clone());
++            }
++            Primitive::MonochromeSprite(p) => {
++                p.bounds = self.bounds(p.bounds);
++                p.transformation = self.matrix(p.transformation);
++                p.content_mask = self.mask(p.content_mask.clone());
++            }
++            Primitive::SubpixelSprite(p) => {
++                p.bounds = self.bounds(p.bounds);
++                p.transformation = self.matrix(p.transformation);
++                p.content_mask = self.mask(p.content_mask.clone());
++            }
++            Primitive::PolychromeSprite(p) => {
++                p.bounds = self.bounds(p.bounds);
++                p.corner_radii = self.corners(p.corner_radii);
++                p.content_mask = self.mask(p.content_mask.clone());
++            }
++            Primitive::Surface(p) => {
++                p.bounds = self.bounds(p.bounds);
++                p.content_mask = self.mask(p.content_mask.clone());
++            }
++        }
++    }
+ }
+ 
+ /// A rounded rect primitives are masked by, in device pixels, and the mask it sits in (`parent`,
+@@ -92,6 +185,7 @@
+         self.backdrop_blurs.clear();
+         self.rounded_clips.clear();
+         self.current_rounded_clip = 0;
++        self.transform = None;
+     }
+ 
+     /// `clip`, when one of its rounded corners (or its parents') reaches into `bounds`, else 0:
+@@ -119,7 +213,11 @@
+     }
+ 
+     /// Adds a rounded mask inside the current one and returns its one-based index.
+-    pub fn push_rounded_clip(&mut self, bounds: Bounds<ScaledPixels>, corner_radii: Corners<ScaledPixels>, parent: u32) -> u32 {
++    pub fn push_rounded_clip(&mut self, mut bounds: Bounds<ScaledPixels>, mut corner_radii: Corners<ScaledPixels>, parent: u32) -> u32 {
++        if let Some(transform) = self.transform {
++            bounds = transform.bounds(bounds);
++            corner_radii = transform.corners(corner_radii);
++        }
+         self.rounded_clips.push(RoundedClipNode { bounds, corner_radii, parent, pad: [0; 3] });
+         self.rounded_clips.len() as u32
+     }
+@@ -159,6 +257,12 @@
+     /// Records a backdrop blur at the current layer's draw order, or above whatever is beneath
+     /// it, so that what is painted after it composites over the blurred backdrop.
+     pub fn insert_backdrop_blur(&mut self, mut blur: BackdropBlur) {
++        if let Some(transform) = self.transform {
++            blur.bounds = transform.bounds(blur.bounds);
++            blur.corner_radii = transform.corners(blur.corner_radii);
++            blur.fades = transform.edges(blur.fades);
++            blur.content_mask = transform.mask(blur.content_mask.clone());
++        }
+         let clipped_bounds = blur.bounds.intersect(&blur.content_mask.bounds);
+         if clipped_bounds.is_empty() || blur.opacity <= 0. {
+             return;
+@@ -198,6 +302,9 @@
+ 
+     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
+         let mut primitive = primitive.into();
++        if let Some(transform) = self.transform {
++            transform.apply(&mut primitive);
++        }
+         let clipped_bounds = primitive
+             .bounds()
+             .intersect(&primitive.content_mask().bounds);
+@@ -268,6 +375,8 @@
+     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+         // Masks are indices into the scene they were painted in, so they come along.
+         let mut copied = collections::FxHashMap::default();
++        // replayed primitives were transformed when they were first painted.
++        let transform = self.transform.take();
+         for operation in &prev_scene.paint_operations[range] {
+             match operation {
+                 PaintOperation::Primitive(primitive) => {
+@@ -294,6 +403,7 @@
+                 PaintOperation::EndLayer => self.pop_layer(),
+             }
+         }
++        self.transform = transform;
+     }
+ 
+     pub fn finish(&mut self) {
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -4493,6 +4493,45 @@
+         }
+     }
+ 
++    /// draws what `f` paints scaled by `scale` around `origin`, then moved by `offset`, without
++    /// changing layout or hit testing: a press shrink, a cover easing to a size, a panel sliding in.
++    /// masks entered before stay where they are; masks inside move with the content. nested
++    /// transforms compose. replayed cached views keep the transform they were painted with.
++    pub fn with_paint_transform<R>(
++        &mut self,
++        scale: f32,
++        origin: Point<Pixels>,
++        offset: Point<Pixels>,
++        f: impl FnOnce(&mut Self) -> R,
++    ) -> R {
++        self.invalidator.debug_assert_paint_or_prepaint();
++        if !self.invalidator.is_painting() || (scale == 1.0 && offset == Point::default()) {
++            return f(self);
++        }
++        let sf = self.scale_factor();
++        let (o, d) = (origin.scale(sf), offset.scale(sf));
++        let local = crate::scene::PaintTransform {
++            scale,
++            offset: point(ScaledPixels(o.x.0 * (1.0 - scale) + d.x.0), ScaledPixels(o.y.0 * (1.0 - scale) + d.y.0)),
++            clip: self.content_mask().scale(sf).bounds,
++        };
++        let previous = self.next_frame.scene.transform;
++        self.next_frame.scene.transform = Some(match previous {
++            None => local,
++            Some(outer) => crate::scene::PaintTransform {
++                scale: outer.scale * local.scale,
++                offset: point(
++                    ScaledPixels(outer.scale * local.offset.x.0 + outer.offset.x.0),
++                    ScaledPixels(outer.scale * local.offset.y.0 + outer.offset.y.0),
++                ),
++                clip: outer.clip,
++            },
++        });
++        let result = f(self);
++        self.next_frame.scene.transform = previous;
++        result
++    }
++
+     /// Clips what `f` draws to a rounded rect: every primitive is masked by it in the renderer's
+     /// shaders, and hit tests skip the cut-off corners. Nested clips intersect. With no rounding
+     /// this is just a content mask.
+--- a/crates/gpui/src/style.rs
++++ b/crates/gpui/src/style.rs
+@@ -301,6 +301,14 @@
+     /// The opacity of this element
+     pub opacity: Option<f32>,
+ 
++    /// draws the element and its children scaled around its center, without changing layout or
++    /// hit testing (`Window::with_paint_transform`).
++    pub paint_scale: Option<f32>,
++
++    /// draws the element and its children moved by this much, without changing layout or hit
++    /// testing.
++    pub paint_offset: Option<Point<Pixels>>,
++
+     /// The grid columns of this element
+     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
+     pub grid_cols: Option<GridTemplate>,
+@@ -838,6 +846,8 @@
+             text: TextStyleRefinement::default(),
+             mouse_cursor: None,
+             opacity: None,
++            paint_scale: None,
++            paint_offset: None,
+             grid_rows: None,
+             grid_cols: None,
+             grid_location: None,
+--- a/crates/gpui/src/styled.rs
++++ b/crates/gpui/src/styled.rs
+@@ -2,7 +2,7 @@
+     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
+     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
+     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
+-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
++    Pixels, Point, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
+     TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+ };
+ pub use gpui_macros::{
+@@ -748,6 +748,20 @@
+         self
+     }
+ 
++    /// draws this element and its children scaled by `scale` around their center, leaving layout
++    /// and hit testing as they are.
++    fn paint_scale(mut self, scale: f32) -> Self {
++        self.style().paint_scale = Some(scale);
++        self
++    }
++
++    /// draws this element and its children moved by `offset`, leaving layout and hit testing as
++    /// they are.
++    fn paint_offset(mut self, offset: Point<Pixels>) -> Self {
++        self.style().paint_offset = Some(offset);
++        self
++    }
++
+     /// Sets the grid columns of this element.
+     fn grid_cols(mut self, cols: u16) -> Self {
+         self.style().grid_cols = Some(GridTemplate {
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -2596,6 +2596,8 @@
+                     tab_group = self.tab_index;
+                 }
+ 
++                let (scale, offset) = (style.paint_scale.unwrap_or(1.0), style.paint_offset.unwrap_or_default());
++                window.with_paint_transform(scale, bounds.center(), offset, |window| {
+                 window.with_element_opacity(style.opacity, |window| {
+                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                         window.with_text_style(style.text_style().cloned(), |window| {
+@@ -2688,6 +2690,7 @@
+                         });
+                     });
+                 });
++                });
+ 
+                 ((), element_state)
+             },

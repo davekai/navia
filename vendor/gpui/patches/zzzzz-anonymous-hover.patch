@@ -1,0 +1,42 @@
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -2915,6 +2915,7 @@
+             || cx.active_drag.is_some() && !self.drag_over_styles.is_empty()
+         {
+             let hitbox = hitbox.clone();
++            let has_hover_style = self.hover_style.is_some();
+             let hover_state = self.hover_style.as_ref().and_then(|_| {
+                 element_state
+                     .as_ref()
+@@ -2922,17 +2923,25 @@
+                     .cloned()
+             });
+             let current_view = window.current_view();
++            // an element without an id keeps no hover state, so it compares with how it was painted
++            let painted_hovered = hitbox.is_hovered(window);
+ 
+             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                 let hovered = hitbox.is_hovered(window);
+-                let was_hovered = hover_state
+-                    .as_ref()
+-                    .is_some_and(|state| state.borrow().element);
+-                if phase == DispatchPhase::Capture && hovered != was_hovered {
+-                    if let Some(hover_state) = &hover_state {
+-                        hover_state.borrow_mut().element = hovered;
++                if phase != DispatchPhase::Capture {
++                    return;
++                }
++                match &hover_state {
++                    Some(hover_state) => {
++                        if hovered != hover_state.borrow().element {
++                            hover_state.borrow_mut().element = hovered;
++                            cx.notify(current_view);
++                        }
++                    }
++                    None if has_hover_style && hovered != painted_hovered => {
+                         cx.notify(current_view);
+                     }
++                    None => {}
+                 }
+             });
+         }

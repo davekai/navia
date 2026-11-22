@@ -1,16 +1,23 @@
 //! Navia's desktop shell in GPUI.
-// No console window for release builds on Windows. Debug builds keep it for logs.
+// the settings file is one `json!` object, longer than the macro's default recursion allows.
+#![recursion_limit = "256"]
+// no console window in release builds; debug builds keep it for logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod account;
 mod airplay;
 mod view_airplay;
 mod art;
+mod anim_art;
+mod animation;
 mod autoplay;
+mod marquee;
+mod heat;
 mod catalog;
 mod chrome;
 mod assets;
 mod color;
+mod system_accent;
 mod core_library;
 mod core_player;
 mod deezer_choice;
@@ -20,6 +27,7 @@ mod mini_player;
 mod view_mini;
 mod model;
 mod persist;
+mod playlist_menu;
 mod sample;
 mod selection;
 mod shell;
@@ -58,6 +66,7 @@ mod view_artists;
 mod view_artist;
 mod view_albums;
 mod view_split;
+mod view_upcoming;
 mod view_album;
 mod pages;
 mod view_dock;
@@ -94,6 +103,7 @@ mod updates;
 mod memory;
 mod tray;
 mod tray_glue;
+mod app_menu;
 
 use gpui::{App, AppContext, Bounds, Entity, Pixels, QuitMode, Size, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions, point, px, size};
 
@@ -128,9 +138,12 @@ fn main() {
     gpui_platform::application().with_assets(assets::Assets).run(move |cx: &mut App| {
         assets::register_fonts(cx);
         shell::bind_keys(cx);
-        // Closing the window may leave Navia playing in the tray, so the app quits only when asked.
+        // closing the window may leave Navia playing in the tray.
         cx.set_quit_mode(QuitMode::Explicit);
-        let prefs = persist::Prefs::load();
+        let mut prefs = persist::Prefs::load();
+        if prefs.migrate_to_system_accent() {
+            prefs.save();
+        }
         let support = chrome::support();
         chrome::watch_double_click();
         chrome::watch_reduce_motion(cx);
@@ -144,7 +157,7 @@ fn main() {
     });
 }
 
-/// Keeps the shell, and with it the player, alive while its window is closed to the tray.
+/// while its window is closed to the tray.
 struct KeepShell(#[allow(dead_code)] Entity<shell::Shell>);
 impl gpui::Global for KeepShell {}
 

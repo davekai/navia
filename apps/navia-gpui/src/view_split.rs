@@ -6,6 +6,7 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, ListAlignment, ListState, MouseButton, SharedString, div, list, px, relative, uniform_list};
 
+use crate::ui::FullTextTip;
 use crate::focus::FocusStop;
 use crate::pages::Block;
 use crate::shell::{Layout, Shell};
@@ -41,7 +42,6 @@ impl Default for SplitPane {
     }
 }
 
-/// Draws the list's row at an index.
 pub type SplitRows = Rc<dyn Fn(&mut Shell, usize, &Layout, &mut Context<Shell>) -> AnyElement>;
 
 impl Shell {
@@ -82,10 +82,10 @@ impl Shell {
             SplitPage::Albums => "albums",
             SplitPage::Artists => "artists",
         };
-        let split_btn = icon_button(&t, SharedString::from(format!("{key}-split-view")), if split { "list-bullets-fill" } else { "list-bullets-regular" }, split)
+        let split_btn = icon_button(&t, SharedString::from(format!("{key}-split-view")), crate::i18n::tr("Split view"), if split { "list-bullets-fill" } else { "list-bullets-regular" }, split)
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| this.set_split(page, true, cx)));
-        let grid_btn = icon_button(&t, SharedString::from(format!("{key}-grid-view")), if split { "grid-four-regular" } else { "grid-four-fill" }, !split)
+        let grid_btn = icon_button(&t, SharedString::from(format!("{key}-grid-view")), crate::i18n::tr("Grid view"), if split { "grid-four-regular" } else { "grid-four-fill" }, !split)
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| this.set_split(page, false, cx)));
         glass_pill(&t).occlude().child(split_btn).child(grid_btn).into_any_element()
@@ -158,9 +158,9 @@ impl Shell {
             .h(t.s(SPLIT_ROW_H))
             .px(t.s(SPLIT_ROW_PAD))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| action(this, cx)))
-            .child(div().absolute().left(px(0.0)).right(px(0.0)).top(t.s(SPLIT_ROW_INSET)).bottom(t.s(SPLIT_ROW_INSET)).rounded(t.s(R_MD)).when(on, |d| d.bg(t.hover())).hover(|s| s.bg(t.row())))
+            .child(div().absolute().left(px(0.0)).right(px(0.0)).top(t.s(SPLIT_ROW_INSET)).bottom(t.s(SPLIT_ROW_INSET)).rounded(t.s(R_MD)).when(on, |d| d.bg(t.hover())))
             .child(div().relative().flex_none().child(art))
-            .child(div().relative().min_w(px(0.0)).line_height(relative(1.32)).child(div().truncate().font_weight(FontWeight::MEDIUM).child(title)).child(div().truncate().text_color(t.t2()).child(sub)))
+            .child(div().relative().min_w(px(0.0)).line_height(relative(1.32)).child(div().id("name").truncate().font_weight(FontWeight::MEDIUM).child(title.clone()).full_text_tip(&t, title)).child(div().id("sub").truncate().text_color(t.t2()).child(sub.clone()).full_text_tip(&t, sub)))
             .child(div().absolute().left(t.s(SPLIT_LINE_FROM)).right(px(0.0)).bottom(px(0.0)).h(px(1.0)).bg(t.line()))
             .into_any_element()
     }

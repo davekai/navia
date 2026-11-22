@@ -54,6 +54,10 @@ pub struct LyricLine {
     /// The core's line when the server gave real word timing, for the word fill. `None` estimates
     /// it from the line's length.
     pub timed: Option<std::sync::Arc<navia_core::lyrics::LyricLine>>,
+    /// the line's bracketed backing vocals, shown smaller under it while current.
+    pub backing: Option<SharedString>,
+    /// the bracketed part comes before the main words, so it's sung, and filled, first.
+    pub backing_first: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +147,54 @@ pub struct Album {
     pub edition: Option<SharedString>,
     /// Another album by the same artist has the same name, so cards show the edition to tell them apart.
     pub edition_on_card: bool,
+    /// days since 1970, full dates only.
+    pub release_day: Option<i64>,
+}
+
+impl Album {
+    /// `today` in days since 1970.
+    pub fn is_new_release(&self, today: i64) -> bool {
+        self.release_day.is_some_and(|day| (0..navia_core::upcoming::NEW_RELEASE_DAYS).contains(&(today - day)))
+    }
+}
+
+/// `navia_core::upcoming::UpcomingAlbum` for the shell.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Upcoming {
+    /// Deezer's album id.
+    pub id: u64,
+    pub title: SharedString,
+    pub artist: SharedString,
+    /// the library artist it was found for.
+    pub artist_id: SharedString,
+    /// the cover's key for `album_thumbnail`.
+    pub cover: SharedString,
+    /// `YYYY-MM-DD`.
+    pub release_date: SharedString,
+    /// local midnight of the release day, Unix seconds.
+    pub release_moment: i64,
+    /// songs announced in all.
+    pub total: u32,
+    pub explicit: bool,
+}
+
+/// `song` is the library's copy; without one it can't play.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpcomingTrack {
+    pub title: SharedString,
+    pub artist: SharedString,
+    pub duration_s: u32,
+    pub explicit: bool,
+    pub song: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpcomingView {
+    Loading,
+    Missing,
+    Upcoming(Upcoming, Vec<UpcomingTrack>),
+    /// the server has it now: this library album's id.
+    OnServer(SharedString),
 }
 
 #[derive(Clone, Debug)]
@@ -161,7 +213,7 @@ pub struct ArtistInfo {
     pub similar: Vec<SharedString>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Genre {
     pub name: SharedString,
     pub song_count: u32,
@@ -242,7 +294,7 @@ pub enum PlaylistCover {
     Empty,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RadioStation {
     pub id: SharedString,
     pub name: SharedString,
@@ -265,6 +317,8 @@ pub struct HomeTaste {
     pub because: Option<(u32, Vec<u32>)>,
     /// Artist Radio stations, each a seed and its neighbors with photos, best seed first.
     pub stations: Vec<(u32, Vec<u32>)>,
+    /// Essentials: played artists with enough top songs, best lately first.
+    pub essentials: Vec<u32>,
 }
 
 /// One of today's mixes on For You.
@@ -294,6 +348,8 @@ pub struct ForYouPage {
     pub forgotten: Vec<u32>,
     pub on_this_day: Vec<u32>,
     pub not_played_recently: Vec<u32>,
+    /// today's mixes are still being made, so an empty page isn't final.
+    pub loading: bool,
 }
 
 /// The only data contract the UI needs from a library. The shell owns playback state, and the
@@ -319,6 +375,18 @@ pub trait Library: Send + Sync + 'static {
         let _ = px;
         self.album_artwork(id)
     }
+    /// whether the art last given for `id` was the server's no-cover placeholder, to be asked for
+    /// again after `navia_core::artwork::NO_STORE_TTL` rather than kept.
+    fn artwork_is_placeholder(&self, id: &str) -> bool {
+        let _ = id;
+        false
+    }
+
+    /// the frames of an animated cover; `key` is an album id or `pl:<playlist id>`. `None` for a still cover.
+    fn animated_cover(&self, key: &str, px: u32) -> Option<navia_core::artwork::AnimatedArt> {
+        let _ = (key, px);
+        None
+    }
     /// The cover for a playlist, about `px` pixels square.
     fn playlist_cover(&self, id: &str, _px: u32) -> PlaylistCover {
         let details = self.playlist_details();
@@ -334,6 +402,10 @@ pub trait Library: Send + Sync + 'static {
     }
     /// Lyric lines in order, empty if the song has none. Every line at 0 means unsynced.
     fn lyrics(&self, song_id: &str) -> Vec<LyricLine>;
+    /// lyricists, else composers (OpenSubsonic `contributors`); empty when the server credits neither.
+    fn lyrics_writers(&self, _song_id: &str) -> Vec<String> {
+        Vec::new()
+    }
     /// Every album, most played first. Empty until the library can answer.
     fn albums(&self) -> Arc<Vec<Album>> {
         Arc::default()
@@ -389,6 +461,10 @@ pub trait Library: Send + Sync + 'static {
     fn playlist_songs(&self, _playlist_id: &str) -> Vec<u32> {
         Vec::new()
     }
+    /// the songs this device already has for a playlist, without asking the server.
+    fn stored_playlist_songs(&self, playlist_id: &str) -> Vec<u32> {
+        self.playlist_songs(playlist_id)
+    }
     /// An artist's albums, as indexes into `albums`, newest first.
     fn artist_albums(&self, _artist_id: &str) -> Vec<u32> {
         Vec::new()
@@ -427,6 +503,26 @@ pub trait Library: Send + Sync + 'static {
     fn more_by(&self, _album_id: &str) -> Option<MoreBy> {
         None
     }
+    /// Deezer's `rank` for an album's songs (song index to rank), only with the Deezer switch on; empty until the answer lands, and songs Deezer has no match for are left out.
+    fn album_heat(&self, _album_id: &str) -> std::collections::HashMap<u32, u64> {
+        std::collections::HashMap::new()
+    }
+    /// an empty answer (offline, or no match) is asked again each time the album opens, not kept for the session
+    fn reask_missing_heat(&self, _album_id: &str) {}
+    /// empty until the answer lands.
+    fn upcoming_for_artist(&self, _artist_id: &str) -> Vec<Upcoming> {
+        Vec::new()
+    }
+    fn upcoming_home(&self) -> Vec<Upcoming> {
+        Vec::new()
+    }
+    /// never asks Deezer.
+    fn upcoming_matching(&self, _query: &str) -> Vec<Upcoming> {
+        Vec::new()
+    }
+    fn upcoming_page(&self, _id: u64) -> UpcomingView {
+        UpcomingView::Missing
+    }
     /// Whether the server has sharing turned on.
     fn can_share(&self) -> bool {
         false
@@ -462,6 +558,13 @@ pub trait Library: Send + Sync + 'static {
             })
             .take(navia_core::stations::STATIONS_MAX)
             .collect();
-        HomeTaste { albums: (0..albums.len() as u32).filter(|i| albums[*i as usize].plays > 0).collect(), artists: played_artists, world_of, stations, ..Default::default() }
+        let essentials = played_artists
+            .iter()
+            .copied()
+            .take(navia_core::library::essentials::LOOK_AT)
+            .filter(|i| self.artist_top_songs(&artists[*i as usize].id).len() >= navia_core::library::essentials::ESSENTIALS_MIN)
+            .take(navia_core::library::essentials::ESSENTIALS)
+            .collect();
+        HomeTaste { albums: (0..albums.len() as u32).filter(|i| albums[*i as usize].plays > 0).collect(), artists: played_artists, world_of, stations, essentials, ..Default::default() }
     }
 }

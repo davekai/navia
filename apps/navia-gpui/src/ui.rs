@@ -5,7 +5,8 @@ use gpui::prelude::*;
 use gpui::{AnyElement, BoxShadow, Div, ElementId, FontWeight, Hsla, SharedString, Stateful, Svg, div, point, px, relative, svg};
 
 use crate::assets::icon as icon_path;
-use crate::theme::{Theme, motion};
+use crate::animation;
+use crate::theme::{PressPhase, Theme, motion};
 use crate::theme::size::*;
 
 /// Whether the renderer can blur what's beneath an element, as reported by the main window's
@@ -73,9 +74,18 @@ pub fn image(source: std::sync::Arc<gpui::RenderImage>) -> gpui::Img {
 
 /// The inset light edge every glass surface has.
 pub fn glass_edge() -> Vec<BoxShadow> {
+    edge_ring(crate::theme::GLASS_EDGE)
+}
+
+/// `--menu-edge`: the fainter hairline of menus and popovers.
+pub fn menu_edge() -> Vec<BoxShadow> {
+    edge_ring(crate::theme::MENU_EDGE)
+}
+
+fn edge_ring(ring: u32) -> Vec<BoxShadow> {
     vec![
         BoxShadow {
-            color: gpui::rgba(crate::theme::GLASS_EDGE).into(),
+            color: gpui::rgba(ring).into(),
             offset: point(px(0.0), px(0.0)),
             blur_radius: px(0.0),
             spread_radius: px(1.0),
@@ -125,12 +135,27 @@ pub fn shadow_art(t: &Theme) -> BoxShadow {
     drop(t, color, y, blur, spread)
 }
 
-/// The shadow for the top bar's glass pills.
+/// header art with `--shadow-art`; the shadow's box stays the art's size however the header aligns or stretches it.
+pub fn hero_art_frame(t: &Theme, radius: f32, art: impl IntoElement) -> Div {
+    div().flex_none().flex().flex_col().items_start().child(div().relative().flex_none().rounded(t.s(radius)).shadow(vec![shadow_art(t)]).child(art))
+}
+
+/// `--shadow-pill`: the top bar's glass pills.
 pub fn shadow_pill(t: &Theme) -> BoxShadow {
     drop(t, 0x00000080, 8.0, 26.0, -10.0)
 }
 
-/// The shadow for the expanded player's cover.
+/// a box of `color` blurred as css `filter: blur()` draws it, `blur` its deviation; the caller sets its insets.
+/// a drop shadow is kept off its own element, so a copy moved out of the way casts it back onto the box.
+pub fn blurred_fill(color: impl Into<Hsla>, radius: gpui::Pixels, blur: gpui::Pixels) -> Div {
+    // further than any box plus its blur's reach, so the cut-out under the caster misses the shadow
+    let away = px(1.0e5);
+    // a shadow's blur radius is about twice css blur()'s deviation
+    let shadow = BoxShadow { color: color.into(), offset: point(away, px(0.0)), blur_radius: blur * 2.0, spread_radius: px(0.0), inset: false };
+    div().absolute().child(div().absolute().top(px(0.0)).bottom(px(0.0)).left(-away).right(away).rounded(radius).shadow(vec![shadow]))
+}
+
+/// `--shadow-player-art`: the expanded player's cover.
 pub fn shadow_player_art(t: &Theme) -> BoxShadow {
     drop(t, 0x00000099, 30.0, 70.0, -22.0)
 }
@@ -150,23 +175,7 @@ pub fn shadow_ghost(t: &Theme) -> BoxShadow {
     drop(t, 0x00000066, 6.0, 18.0, 0.0)
 }
 
-/// The thumb over a seek or volume bar's playhead, centered on `x`. Hidden at rest, it fades and
-/// grows in as `amount` goes from 0 to 1. `size` is `SCRUB_KNOB` or `SCRUB_THIN_KNOB`.
-pub fn scrub_knob(t: &Theme, size: f32, x: gpui::Pixels, amount: f32) -> Div {
-    use crate::theme::size::SCRUB_KNOB_REST_SCALE;
-    let d = t.s(size * (SCRUB_KNOB_REST_SCALE + (1.0 - SCRUB_KNOB_REST_SCALE) * amount));
-    div()
-        .absolute()
-        .top(px(0.0))
-        .bottom(px(0.0))
-        .left(x - d / 2.0)
-        .flex()
-        .items_center()
-        .opacity(amount)
-        .child(div().size(d).rounded_full().bg(t.knob()).shadow(vec![shadow_knob(t)]))
-}
-
-/// The shadow for slider thumbs.
+/// `--shadow-knob`: slider thumbs.
 pub fn shadow_knob(t: &Theme) -> BoxShadow {
     drop(t, 0x00000066, 1.0, 4.0, 0.0)
 }
@@ -190,7 +199,7 @@ pub fn shadow_lift(t: &Theme) -> BoxShadow {
 /// without backdrop blur.
 pub fn glass_pill(t: &Theme) -> Div {
     let pill = div().flex().flex_row().items_center().flex_none().h(t.s(CONTROL_H)).px(t.s(3.0)).rounded_full();
-    glass_layers(pill, t, t.s(CONTROL_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass_frost_fill(), t.glass_fill(), glass_edge())
+    glass_layers(pill, t, t.s(CONTROL_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass(), t.glass_fill(), glass_edge())
 }
 
 /// A small single-line float chip, like the mini player's time chip. It moves with the playhead
@@ -203,44 +212,88 @@ pub fn float_chip(t: &Theme) -> Div {
 pub struct Tip {
     theme: Theme,
     text: SharedString,
+    /// shown only while this is set (see [`FullTextTip`]).
+    when: Option<std::rc::Rc<std::cell::Cell<bool>>>,
 }
 
 impl gpui::Render for Tip {
     fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        if self.when.as_ref().is_some_and(|on| !on.get()) {
+            return div();
+        }
         float_chip(&self.theme).child(self.text.clone())
     }
 }
 
 pub fn tip(t: &Theme, text: impl Into<SharedString>) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
     let (theme, text) = (*t, text.into());
-    move |_, cx| cx.new(|_| Tip { theme, text: text.clone() }).into()
+    move |_, cx| cx.new(|_| Tip { theme, text: text.clone(), when: None }).into()
 }
 
-/// A floating panel for menus, selects, popovers and the bar's volume panel. Add the contents as
-/// children. It's `relative` so its glass layers fill it, but a later `absolute()` still wins.
+/// text that can be cut short (`truncate`, `line_clamp`) shows its full text as its tip, only while it's cut.
+/// call it on the box that cuts; credits pass their joined list.
+pub trait FullTextTip: Sized {
+    fn full_text_tip(self, t: &Theme, text: impl Into<SharedString>) -> Self;
+}
+
+impl FullTextTip for Stateful<Div> {
+    fn full_text_tip(self, t: &Theme, text: impl Into<SharedString>) -> Self {
+        let (theme, text) = (*t, text.into());
+        let cut = std::rc::Rc::new(std::cell::Cell::new(false));
+        let probe = {
+            let (cut, text) = (cut.clone(), text.clone());
+            gpui::canvas(move |bounds, window, _| cut.set(is_cut(window, &text, bounds.size.width)), |_, _, _, _| {}).absolute().size_full()
+        };
+        // Taffy places an absolute child in its own parent, so the element keeps its own position.
+        self.child(probe).tooltip(move |_, cx| cx.new(|_| Tip { theme, text: text.clone(), when: Some(cut.clone()) }).into())
+    }
+}
+
+/// whether `text` in the inherited style overflows `width`: past the width on one line, or past the line clamp when wrapped.
+fn is_cut(window: &mut gpui::Window, text: &SharedString, width: gpui::Pixels) -> bool {
+    if text.is_empty() || width <= px(0.0) {
+        return false;
+    }
+    let style = window.text_style();
+    let size = style.font_size.to_pixels(window.rem_size());
+    let run = style.to_run(text.len());
+    let line = text.replace('\n', " ");
+    match style.line_clamp {
+        Some(lines) => window
+            .text_system()
+            .shape_text(line.into(), size, &[run], Some(width), None)
+            .map(|wrapped| wrapped.iter().map(|l| l.wrap_boundaries().len() + 1).sum::<usize>() > lines)
+            .unwrap_or(false),
+        // half a pixel of slack for subpixel layout.
+        None => window.text_system().shape_line(line.into(), size, &[run], None).width > width + px(0.5),
+    }
+}
+
+/// a floating panel (`--menu-glass`, `--r-float`, `--shadow-float`); `relative` so its glass layers fill it, and a later `absolute()` still wins.
 pub fn float_panel(t: &Theme) -> Div {
     let radius = t.s(R_FLOAT);
-    glass_layers(div().relative().rounded(radius).occlude(), t, radius, FLOAT_BLUR, FLOAT_SATURATION, t.float_glass(), t.float_fill(), edge_and(shadow_float(t)))
+    let edge = menu_edge().into_iter().chain([shadow_float(t)]).collect();
+    glass_layers(div().relative().rounded(radius).occlude(), t, radius, MENU_BLUR, MENU_SATURATION, t.menu_glass(), t.float_fill(), edge)
 }
 
-/// The filter field at the top of a floating list, for long selects and the Add to Playlist
-/// submenu. `line` is the field's text line.
-pub fn float_filter(t: &Theme, id: &'static str, line: impl IntoElement) -> Stateful<Div> {
+/// the filter field at the top of a floating list. `line` is the field's text line.
+pub fn float_filter(t: &Theme, id: &'static str, line: impl IntoElement, clear: Option<AnyElement>) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
         .flex_row()
         .items_center()
         .flex_none()
-        .gap(t.s(8.0))
-        .h(t.s(34.0))
-        .mb(t.s(4.0))
-        .px(t.s(11.0))
-        .rounded(t.s(10.0))
+        .gap(t.s(MENU_FIND_GLYPH_GAP))
+        .h(t.s(MENU_FIND_H))
+        .mb(t.s(MENU_FIND_GAP))
+        .px(t.s(MENU_FIND_PAD))
+        .rounded(t.s(MENU_ROW_R))
         .bg(t.row())
-        .text_size(t.text(TEXT_SM))
-        .child(icon(t, "magnifying-glass-regular", 15.0, t.t2()))
+        .text_size(t.text(MENU_TEXT))
+        .child(icon(t, "magnifying-glass-regular", MENU_FIND_ICON, t.t2()))
         .child(line)
+        .children(clear)
 }
 
 /// A dialog's or toast's glass surface with the given corner radius.
@@ -257,7 +310,7 @@ pub fn dialog_scrim(t: &Theme, id: &'static str) -> Stateful<Div> {
 /// A modal dialog's panel, which keeps clicks inside it from reaching the scrim. Add
 /// `dialog_title`, text, fields and `dialog_actions` as children.
 pub fn dialog_panel(t: &Theme, id: &'static str) -> Stateful<Div> {
-    dialog_surface(t, t.s(R_LG))
+    dialog_surface(t, t.s(DIALOG_R))
         .id(id)
         .w(t.s(DIALOG_W))
         .max_w_full()
@@ -277,7 +330,7 @@ pub fn dialog_sheet(t: &Theme, id: &'static str, window_h: gpui::Pixels) -> Stat
 /// The dialog's cover variant, as used by an artist's About. The sheet's size with no padding
 /// so its picture runs to the edges. Children are a scrolling body and a round close button.
 pub fn dialog_cover(t: &Theme, id: &'static str, window_h: gpui::Pixels) -> Stateful<Div> {
-    dialog_surface(t, t.s(R_LG))
+    dialog_surface(t, t.s(DIALOG_R))
         .id(id)
         .w(t.s(SHEET_W))
         .max_w_full()
@@ -384,70 +437,258 @@ pub enum SearchSize {
     Large,
 }
 
-/// A glass search field with its magnifying glass, then `line`. Focus shows as an outer ring,
-/// not a border, so nothing inside moves.
-pub fn search_field(t: &Theme, id: &'static str, size: SearchSize, width: f32, focused: bool, line: impl IntoElement) -> Stateful<Div> {
-    let (h, pad, gap, glyph) = match size {
-        SearchSize::Toolbar => (CONTROL_H, 15.0, 9.0, 18.0),
-        SearchSize::Large => (53.0, 19.0, 11.0, 22.0),
-    };
+/// a glass search field; focus is the outer accent ring, not a border, so nothing inside moves.
+pub fn search_field(t: &Theme, id: &'static str, size: SearchSize, width: SearchWidth, focused: bool, line: impl IntoElement, clear: Option<AnyElement>) -> Stateful<Div> {
+    let (h, pad, gap, glyph) = size.metrics();
     let edge = if size == SearchSize::Large { edge_and(shadow_pill(t)) } else { glass_edge() };
-    let el = div().id(id).relative().flex().flex_row().items_center().gap(t.s(gap)).w(t.s(width)).h(t.s(h)).px(t.s(pad)).rounded_full();
-    glass_layers(el, t, t.s(h / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass_frost_fill(), t.glass_fill(), edge)
+    let el = div().id(id).relative().flex().flex_row().items_center().gap(t.s(gap)).h(t.s(h)).px(t.s(pad)).rounded_full();
+    let el = match width {
+        SearchWidth::Fixed(w) => el.w(t.s(w)),
+        SearchWidth::Fit { step, fit } => el.w(fit).flex_shrink(1.0).min_w(t.s(step)),
+        SearchWidth::Fill { min, max } => el.w_full().min_w(t.s(min)).max_w(t.s(max)),
+    };
+    glass_layers(el, t, t.s(h / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass(), t.glass_fill(), edge)
         .when(focused, |d| d.child(focus_ring(t, t.s(h / 2.0))))
         .occlude()
         .cursor_text()
         .child(icon(t, "magnifying-glass-regular", glyph, t.t2()))
         .child(line)
+        .children(clear)
+}
+
+/// a toolbar search field's narrowest, in steps as the page narrows (`--field-w`).
+pub fn pill_search_width(main_tokens: f32) -> f32 {
+    if main_tokens <= 620.0 {
+        SEARCH_PILL_W_NARROW
+    } else if main_tokens <= 1000.0 {
+        SEARCH_PILL_W_MID
+    } else {
+        SEARCH_PILL_W
+    }
+}
+
+/// how wide a search field is: fixed, or `fit` (its placeholder whole) and narrowing to `step`
+/// only when the bar has no more room.
+#[derive(Clone, Copy)]
+pub enum SearchWidth {
+    Fixed(f32),
+    Fit { step: f32, fit: gpui::Pixels },
+    /// the room it's given, between `min` and `max` tokens.
+    Fill { min: f32, max: f32 },
+}
+
+impl SearchSize {
+    /// height, side padding, gap and glyph, in tokens.
+    fn metrics(self) -> (f32, f32, f32, f32) {
+        match self {
+            SearchSize::Toolbar => (CONTROL_H, SEARCH_PILL_PAD, SEARCH_PILL_GAP, 18.0),
+            SearchSize::Large => (53.0, 19.0, 11.0, 22.0),
+        }
+    }
+
+    /// as wide as `placeholder` shows whole in this field.
+    pub fn fit(self, t: &Theme, cx: &gpui::App, placeholder: &str) -> gpui::Pixels {
+        let (_, pad, gap, glyph) = self.metrics();
+        let text = if self == SearchSize::Large { TEXT_LG } else { TEXT_MD };
+        t.s(2.0 * pad + gap + glyph) + text_width_app(cx, placeholder, t.text(text), FontWeight::NORMAL).ceil()
+    }
+
+    /// its clear button's size (`SEARCH_CLEAR*`).
+    pub fn clear(self) -> f32 {
+        match self {
+            SearchSize::Toolbar => SEARCH_CLEAR,
+            SearchSize::Large => SEARCH_CLEAR_LG,
+        }
+    }
+}
+
+/// the dark veil and glyph over artwork while `key`'s `hover_track` is under the pointer. `radius` is the art's.
+pub fn art_overlay(t: &Theme, key: impl Into<ElementId>, radius: gpui::Pixels, glyph: &str, size: f32) -> Option<Div> {
+    let shown = ink(key).amount;
+    (shown > 0.0).then(|| {
+        div()
+            .absolute()
+            .inset_0()
+            .rounded(radius)
+            .bg(gpui::rgba(crate::theme::WINDOW_BUTTON_ON_ART))
+            .flex()
+            .items_center()
+            .justify_center()
+            .opacity(shown)
+            .child(icon(t, glyph, size, t.t_on_art()))
+    })
 }
 
 pub fn divider(t: &Theme) -> Div {
     div().w(px(1.0)).h(t.s(20.0)).mx(t.s(3.0)).bg(t.glass_divider()).flex_none()
 }
 
-/// An icon button that brightens on hover and sits on glass when active.
-pub fn icon_button(t: &Theme, id: impl Into<ElementId>, name: &str, active: bool) -> Stateful<Div> {
-    icon_button_colored(t, id, name, active, t.t1().into(), t.hover_ink())
+/// `--t1` at `ICON_REST`, brightening on hover; on the glass when active. every icon-only button takes its `label` as its tip.
+pub fn icon_button(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>, name: &str, active: bool) -> Stateful<Div> {
+    icon_button_colored(t, id, label, name, active, t.t1().into(), t.hover_ink())
 }
 
-/// A small icon button in `color` that brightens to `hover` on hover, like a song row's heart.
-pub fn icon_button_colored(t: &Theme, id: impl Into<ElementId>, name: &str, active: bool, color: Hsla, hover: Hsla) -> Stateful<Div> {
+/// a small icon button in `color` that brightens to `hover`; active, it sits on `--glass-on`, easing in and out.
+pub fn icon_button_colored(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>, name: &str, active: bool, color: Hsla, hover: Hsla) -> Stateful<Div> {
+    icon_button_drawn(t, id, label, active, color, hover, |glyph| glyph, name)
+}
+
+fn icon_button_drawn(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool, color: Hsla, hover: Hsla, shape: impl FnOnce(Svg) -> Svg, name: &str) -> Stateful<Div> {
     let id = id.into();
-    if active {
-        return icon_button_shell(t, id, true).child(icon(t, name, 20.0, color));
-    }
-    ink_button(t, id, name, 20.0, color, hover)
+    let (on, ticker) = toggle_ease(id.clone(), active);
+    let ink = ink(id.clone());
+    let fill = t.glass_on();
+    icon_button_shell(t, id.clone(), label)
+        .child(ticker)
+        .when(on > 0.0, |d| d.bg(gpui::Rgba { a: fill.a * on, ..fill }))
+        .child(hover_track(id.clone()))
+        .opacity(ink.opacity(ICON_REST) + (1.0 - ink.opacity(ICON_REST)) * on)
+        .paint_scale(ink.press_scale())
+        .child(popped(&id, shape(icon(t, name, 20.0, ink.color(color, hover)))))
 }
 
-/// A small icon button whose glyph rests at `ICON_REST` in `rest` and brightens to `hover`. The
-/// player's and bar's buttons pass their own colors.
-pub fn ink_button(t: &Theme, id: impl Into<ElementId>, name: &str, size: f32, rest: Hsla, hover: Hsla) -> Stateful<Div> {
+/// a page's refresh, the last of its controls, in its own pill: `arrows-clockwise` turning once per `SPIN_PERIOD`
+/// while `busy`, ending on a whole turn; still while motion is reduced. a click while `busy` does nothing.
+pub fn refresh_button(t: &Theme, busy: bool, on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static) -> Div {
+    use crate::focus::FocusStop;
+    use gpui::{Transformation, percentage};
+    let spin = ElementId::Name("refresh-spin".into());
+    let turning = animation::current(spin.clone()).is_some_and(|m| m.moving);
+    if busy && !turning && !motion::reduced() {
+        animation::restart(spin.clone(), 0.0, 1.0, animation::Curve::ease(SPIN_PERIOD as f32 / 1000.0, motion::LINEAR));
+    }
+    let turn = animation::current(spin.clone()).filter(|m| m.moving).map_or(0.0, |m| m.value);
+    let button = icon_button_drawn(t, "refresh", crate::i18n::tr("Refresh"), false, t.t1().into(), t.hover_ink(), |glyph| glyph.with_transformation(Transformation::rotate(percentage(turn))), "arrows-clockwise-regular")
+        .child(animation::ticker([spin]))
+        .stop(t)
+        .on_click(move |event, window, cx| {
+            if !busy {
+                on_click(event, window, cx);
+            }
+        });
+    glass_pill(t).occlude().child(button)
+}
+
+/// a small icon button whose glyph (`size` tokens) rests at `ICON_REST` in `rest` and brightens to full `hover`.
+pub fn ink_button(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>, name: &str, size: f32, rest: Hsla, hover: Hsla) -> Stateful<Div> {
     let id = id.into();
     let ink = ink(id.clone());
-    icon_button_shell(t, id.clone(), false).child(hover_track(id)).opacity(ink.opacity(ICON_REST)).child(icon(t, name, size, ink.color(rest, hover)))
+    icon_button_shell(t, id.clone(), label).child(hover_track(id)).opacity(ink.opacity(ICON_REST)).paint_scale(ink.press_scale()).child(icon(t, name, size, ink.color(rest, hover)))
+}
+
+/// a player control's `ink_button`, pressed as its `feel` says: in the bar a round `--active-fill` shows while held.
+pub fn player_button(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>, name: &str, size: f32, rest: Hsla, hover: Hsla, feel: Feel) -> Stateful<Div> {
+    player_button_with(t, id.into(), label.into(), name, size, rest, hover, feel, false)
+}
+
+/// a player control whose glyph cross-fades over `--toggle-fade` when `name` changes, such as the volume level.
+pub fn player_button_fading(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>, name: &'static str, size: f32, rest: Hsla, hover: Hsla, feel: Feel) -> Stateful<Div> {
+    let id = id.into();
+    let (fade, ticker) = swap(ElementId::Name(format!("glyph:{id}").into()), &name, motion::TOGGLE_FADE);
+    let Some(old) = fade.leaving else { return player_button(t, id, label, name, size, rest, hover, feel) };
+    let color = ink(id.clone()).color(rest, hover);
+    let layer = |name: &str, opacity: f32| div().absolute().inset_0().flex().items_center().justify_center().opacity(opacity).child(icon(t, name, size, color));
+    let glyph = div().relative().flex_none().size(t.s(size)).child(layer(old, 1.0 - fade.shown)).child(layer(name, fade.shown)).child(ticker).into_any_element();
+    player_button_around(t, id, label.into(), glyph, size, feel, false)
+}
+
+/// a player control that opens a menu on mouse down: its whole press plays at once (`menu_press_track`).
+pub fn player_menu_button(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>, name: &str, size: f32, rest: Hsla, hover: Hsla, feel: Feel) -> Stateful<Div> {
+    player_button_with(t, id.into(), label.into(), name, size, rest, hover, feel, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn player_button_with(t: &Theme, id: ElementId, label: SharedString, name: &str, size: f32, rest: Hsla, hover: Hsla, feel: Feel, menu: bool) -> Stateful<Div> {
+    let glyph = popped(&id, icon(t, name, size, ink(id.clone()).color(rest, hover))).into_any_element();
+    player_button_around(t, id, label, glyph, size, feel, menu)
+}
+
+fn player_button_around(t: &Theme, id: ElementId, label: SharedString, glyph: AnyElement, size: f32, feel: Feel, menu: bool) -> Stateful<Div> {
+    let ink = ink(id.clone());
+    let track = if menu { menu_press_track(id.clone(), feel).into_any_element() } else { press_track(id.clone(), feel).into_any_element() };
+    icon_button_shell(t, id, label)
+        .relative()
+        .child(track)
+        .child(active_fill(t, ink, feel, (ICON_W, ICON_BUTTON_H), size))
+        // on a pressing surface they rest at full strength.
+        .opacity(ink.opacity(if feel.phase { 1.0 } else { ICON_REST }))
+        .paint_scale(ink.press_scale_in(feel))
+        .child(glyph)
+}
+
+/// the held fill's size as a share of its full size: from `--active-fill-start` up as the press is held.
+fn fill_growth(ink: Ink) -> f32 {
+    ACTIVE_FILL_START + (1.0 - ACTIVE_FILL_START) * ink.grown
+}
+
+/// `--active-fill` behind a held text control in the bar: a pill `--active-fill-pad` past the text.
+pub fn active_pill(t: &Theme, ink: Ink, feel: Feel) -> AnyElement {
+    if !feel.fill || ink.fill <= 0.0 {
+        return div().into_any_element();
+    }
+    let (fill, pad) = (t.active_fill(), t.s(ACTIVE_FILL_PAD));
+    div()
+        .absolute()
+        .top(-pad)
+        .bottom(-pad)
+        .left(-pad * 2.0)
+        .right(-pad * 2.0)
+        .rounded_full()
+        .bg(gpui::Rgba { a: fill.a * ink.fill, ..fill })
+        .paint_scale(fill_growth(ink))
+        .into_any_element()
+}
+
+/// the round `--active-fill` behind a held bar control: grows from `--active-fill-start` while held, fades at its reached size so it hands over without a blink.
+pub fn active_fill(t: &Theme, ink: Ink, feel: Feel, box_tokens: (f32, f32), glyph: f32) -> AnyElement {
+    let press = ink.fill;
+    if !feel.fill || press <= 0.0 {
+        return div().into_any_element();
+    }
+    let d = glyph * ACTIVE_FILL_SIZE * fill_growth(ink);
+    let fill = t.active_fill();
+    div()
+        .absolute()
+        .left(t.s((box_tokens.0 - d) / 2.0))
+        .top(t.s((box_tokens.1 - d) / 2.0))
+        .size(t.s(d))
+        .rounded_full()
+        .bg(gpui::Rgba { a: fill.a * press, ..fill })
+        .into_any_element()
 }
 
 /// The margin around an icon drawn to be scaled (`assets::GROW_PREFIX`), as a fraction of its side.
 pub const GROW_MARGIN: f32 = 0.1;
 
-/// Play, pause and skip, with no fill. The glyph grows on hover and shrinks while pressed.
-pub fn transport_button(t: &Theme, id: impl Into<ElementId>, name: &str, size: f32, color: Hsla, enabled: bool) -> Stateful<Div> {
+/// Play and skip: the glyph grows on hover and shrinks while pressed, as its `feel` says.
+pub fn transport_button(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>, name: &str, size: f32, color: Hsla, enabled: bool, feel: Feel) -> Stateful<Div> {
     let id = id.into();
     let ink = ink(id.clone());
-    let scale = if enabled { ink.scale() } else { 1.0 };
-    // Rasterize once at the grown size and scale down on the GPU, so the glyph moves smoothly by
-    // fractions of a pixel. Resizing would snap to whole pixels. The raster's transparent margin keeps
-    // scaling from sampling a neighboring glyph in the atlas.
-    let grown = size * HOVER_GROW;
-    let side = t.s(grown * (1.0 + 2.0 * GROW_MARGIN));
-    let glyph = svg()
-        .path(format!("{}{name}.svg", crate::assets::GROW_PREFIX))
-        .absolute()
-        .size(side)
-        .left((t.s(size) - side) / 2.0)
-        .top((t.s(size) - side) / 2.0)
-        .text_color(color)
-        .with_transformation(gpui::Transformation::scale(gpui::size(scale / HOVER_GROW, scale / HOVER_GROW)));
+    let scale = if enabled { ink.scale_in(feel) } else { 1.0 };
+    let glyph = grow_glyph(t, name, size, color, scale, 1.0);
+    transport_shell(id, enabled, feel, transport_box(t, &ink, feel, size, enabled).child(glyph)).tooltip(tip(t, label))
+}
+
+/// Play and pause crossfade over `--press-swap`; a plain swap under Reduce Motion.
+pub fn play_button(t: &Theme, id: impl Into<ElementId>, playing: bool, size: f32, color: Hsla, feel: Feel) -> Stateful<Div> {
+    let id = id.into();
+    let ink = ink(id.clone());
+    let (shown, ticker) = ease_to(ElementId::from((id.clone(), "swap")), playing, motion::PRESS_SWAP, motion::EASE_OUT);
+    let shown = if motion::reduced() { if playing { 1.0 } else { 0.0 } } else { shown };
+    let scale = ink.scale_in(feel);
+    let glyphs = transport_box(t, &ink, feel, size, true)
+        .when(shown < 1.0, |d| d.child(grow_glyph(t, "play-fill", size, color, scale, 1.0 - shown)))
+        .when(shown > 0.0, |d| d.child(grow_glyph(t, "pause-fill", size, color, scale, shown)));
+    transport_shell(id, true, feel, glyphs).child(ticker).tooltip(tip(t, if playing { crate::i18n::tr("Pause") } else { crate::i18n::tr("Play") }))
+}
+
+/// a transport button's glyph box, with the active fill behind its glyph.
+fn transport_box(t: &Theme, ink: &Ink, feel: Feel, size: f32, enabled: bool) -> Div {
+    div().relative().size(t.s(size)).when(enabled, |d| d.child(active_fill(t, *ink, feel, (size, size), size)))
+}
+
+/// a transport button: its hover track around the glyph box `inner`.
+fn transport_shell(id: ElementId, enabled: bool, feel: Feel, inner: Div) -> Stateful<Div> {
     div()
         .id(id.clone())
         .relative()
@@ -455,14 +696,38 @@ pub fn transport_button(t: &Theme, id: impl Into<ElementId>, name: &str, size: f
         .items_center()
         .justify_center()
         .flex_none()
-        .when(enabled, |d| d.child(hover_track(id)))
-        .child(div().relative().size(t.s(size)).child(glyph))
+        .when(enabled, |d| d.child(press_track(id, feel)))
+        .child(inner)
 }
 
-/// `icon_button` with a drawn glyph instead of an icon, like the Download switch's progress ring.
-pub fn icon_button_with(t: &Theme, id: impl Into<ElementId>, active: bool, glyph: impl IntoElement) -> Stateful<Div> {
+/// a transport glyph at `scale` of `size`, centred in its box.
+fn grow_glyph(t: &Theme, name: &str, size: f32, color: Hsla, scale: f32, opacity: f32) -> Div {
+    // one raster at the grown size, scaled on the GPU so the glyph moves by fractions of a pixel; its margin keeps neighbours out.
+    let grown = size * HOVER_GROW;
+    let side = t.s(grown * (1.0 + 2.0 * GROW_MARGIN));
+    let glyph = svg()
+        .path(format!("{}{name}.svg", crate::assets::GROW_PREFIX))
+        .absolute()
+        .size(side)
+        .text_color(color.opacity(opacity))
+        .with_transformation(gpui::Transformation::scale(gpui::size(scale / HOVER_GROW, scale / HOVER_GROW)));
+    // the atlas samples linearly, so the glyph is clipped a pixel inside its scaled raster to avoid a neighbour's edge.
+    let inset = side * (1.0 - scale / HOVER_GROW) / 2.0 + px(1.0);
+    div()
+        .absolute()
+        .left((t.s(size) - side) / 2.0 + inset)
+        .top((t.s(size) - side) / 2.0 + inset)
+        .size(side - inset * 2.0)
+        .overflow_hidden()
+        .child(glyph.left(-inset).top(-inset))
+}
+
+/// `icon_button` with a drawn glyph in place of an icon (the Download switch's progress ring).
+pub fn icon_button_with(t: &Theme, id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool, glyph: impl IntoElement) -> Stateful<Div> {
     let id = id.into();
-    icon_button_shell(t, id, active).child(glyph)
+    let (on, ticker) = toggle_ease(id.clone(), active);
+    let fill = t.glass_on();
+    pressable(icon_button_shell(t, id.clone(), label), id).child(ticker).when(on > 0.0, |d| d.bg(gpui::Rgba { a: fill.a * on, ..fill })).child(glyph)
 }
 
 /// The download mark. Filled when downloaded, a filling ring while downloading, gray while
@@ -476,8 +741,37 @@ pub enum DownloadGlyph {
     Fetching,
 }
 
-/// Draws a download glyph `size` tokens square. `progress` from 0 to 1 fills the ring, and `ink`
-/// colors the arrow until done.
+/// `--accent-wheel`: every hue at the accent's saturation and lightness, red at the top, clockwise.
+pub fn accent_wheel() -> impl IntoElement {
+    const WEDGES: usize = 72;
+    gpui::canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let r = bounds.size.width / 2.0;
+            let centre = bounds.center();
+            let at = |f: f32| {
+                let angle = f * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+                centre + point(r * angle.cos(), r * angle.sin())
+            };
+            for i in 0..WEDGES {
+                let (from, to) = (i as f32 / WEDGES as f32, (i as f32 + 1.5) / WEDGES as f32);
+                let mut b = gpui::PathBuilder::fill();
+                b.move_to(centre);
+                b.line_to(at(from));
+                b.arc_to(point(r, r), px(0.0), false, true, at(to.min(1.0 + 0.5 / WEDGES as f32)));
+                b.close();
+                if let Ok(path) = b.build() {
+                    let hue = (i as f32 + 0.5) * 360.0 / WEDGES as f32;
+                    window.paint_path(path, Hsla::from(gpui::rgb(crate::color::hue_to_hex(hue))));
+                }
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+/// `size` tokens square; `progress` 0 to 1 fills the ring; `ink` is the arrow's color while not done.
 pub fn download_glyph(t: &Theme, glyph: DownloadGlyph, progress: f32, size: f32, ink: Hsla) -> impl IntoElement {
     let (done_fill, done_ink, track, paused) = (t.downloaded(), t.downloaded_ink(), t.download_track(), t.download_paused());
     let arc_color: Hsla = if glyph == DownloadGlyph::Paused { paused.into() } else { done_fill };
@@ -543,17 +837,17 @@ pub fn download_glyph(t: &Theme, glyph: DownloadGlyph, progress: f32, size: f32,
     .size(t.s(size))
 }
 
-fn icon_button_shell(t: &Theme, id: ElementId, active: bool) -> Stateful<Div> {
+fn icon_button_shell(t: &Theme, id: ElementId, label: impl Into<SharedString>) -> Stateful<Div> {
     div()
         .id(id)
+        .tooltip(tip(t, label))
         .flex()
         .items_center()
         .justify_center()
         .flex_none()
         .w(t.s(ICON_W))
-        .h(t.s(34.0))
+        .h(t.s(ICON_BUTTON_H))
         .rounded_full()
-        .when(active, |d| d.bg(t.glass_on()))
 }
 
 /// The small "E" after a title the server flags explicit, sized from the text it follows.
@@ -574,8 +868,8 @@ pub fn explicit_mark(t: &Theme, text: f32) -> gpui::Div {
         .child("E")
 }
 
-/// A one-line title followed by its explicit mark when it has one. `title` should truncate itself.
-pub fn titled(t: &Theme, title: gpui::Div, explicit: bool, text: f32) -> gpui::Div {
+/// a one-line title, followed by its explicit mark; `title` should truncate itself (and take a [`FullTextTip`]).
+pub fn titled(t: &Theme, title: impl IntoElement + Styled, explicit: bool, text: f32) -> gpui::Div {
     div().flex().flex_row().items_center().min_w(gpui::px(0.0)).child(title.min_w(gpui::px(0.0))).when(explicit, |d| d.child(explicit_mark(t, text)))
 }
 
@@ -608,6 +902,12 @@ pub struct Ink {
     pub pressed: bool,
     /// Press progress from 0 to 1, over `HOVER_PRESS` going down and `HOVER_IN` coming back up.
     pub press: f32,
+    /// the scale of the four-step press (`PressPhase`).
+    pub phase: f32,
+    /// how far a held control's fill has grown, 0 to 1 over `ACTIVE_FILL_GROW`; it keeps its size once let go.
+    pub grown: f32,
+    /// the held fill's strength: in over `ACTIVE_FILL_GROW`, out over `ACTIVE_FILL_FADE`.
+    pub fill: f32,
 }
 
 impl Ink {
@@ -622,12 +922,205 @@ impl Ink {
     pub fn opacity(self, rest: f32) -> f32 {
         if self.pressed { PRESS_DIM } else { rest + (1.0 - rest) * self.amount }
     }
-    /// The scale for play and skip, grown on hover and shrunk while pressed.
-    pub fn scale(self) -> f32 {
-        let hover = 1.0 + (motion::hover_grow() - 1.0) * self.amount;
-        let shrink = if motion::reduced() { 1.0 } else { PRESS_SHRINK };
-        hover + (shrink - hover) * self.press
+    /// every other button: `--press-shrink` while held, easing there over `--hover-press` and back over `--hover-in`.
+    pub fn press_scale(self) -> f32 {
+        self.press_scale_in(Feel::PLAIN)
     }
+    /// Play and skip: grown on hover, shrunk while pressed; with the four-step press there's no hover grow.
+    pub fn scale_in(self, feel: Feel) -> f32 {
+        if feel.phases() {
+            return self.phase;
+        }
+        let hover = 1.0 + (motion::hover_grow() - 1.0) * self.amount;
+        hover + (PRESS_SHRINK - hover) * self.press
+    }
+    /// `press_scale` where the control sits.
+    pub fn press_scale_in(self, feel: Feel) -> f32 {
+        if feel.phases() { self.phase } else { 1.0 + (PRESS_SHRINK - 1.0) * self.press }
+    }
+}
+
+/// where a player control sits: the bar shows `--active-fill` while held; the bar, the side player and full screen
+/// press in `PressPhase` steps.
+#[derive(Clone, Copy)]
+pub struct Feel {
+    pub fill: bool,
+    pub phase: bool,
+}
+
+impl Feel {
+    pub const BAR: Feel = Feel { fill: true, phase: true };
+    pub const PLAYER: Feel = Feel { fill: false, phase: true };
+    pub const PLAIN: Feel = Feel { fill: false, phase: false };
+
+    /// Reduce Motion keeps the plain `--press-shrink`.
+    fn phases(self) -> bool {
+        self.phase && !motion::reduced()
+    }
+}
+
+/// a button drawn as a whole shrinks to `--press-shrink` while held, without moving anything around it.
+pub fn pressable(el: Stateful<Div>, key: impl Into<ElementId>) -> Stateful<Div> {
+    pressable_in(el, key, Feel::PLAIN)
+}
+
+type MenuOpen = dyn Fn(&mut crate::shell::Shell, gpui::Point<gpui::Pixels>, &mut gpui::Context<crate::shell::Shell>);
+
+/// a menu button (`player_menu_button`): its menu opens on mouse down, or on Enter and Space.
+pub fn menu_on_press(el: Stateful<Div>, cx: &mut gpui::Context<crate::shell::Shell>, open: impl Fn(&mut crate::shell::Shell, gpui::Point<gpui::Pixels>, &mut gpui::Context<crate::shell::Shell>) + 'static) -> Stateful<Div> {
+    let open: std::rc::Rc<MenuOpen> = std::rc::Rc::new(open);
+    let keys = open.clone();
+    el.on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+        cx.stop_propagation();
+        open(this, event.position, cx);
+    }))
+    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+        if event.is_keyboard() {
+            keys(this, event.position(), cx);
+        }
+    }))
+}
+
+/// `pressable` for a player control, pressed as its `feel` says.
+pub fn pressable_in(el: Stateful<Div>, key: impl Into<ElementId>, feel: Feel) -> Stateful<Div> {
+    let key = key.into();
+    let scale = ink(key.clone()).press_scale_in(feel);
+    el.child(press_track(key, feel)).paint_scale(scale)
+}
+
+/// how far a toggle's on look shows (0 to 1), easing over `--toggle-fade`; add the returned element as a child.
+pub fn toggle_ease(key: impl Into<ElementId>, on: bool) -> (f32, AnyElement) {
+    ease_to(key, on, motion::TOGGLE_FADE, motion::HOVER_EASE)
+}
+
+/// [`toggle_ease`] over `secs` on its own `curve` (a CSS cubic-bezier, which may overshoot).
+pub fn ease_to(key: impl Into<ElementId>, on: bool, secs: f32, curve: [f32; 4]) -> (f32, AnyElement) {
+    let key = key.into();
+    let (amount, running) = eased(key.clone(), on, secs, curve);
+    (amount, if running { ease_ticker(key) } else { animation::idle() })
+}
+
+/// [`ease_to`]'s value and whether it's still moving, for a caller that keeps its own ticker; a change of `on`
+/// mid-way turns back from where it is.
+pub fn eased(key: impl Into<ElementId>, on: bool, secs: f32, curve: [f32; 4]) -> (f32, bool) {
+    let motion = animation::animate(key, if on { 1.0 } else { 0.0 }, animation::Curve::ease(secs, curve));
+    (motion.value, motion.moving)
+}
+
+/// asks for frames while `key`'s [`eased`] value moves; add it as a child of the view that reads the value.
+pub fn ease_ticker(key: impl Into<ElementId>) -> AnyElement {
+    animation::ticker([key])
+}
+
+thread_local! {
+    static SWAPS: std::cell::RefCell<std::collections::HashMap<ElementId, SwapState>> = Default::default();
+}
+
+struct SwapState {
+    current: Box<dyn std::any::Any>,
+    leaving: Option<Box<dyn std::any::Any>>,
+}
+
+/// what a cross-fade by key shows: the incoming content's share (0 to 1, eased) and the one it replaces while that fades.
+pub struct Swapping<K> {
+    pub shown: f32,
+    pub leaving: Option<K>,
+}
+
+/// cross-fades content keyed by `current` over `secs`: when the key changes, the old one fades out over the new one,
+/// which fades in. only the latest old key is kept, so quick changes never pile up. add the element as a child of the
+/// view that draws both; it asks for frames while the fade runs.
+pub fn swap<K: Clone + PartialEq + 'static>(id: impl Into<ElementId>, current: &K, secs: f32) -> (Swapping<K>, AnyElement) {
+    let id = id.into();
+    let curve = animation::Curve::ease(secs, motion::EASE);
+    let (shown, leaving) = SWAPS.with(|m| {
+        let mut m = m.borrow_mut();
+        let state = m.entry(id.clone()).or_insert_with(|| {
+            animation::restart(id.clone(), 0.0, 1.0, curve);
+            SwapState { current: Box::new(current.clone()), leaving: None }
+        });
+        if state.current.downcast_ref::<K>() != Some(current) {
+            let old = std::mem::replace(&mut state.current, Box::new(current.clone()));
+            state.leaving = (!motion::reduced()).then_some(old);
+            animation::restart(id.clone(), 0.0, 1.0, curve);
+        }
+        let shown = animation::current(id.clone()).unwrap_or(animation::Motion { value: 1.0, moving: false });
+        if !shown.moving {
+            state.leaving = None;
+        }
+        (shown.value, state.leaving.as_ref().and_then(|k| k.downcast_ref::<K>().cloned()))
+    });
+    let ticker = if leaving.is_some() { animation::ticker([id]) } else { animation::idle() };
+    (Swapping { shown, leaving }, ticker)
+}
+
+/// a layer of a [`swap`] filling its `relative` parent: the incoming one fades in rising `rise`, the leaving one fades out.
+pub fn swap_layer(content: impl IntoElement, shown: f32, rise: gpui::Pixels, incoming: bool) -> Div {
+    let (opacity, lift) = if incoming { (shown, rise * (1.0 - shown)) } else { (1.0 - shown, px(0.0)) };
+    // the rise is painted, not laid out, so it moves by fractions of a pixel
+    div().absolute().inset_0().when(lift != px(0.0), |d| d.paint_offset(gpui::point(px(0.0), lift))).when(opacity < 1.0, |d| d.opacity(opacity)).child(content)
+}
+
+fn pop_key(id: &ElementId) -> ElementId {
+    ElementId::NamedChild(std::sync::Arc::new(id.clone()), "pop".into())
+}
+
+/// pops the glyph of icon button `id`, as a heart does when liking; a second pop restarts it.
+pub fn pop(id: impl Into<ElementId>) {
+    if !motion::reduced() {
+        animation::restart(pop_key(&id.into()), 0.0, 1.0, animation::Curve::ease(motion::LIKE_POP, motion::EASE));
+    }
+}
+
+/// the glyph's scale `LIKE_POP` seconds through a pop: up to `LIKE_POP_SCALE` at `LIKE_POP_PEAK` and back, on `--ease`.
+fn pop_scale(id: &ElementId) -> Option<f32> {
+    let key = pop_key(id);
+    let shown = animation::current(key.clone())?;
+    if !shown.moving {
+        animation::forget(key);
+        return None;
+    }
+    let e = shown.value;
+    let k = if e < motion::LIKE_POP_PEAK { e / motion::LIKE_POP_PEAK } else { (1.0 - e) / (1.0 - motion::LIKE_POP_PEAK) };
+    Some(1.0 + (motion::LIKE_POP_SCALE - 1.0) * k)
+}
+
+/// `glyph`, scaled while a [`pop`] of `id` runs.
+fn popped(id: &ElementId, glyph: Svg) -> AnyElement {
+    let Some(scale) = pop_scale(id) else { return glyph.into_any_element() };
+    div().flex_none().relative().paint_scale(scale).child(animation::ticker([pop_key(id)])).child(glyph).into_any_element()
+}
+
+fn card_key(group: &str) -> ElementId {
+    ElementId::Name(SharedString::from(format!("{group}:hover")))
+}
+
+/// how far a card's hover look shows (0 to 1), easing both ways over `secs` once `card_track(group)` sees the pointer; add the returned element as a child.
+pub fn card_hover(group: &str, secs: f32) -> (f32, AnyElement) {
+    let key = card_key(group);
+    let hovered = INKS.with(|m| m.borrow().get(&key).is_some_and(|f| f.hovered));
+    ease_to(key, hovered, secs, motion::EASE)
+}
+
+/// tracks the pointer over a card for `card_hover`; add it last to the card, which must be `relative`.
+pub fn card_track(group: &str) -> impl IntoElement {
+    hover_track(card_key(group))
+}
+
+/// one segment of a glass pill of choices: `--glass-on` behind it while on; draw the label in the ink returned.
+pub fn segment(t: &Theme, id: impl Into<ElementId>, on: bool, rest: impl Into<Hsla>) -> (Stateful<Div>, Hsla) {
+    let id = id.into();
+    let ink = ink(id.clone());
+    let (shown, ticker) = toggle_ease(id.clone(), on);
+    let fill = t.glass_on();
+    let color = mix_hsla(ink.color(rest, t.hover_ink()), t.t_em(), shown);
+    let el = pressable(div().id(id.clone()), id).child(ticker).rounded_full().when(shown > 0.0, |d| d.bg(gpui::Rgba { a: fill.a * shown, ..fill })).when(!on, |d| d.opacity(ink.opacity(1.0)));
+    (el, color)
+}
+
+/// `a` mixed toward `b` by `t`.
+pub fn mix_hsla(a: impl Into<Hsla>, b: impl Into<Hsla>, t: f32) -> Hsla {
+    Ink { amount: t, ..Default::default() }.color(a, b)
 }
 
 thread_local! {
@@ -638,21 +1131,31 @@ thread_local! {
 pub fn ink(key: impl Into<ElementId>) -> Ink {
     let key = key.into();
     let now = std::time::Instant::now();
-    INKS.with(|m| m.borrow().get(&key).map(|f| Ink { amount: f.amount(now), pressed: f.pressed.get(), press: f.press(now) }).unwrap_or_default())
+    INKS.with(|m| {
+        m.borrow().get(&key).map(|f| Ink { amount: f.amount(now), pressed: f.pressed.get(), press: f.press(now), phase: f.phase_moving(now).0, grown: f.grown(now), fill: f.fill(now) }).unwrap_or_default()
+    })
 }
 
 /// Tracks the pointer over a small control for `ink(key)`. Add it as the control's first child.
 /// It redraws the view while the ink fades and on enter, leave and press.
 pub fn hover_track(key: impl Into<ElementId>) -> impl IntoElement {
-    track(key.into(), 0.0)
+    track(key.into(), 0.0, false)
 }
 
-/// Tracks the pointer over an area that reveals controls on hover, for `ink(key).amount`. Add it
-/// as the area's last child, so its hitbox sits over the area's own controls and they stay while
-/// hovered. Anything drawn over the area from outside still hides it. After the pointer leaves,
-/// the controls wait a grace period before fading.
+/// `hover_track` for a player control.
+pub fn press_track(key: impl Into<ElementId>, _feel: Feel) -> impl IntoElement {
+    hover_track(key)
+}
+
+/// `press_track` for a control whose menu opens on mouse down, so it never sees the release: the press plays
+/// squash, over and rest at once, with the held fill through it where `feel` has one.
+pub fn menu_press_track(key: impl Into<ElementId>, feel: Feel) -> impl IntoElement {
+    track(key.into(), 0.0, feel.phases())
+}
+
+/// tracks the pointer over an area that reveals controls; add it last so its hitbox isn't hidden by them. they stay `--reveal-grace` after leaving.
 pub fn reveal_track(key: impl Into<ElementId>) -> impl IntoElement {
-    track(key.into(), motion::REVEAL_GRACE)
+    track(key.into(), motion::REVEAL_GRACE, false)
 }
 
 thread_local! {
@@ -660,7 +1163,7 @@ thread_local! {
     static LEFT: std::cell::RefCell<std::collections::HashMap<ElementId, std::time::Instant>> = Default::default();
 }
 
-fn track(key: ElementId, grace: f32) -> impl IntoElement {
+fn track(key: ElementId, grace: f32, burst: bool) -> impl IntoElement {
     gpui::canvas(
         |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
         move |_, hitbox, window, _| {
@@ -678,14 +1181,14 @@ fn track(key: ElementId, grace: f32) -> impl IntoElement {
                     let left = *l.entry(key.clone()).or_insert(now);
                     let held = now.saturating_duration_since(left).as_secs_f32() < grace;
                     if held {
-                        window.request_animation_frame();
+                        crate::animation::request_frame(window);
                     } else {
                         l.remove(&key);
                     }
                     held
                 });
             }
-            let (amount, pressed, press) = INKS.with(|m| {
+            let (amount, pressed, press, moving, fade) = INKS.with(|m| {
                 let mut m = m.borrow_mut();
                 let state = m.entry(key.clone()).or_insert_with(|| HoverFade { hovered: false, since: now, from: 0.0, pressed: Default::default(), press: Default::default() });
                 if state.hovered != hovered {
@@ -693,19 +1196,19 @@ fn track(key: ElementId, grace: f32) -> impl IntoElement {
                     *state = HoverFade { hovered, since: now, from, pressed: state.pressed.clone(), press: state.press.clone() };
                 }
                 state.follow_press(now);
-                (state.amount(now), state.pressed.clone(), state.press(now))
+                (state.amount(now), state.pressed.clone(), state.press(now), state.press_moving(now), state.press.clone())
             });
             if !hovered && pressed.get() {
                 pressed.set(false);
             }
-            let pressing = if pressed.get() { press < 1.0 } else { press > 0.0 };
+            let pressing = moving || if pressed.get() { press < 1.0 } else { press > 0.0 };
             if (hovered && amount < 1.0) || (!hovered && amount > 0.0) || pressing {
-                window.request_animation_frame();
+                crate::animation::request_frame(window);
             }
             if hover_log() {
                 eprintln!("navia: hover {key:?} {:.1} ms amount {amount:.4} press {press:.4}", crate::testing::since_start_ms());
             }
-            track_pointer(window, &hitbox, hovered, pressed);
+            track_pointer(window, &hitbox, hovered, pressed, burst.then_some(fade));
         },
     )
     .absolute()
@@ -714,8 +1217,44 @@ fn track(key: ElementId, grace: f32) -> impl IntoElement {
     .size_full()
 }
 
+thread_local! {
+    static POINTER_BUTTON: std::cell::Cell<Option<gpui::MouseButton>> = const { std::cell::Cell::new(None) };
+}
+
+/// hover only follows pointer moves, so a row stays lit after the pointer leaves the window; this moves the
+/// pointer away from the window when it leaves. add it once to each window's root.
+pub fn hover_clears_on_leave() -> AnyElement {
+    gpui::canvas(
+        |_, _, _| {},
+        |_, _, window, _| {
+            window.on_mouse_event(|event: &gpui::MouseMoveEvent, phase, _, _| {
+                if phase == gpui::DispatchPhase::Capture {
+                    POINTER_BUTTON.set(event.pressed_button);
+                }
+            });
+            window.on_mouse_event(|_: &gpui::MouseExitEvent, phase, window, _| {
+                // a drag carries on outside the window
+                if phase == gpui::DispatchPhase::Capture && POINTER_BUTTON.get().is_none() {
+                    // not from inside this dispatch, which holds the frame's listeners
+                    window.on_next_frame(|window, cx| {
+                        if !window.is_window_hovered() {
+                            let away = window.viewport_size();
+                            let event = gpui::MouseMoveEvent { position: point(-away.width, -away.height), pressed_button: None, modifiers: window.modifiers() };
+                            window.dispatch_event(gpui::PlatformInput::MouseMove(event), cx);
+                        }
+                    });
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_0()
+    .into_any_element()
+}
+
 /// Redraws the current view when the pointer crosses `hitbox` or presses and releases on it.
-fn track_pointer(window: &mut gpui::Window, hitbox: &gpui::Hitbox, hovered: bool, pressed: std::rc::Rc<std::cell::Cell<bool>>) {
+/// with `burst`, a press plays its release at once instead of holding.
+fn track_pointer(window: &mut gpui::Window, hitbox: &gpui::Hitbox, hovered: bool, pressed: std::rc::Rc<std::cell::Cell<bool>>, burst: Option<std::rc::Rc<std::cell::Cell<PressFade>>>) {
     let view = window.current_view();
     let moved = hitbox.clone();
     window.on_mouse_event(move |_: &gpui::MouseMoveEvent, phase, window, cx| {
@@ -727,7 +1266,10 @@ fn track_pointer(window: &mut gpui::Window, hitbox: &gpui::Hitbox, hovered: bool
     let downbox = hitbox.clone();
     window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, window, cx| {
         if phase == gpui::DispatchPhase::Capture && event.button == gpui::MouseButton::Left && downbox.is_hovered(window) {
-            down.set(true);
+            match &burst {
+                Some(fade) => fade.set(PressFade { since: Some(std::time::Instant::now()), scale_from: 1.0, grown: 1.0, burst: true, ..Default::default() }),
+                None => down.set(true),
+            }
             cx.notify(view);
         }
     });
@@ -756,12 +1298,32 @@ struct HoverFade {
     since: std::time::Instant,
     from: f32,
     pressed: std::rc::Rc<std::cell::Cell<bool>>,
-    /// The press's own fade as (down, since, from), restarted when the button goes down or up.
-    press: std::rc::Rc<std::cell::Cell<(bool, Option<std::time::Instant>, f32)>>,
+    /// the press's own fade, restarted when the button goes down or comes up.
+    press: std::rc::Rc<std::cell::Cell<PressFade>>,
 }
 
-/// One step of a transition from `from` toward `to` over `secs`, `dt` seconds in. As in CSS, a
-/// change partway starts a new full-length transition from the current value.
+/// a press going down or coming up: since when, and where its ease, scale and fill growth were then.
+#[derive(Clone, Copy, Default)]
+struct PressFade {
+    down: bool,
+    since: Option<std::time::Instant>,
+    from: f32,
+    scale_from: f32,
+    grown: f32,
+    fill_from: f32,
+    /// down and up in one go (`menu_press_track`): the fill holds through the whole release.
+    burst: bool,
+}
+
+/// from `from` toward `phase`'s scale, `dt` seconds into the step.
+fn phase_step(from: f32, phase: PressPhase, dt: f32) -> f32 {
+    let (secs, curve) = phase.motion();
+    from + (phase.scale() - from) * motion::cubic_bezier(curve, motion::progress(dt, secs))
+}
+
+const RELEASE: [PressPhase; 3] = [PressPhase::Squash, PressPhase::Over, PressPhase::Rest];
+
+/// one transition from `from` towards `to` over `secs`, `dt` seconds in; a change partway restarts from where it is, as CSS does.
 fn hover_step(from: f32, to: f32, secs: f32, dt: f32) -> f32 {
     from + (to - from) * motion::hover_ease(motion::progress(dt, secs))
 }
@@ -775,19 +1337,72 @@ impl HoverFade {
 
     /// The press, going down over the press time and back up over the fade-in time.
     fn press(&self, now: std::time::Instant) -> f32 {
-        let (down, since, from) = self.press.get();
-        let Some(since) = since else { return if down { 1.0 } else { 0.0 } };
+        let p = self.press.get();
+        let Some(since) = p.since else { return if p.down { 1.0 } else { 0.0 } };
         let dt = now.saturating_duration_since(since).as_secs_f32();
-        if down { hover_step(from, 1.0, motion::HOVER_PRESS, dt) } else { hover_step(from, 0.0, motion::HOVER_IN, dt) }
+        if p.down { hover_step(p.from, 1.0, motion::HOVER_PRESS, dt) } else { hover_step(p.from, 0.0, motion::HOVER_IN, dt) }
+    }
+
+    /// the `PressPhase` scale, and whether it's still moving: `Held` while down; let go, each step after the last.
+    fn phase_moving(&self, now: std::time::Instant) -> (f32, bool) {
+        let p = self.press.get();
+        let Some(since) = p.since else { return (if p.down { PressPhase::Held.scale() } else { 1.0 }, false) };
+        let mut dt = now.saturating_duration_since(since).as_secs_f32();
+        if p.down {
+            return (phase_step(p.scale_from, PressPhase::Held, dt), dt < PressPhase::Held.motion().0);
+        }
+        let mut from = p.scale_from;
+        for phase in RELEASE {
+            let secs = phase.motion().0;
+            if dt < secs {
+                return (phase_step(from, phase, dt), true);
+            }
+            dt -= secs;
+            from = phase.scale();
+        }
+        (1.0, false)
+    }
+
+    /// the held fill's growth: up over `ACTIVE_FILL_GROW` while held, kept as it was once let go.
+    fn grown(&self, now: std::time::Instant) -> f32 {
+        let p = self.press.get();
+        match (p.down, p.since) {
+            (true, Some(since)) => motion::cubic_bezier(motion::EASE_OUT, motion::progress(now.saturating_duration_since(since).as_secs_f32(), motion::ACTIVE_FILL_GROW)),
+            _ => p.grown,
+        }
+    }
+
+    /// the held fill's strength: up over `ACTIVE_FILL_GROW` while held, down over `ACTIVE_FILL_FADE` once let go.
+    fn fill(&self, now: std::time::Instant) -> f32 {
+        let p = self.press.get();
+        let Some(since) = p.since else { return if p.down { 1.0 } else { 0.0 } };
+        let dt = now.saturating_duration_since(since).as_secs_f32();
+        if p.burst {
+            let held: f32 = RELEASE.iter().map(|phase| phase.motion().0).sum();
+            return if dt < held {
+                motion::cubic_bezier(motion::EASE_OUT, motion::progress(dt, motion::PRESS_IN))
+            } else {
+                1.0 - motion::cubic_bezier(motion::EASE_OUT, motion::progress(dt - held, motion::ACTIVE_FILL_FADE))
+            };
+        }
+        let (to, secs) = if p.down { (1.0, motion::ACTIVE_FILL_GROW) } else { (0.0, motion::ACTIVE_FILL_FADE) };
+        p.fill_from + (to - p.fill_from) * motion::cubic_bezier(motion::EASE_OUT, motion::progress(dt, secs))
+    }
+
+    /// the press or the fill still needs frames.
+    fn press_moving(&self, now: std::time::Instant) -> bool {
+        let p = self.press.get();
+        let fill = self.fill(now);
+        let filling = if p.down { fill < 1.0 || self.grown(now) < 1.0 } else { fill > 0.0 };
+        p.since.is_some() && (self.phase_moving(now).1 || filling)
     }
 
     /// Starts the press's fade when the button has gone down or come up since the last frame.
     fn follow_press(&self, now: std::time::Instant) {
         let down = self.pressed.get();
-        let (was, _, _) = self.press.get();
-        if down != was {
-            let from = self.press(now);
-            self.press.set((down, Some(now), from));
+        if down != self.press.get().down {
+            let grown = if down { 0.0 } else { self.grown(now) };
+            self.press.set(PressFade { down, since: Some(now), from: self.press(now), scale_from: self.phase_moving(now).0, grown, fill_from: self.fill(now), burst: false });
         }
     }
 }
@@ -831,9 +1446,9 @@ pub fn hover_fill(shape: HoverShape, hover: gpui::Rgba, press: gpui::Rgba) -> im
                 window.paint_quad(gpui::fill(rect, color).corner_radii(radius));
             }
             if (hovered && amount < 1.0) || (!hovered && amount > 0.0) {
-                window.request_animation_frame();
+                crate::animation::request_frame(window);
             }
-            track_pointer(window, &hitbox, hovered, pressed);
+            track_pointer(window, &hitbox, hovered, pressed, None);
         },
     )
     .absolute()
@@ -957,7 +1572,7 @@ pub fn spinner(t: &Theme, key: impl Into<ElementId>, size: f32, color: impl Into
         return glyph.into_any_element();
     }
     glyph
-        .with_animation(key, Animation::new(std::time::Duration::from_millis(SPIN_PERIOD_MS)).repeat(), |svg, delta| svg.with_transformation(Transformation::rotate(percentage(delta))))
+        .with_animation(key, Animation::new(std::time::Duration::from_millis(SPIN_PERIOD)).repeat(), |svg, delta| svg.with_transformation(Transformation::rotate(percentage(delta))))
         .into_any_element()
 }
 
@@ -1031,8 +1646,8 @@ pub fn dialog_code(t: &Theme, code: impl Into<SharedString>, copy: impl IntoElem
 /// The filter chip, `CHIP_H` tall, glass at rest and filled when on. Add the label and glyphs as
 /// children. It's the whole chip unless there's an X ([`filter_chip_remove`]).
 pub fn filter_chip(t: &Theme, id: impl Into<ElementId>, on: bool) -> Stateful<Div> {
-    let chip = div()
-        .id(id)
+    let id = id.into();
+    let chip = pressable(div().id(id.clone()), id)
         .relative()
         .flex()
         .flex_row()
@@ -1228,27 +1843,57 @@ pub enum LabelAt {
     Bottom,
 }
 
-/// The quiet label chip on art the app made, with white text over a scrim.
-pub fn cover_label(t: &Theme, label: &'static str, at: LabelAt) -> Div {
-    let chip = div().absolute().left(t.s(COVER_LABEL_INSET));
-    let chip = match at {
-        LabelAt::Top => chip.top(t.s(COVER_LABEL_INSET)),
-        LabelAt::Bottom => chip.bottom(t.s(COVER_LABEL_INSET)),
-    };
-    chip.px(t.s(COVER_LABEL_PAD_X))
-        .py(t.s(COVER_LABEL_PAD_Y))
-        .rounded_full()
-        .bg(t.scrim())
-        .shadow(glass_edge())
-        .text_size(t.text(TEXT_XS))
-        .font_weight(FontWeight::SEMIBOLD)
-        .line_height(relative(1.3))
-        .text_color(t.t_on_art())
-        .child(label)
+/// how a [`cover_label`] looks: the glass chip, or `Mark`, the bare glyph and uppercase word over a photo, sized by
+/// the cover's `width` (`--cover-mark-*`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LabelStyle {
+    Chip,
+    Mark { glyph: &'static str, width: f32 },
 }
 
-/// The background for a tile with light text on a tint, like a genre tile. The `tile_fill` ramp
-/// along `TILE_FILL_ANGLE`, or a neutral panel while the tint is unknown.
+/// the quiet label on art the app made; the chip is `--scrim` with the glass edge, `--cover-label-*` from the corner.
+pub fn cover_label(t: &Theme, label: impl Into<SharedString>, at: LabelAt, style: LabelStyle) -> Div {
+    let label: SharedString = label.into();
+    let inset = match style {
+        LabelStyle::Chip => COVER_LABEL_INSET,
+        LabelStyle::Mark { width, .. } => width * COVER_MARK_INSET,
+    };
+    let el = div().absolute().left(t.s(inset));
+    let el = match at {
+        LabelAt::Top => el.top(t.s(inset)),
+        LabelAt::Bottom => el.bottom(t.s(inset)),
+    };
+    match style {
+        LabelStyle::Chip => el
+            .px(t.s(COVER_LABEL_PAD_X))
+            .py(t.s(COVER_LABEL_PAD_Y))
+            .rounded_full()
+            .bg(t.scrim())
+            .shadow(glass_edge())
+            .text_size(t.text(TEXT_XS))
+            .font_weight(FontWeight::SEMIBOLD)
+            .line_height(relative(1.3))
+            .text_color(t.t_on_art())
+            .child(label),
+        LabelStyle::Mark { glyph, width } => el
+            .flex()
+            .items_center()
+            .gap(t.s(width * COVER_MARK_GAP))
+            .text_size(t.s(width * COVER_MARK_TEXT))
+            .font_weight(FontWeight::SEMIBOLD)
+            .line_height(relative(1.0))
+            .text_color(t.cover_mark_ink())
+            .child(icon(t, glyph, width * COVER_MARK_GLYPH, t.cover_mark_ink()))
+            .child(label.to_uppercase()),
+    }
+}
+
+/// so counting numbers don't shift.
+pub fn tabular_figures() -> gpui::FontFeatures {
+    gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]))
+}
+
+/// the `tile_fill` ramp along `TILE_FILL_ANGLE`, or `--panel-2` while the tint isn't known.
 pub fn tile_fill_bg(t: &Theme, tint: Option<crate::color::Srgb>) -> gpui::Background {
     match tint {
         Some(tint) => {
@@ -1259,12 +1904,98 @@ pub fn tile_fill_bg(t: &Theme, tint: Option<crate::color::Srgb>) -> gpui::Backgr
     }
 }
 
-/// How wide one line of the app's font draws, from glyph advances, for layout outside paint.
-/// Kerning isn't counted, so it errs slightly wide.
+/// one line's width from glyph advances, for layout outside paint; kerning isn't counted, so it errs slightly wide.
+/// watches the room an element gets: when whether `need` fits differs from `fits` (what was drawn),
+/// it draws again, so a whole-or-nothing choice follows a resize without waiting for another event.
+pub fn watch_fit(store: std::rc::Rc<std::cell::RefCell<gpui::Bounds<gpui::Pixels>>>, need: gpui::Pixels, fits: bool) -> impl IntoElement {
+    gpui::canvas(
+        move |bounds, window, _| {
+            *store.borrow_mut() = bounds;
+            if (bounds.size.width + px(0.5) >= need) != fits {
+                window.refresh();
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// shaped widths already measured, by text, size and weight; cleared when it grows past this
+const TEXT_WIDTHS_KEPT: usize = 512;
+
+thread_local! {
+    static TEXT_WIDTHS: std::cell::RefCell<std::collections::HashMap<(String, u32, u32), gpui::Pixels>> = Default::default();
+}
+
+/// the width `text` draws at in the app's font, shaped as painting shapes it (kerning and all), so
+/// a fit decided by it matches what's drawn; for places without a window
 pub fn text_width_app(cx: &gpui::App, text: &str, size: gpui::Pixels, weight: FontWeight) -> gpui::Pixels {
+    let key = (text.to_string(), f32::from(size).to_bits(), weight.0.to_bits());
+    if let Some(width) = TEXT_WIDTHS.with(|w| w.borrow().get(&key).copied()) {
+        return width;
+    }
     let mut font = gpui::font(crate::assets::FONT_FAMILY);
     font.weight = weight;
-    let system = cx.text_system();
-    let id = system.resolve_font(&font);
-    text.chars().map(|c| system.advance(id, size, c).map(|s| s.width).unwrap_or(px(0.0))).fold(px(0.0), |a, b| a + b)
+    let run = gpui::TextRun { len: text.len(), font, color: Hsla::default(), background_color: None, underline: None, strikethrough: None };
+    let width = gpui::WindowTextSystem::new(cx.text_system().clone()).layout_line(text, size, &[run], None).width;
+    TEXT_WIDTHS.with(|w| {
+        let mut w = w.borrow_mut();
+        if w.len() >= TEXT_WIDTHS_KEPT {
+            w.clear();
+        }
+        w.insert(key, width);
+    });
+    width
+}
+
+/// draws `child` fading out to clear towards its right edge, so the page behind shows through
+/// whatever it is (a tint, the translucent window). the last `gap` of the width is clear; the fade
+/// runs over the `fade` before it through `stops`. both are window pixels; nothing is faded at 0.
+pub fn fade_right(child: AnyElement, fade: gpui::Pixels, gap: gpui::Pixels, stops: [(f32, f32); 2]) -> AnyElement {
+    FadeRight { child, fade, gap, stops }.into_any_element()
+}
+
+struct FadeRight {
+    child: AnyElement,
+    fade: gpui::Pixels,
+    gap: gpui::Pixels,
+    stops: [(f32, f32); 2],
+}
+
+impl FadeRight {
+    fn within<R>(&mut self, bounds: gpui::Bounds<gpui::Pixels>, window: &mut gpui::Window, f: impl FnOnce(&mut AnyElement, &mut gpui::Window) -> R) -> R {
+        let clip = gpui::Bounds { origin: bounds.origin, size: gpui::size((bounds.size.width - self.gap).max(px(0.0)), bounds.size.height) };
+        let fade = gpui::ClipFade { width: self.fade, stops: self.stops };
+        window.with_faded_clip(clip, fade, |window| f(&mut self.child, window))
+    }
+}
+
+impl IntoElement for FadeRight {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for FadeRight {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, window: &mut gpui::Window, cx: &mut gpui::App) -> (gpui::LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+    fn prepaint(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, bounds: gpui::Bounds<gpui::Pixels>, _: &mut (), window: &mut gpui::Window, cx: &mut gpui::App) {
+        self.within(bounds, window, |child, window| {
+            child.prepaint(window, cx);
+        });
+    }
+    fn paint(&mut self, _: Option<&gpui::GlobalElementId>, _: Option<&gpui::InspectorElementId>, bounds: gpui::Bounds<gpui::Pixels>, _: &mut (), _: &mut (), window: &mut gpui::Window, cx: &mut gpui::App) {
+        self.within(bounds, window, |child, window| child.paint(window, cx));
+    }
 }

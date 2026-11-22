@@ -1,0 +1,2536 @@
+diff -ruN -x 'LICENSE*' a/crates/gpui/src/elements/div.rs b/crates/gpui/src/elements/div.rs
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -2599,6 +2599,7 @@
+                 let (scale, offset) = (style.paint_scale.unwrap_or(1.0), style.paint_offset.unwrap_or_default());
+                 window.with_paint_transform(scale, bounds.center(), offset, |window| {
+                 window.with_element_opacity(style.opacity, |window| {
++                window.with_optional_filter_group(bounds, style.blur, |window| {
+                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                         window.with_text_style(style.text_style().cloned(), |window| {
+                             style.with_overflow(
+@@ -2691,6 +2692,7 @@
+                     });
+                 });
+                 });
++                });
+ 
+                 ((), element_state)
+             },
+diff -ruN -x 'LICENSE*' a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -60,6 +60,59 @@
+     pub(crate) current_rounded_clip: u32,
+     /// the transform primitives inserted now are drawn with (`Window::with_paint_transform`).
+     pub(crate) transform: Option<PaintTransform>,
++    /// filter groups, in draw order once `finish` has run. each is drawn after every primitive
++    /// of its order: its own scene goes to an offscreen target that is filtered and composited.
++    pub filter_groups: Vec<FilterGroup>,
++    /// groups being painted, innermost last. primitives inserted now go to the last one's scene.
++    open_filter_groups: Vec<OpenFilterGroup>,
++}
++
++/// content painted into its own scene, then blurred, faded and moved as one image and composited
++/// over what was drawn beneath it. painted with [`crate::Window::paint_filter_group`].
++#[derive(Default)]
++pub struct FilterGroup {
++    /// drawn after every primitive of this order in the enclosing scene.
++    pub order: DrawOrder,
++    /// what the group may draw; its primitives are clipped to it.
++    pub bounds: Bounds<ScaledPixels>,
++    /// the gaussian's standard deviation; zero composites the content unblurred.
++    pub blur_radius: ScaledPixels,
++    /// the group's opacity, applied once to the composited image.
++    pub opacity: f32,
++    /// how far the composited image is moved; fractions are sampled between pixels.
++    pub offset: Point<ScaledPixels>,
++    /// when set, the composited image is cut to `bounds` moved by `offset`, rounded by these.
++    pub mask_corner_radii: Option<Corners<ScaledPixels>>,
++    /// the enclosing mask the composite is clipped to.
++    pub content_mask: ContentMask<ScaledPixels>,
++    /// the enclosing rounded clip of the composite: an index into the top scene's
++    /// [`Scene::rounded_clips`] plus one, or 0. primitives inside index the same table.
++    pub rounded_clip: u32,
++    /// the group's content, finished.
++    pub scene: Box<Scene>,
++}
++
++impl FilterGroup {
++    /// the device pixels the composite can touch: the bounds grown by the blur's reach, moved
++    /// by the offset, inside the enclosing mask.
++    pub fn composite_bounds(&self) -> Bounds<ScaledPixels> {
++        let reach = ScaledPixels(self.blur_reach() as f32 + 1.);
++        let grown = self.bounds.dilate(reach);
++        Bounds { origin: grown.origin + self.offset, size: grown.size }.intersect(&self.content_mask.bounds)
++    }
++
++    /// how far the blur spreads past the content, in whole device pixels (three deviations).
++    pub fn blur_reach(&self) -> u32 {
++        let sigma = self.blur_radius.0;
++        if sigma.is_finite() && sigma > 0. { (sigma * 3.).ceil() as u32 } else { 0 }
++    }
++}
++
++#[derive(Default)]
++struct OpenFilterGroup {
++    group: FilterGroup,
++    transform: Option<PaintTransform>,
++    rounded_clip: u32,
+ }
+ 
+ /// scales device points by `scale` and then moves them by `offset`, with every mask the scope
+@@ -206,6 +259,86 @@
+         self.rounded_clips.clear();
+         self.current_rounded_clip = 0;
+         self.transform = None;
++        self.filter_groups.clear();
++        self.open_filter_groups.clear();
++    }
++
++    /// the scene primitives inserted now land in: the innermost open filter group's, or this.
++    fn target(&mut self) -> &mut Scene {
++        match self.open_filter_groups.len() {
++            0 => self,
++            count => &mut self.open_filter_groups[count - 1].group.scene,
++        }
++    }
++
++    /// starts a filter group: until the matching [`Self::pop_filter_group`], primitives go to the
++    /// group's own scene. `group.scene` and `group.order` are filled in here, and a group with
++    /// no `rounded_clip` takes the current one. primitives in the group start with no rounded clip.
++    pub fn push_filter_group(&mut self, mut group: FilterGroup) {
++        if let Some(transform) = self.transform {
++            group.bounds = transform.bounds(group.bounds);
++            group.blur_radius = transform.len(group.blur_radius);
++            group.offset = point(transform.len(group.offset.x), transform.len(group.offset.y));
++            group.mask_corner_radii = group.mask_corner_radii.map(|radii| transform.corners(radii));
++            group.content_mask = transform.mask(group.content_mask.clone());
++        }
++        if group.rounded_clip == 0 {
++            group.rounded_clip = self.clip_reaching(group.composite_bounds(), self.current_rounded_clip);
++        }
++        group.scene = Box::default();
++        group.order = 0;
++        self.paint_operations.push(PaintOperation::PushFilterGroup(FilterGroup {
++            scene: Box::default(),
++            ..group_params(&group)
++        }));
++        let transform = self.transform;
++        // children were clipped to the group's bounds, so that is all the transform's clip may cut
++        if let Some(inner) = &mut self.transform {
++            inner.clip = group.bounds;
++        }
++        self.open_filter_groups.push(OpenFilterGroup {
++            group,
++            transform,
++            rounded_clip: self.current_rounded_clip,
++        });
++        self.current_rounded_clip = 0;
++    }
++
++    /// ends the innermost filter group and places it in the scene around it.
++    pub fn pop_filter_group(&mut self) {
++        let Some(open) = self.open_filter_groups.pop() else {
++            return;
++        };
++        self.paint_operations.push(PaintOperation::PopFilterGroup);
++        self.transform = open.transform;
++        self.current_rounded_clip = open.rounded_clip;
++        let mut group = open.group;
++        let composite = group.composite_bounds();
++        if composite.is_empty() || !(group.opacity > 0.) || group.scene.is_empty() {
++            return;
++        }
++        group.scene.finish();
++        let target = self.target();
++        group.order = target
++            .layer_stack
++            .last()
++            .copied()
++            .unwrap_or_else(|| target.primitive_bounds.insert(composite));
++        target.filter_groups.push(group);
++    }
++
++    /// whether nothing would be drawn: no primitives, blurs or groups.
++    fn is_empty(&self) -> bool {
++        self.shadows.is_empty()
++            && self.quads.is_empty()
++            && self.paths.is_empty()
++            && self.underlines.is_empty()
++            && self.monochrome_sprites.is_empty()
++            && self.subpixel_sprites.is_empty()
++            && self.polychrome_sprites.is_empty()
++            && self.surfaces.is_empty()
++            && self.backdrop_blurs.is_empty()
++            && self.filter_groups.is_empty()
+     }
+ 
+     /// `clip`, when one of its rounded corners or its fade (or its parents') reaches into `bounds`,
+@@ -275,14 +408,15 @@
+     }
+ 
+     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+-        let order = self.primitive_bounds.insert(bounds);
+-        self.layer_stack.push(order);
++        let target = self.target();
++        let order = target.primitive_bounds.insert(bounds);
++        target.layer_stack.push(order);
+         self.paint_operations
+             .push(PaintOperation::StartLayer(bounds));
+     }
+ 
+     pub fn pop_layer(&mut self) {
+-        self.layer_stack.pop();
++        self.target().layer_stack.pop();
+         self.paint_operations.push(PaintOperation::EndLayer);
+     }
+ 
+@@ -302,12 +436,13 @@
+         if blur.rounded_clip == 0 {
+             blur.rounded_clip = self.clip_reaching(clipped_bounds, self.current_rounded_clip);
+         }
+-        blur.order = self
++        let target = self.target();
++        blur.order = target
+             .layer_stack
+             .last()
+             .copied()
+-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+-        self.backdrop_blurs.push(blur);
++            .unwrap_or_else(|| target.primitive_bounds.insert(clipped_bounds));
++        target.backdrop_blurs.push(blur);
+         self.paint_operations
+             .push(PaintOperation::BackdropBlur(blur));
+     }
+@@ -345,11 +480,6 @@
+             return;
+         }
+ 
+-        let order = self
+-            .layer_stack
+-            .last()
+-            .copied()
+-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+         // Fresh primitives take the mask they're painted in; replayed ones keep their own.
+         let current = self.current_rounded_clip;
+         let clip = match &mut primitive {
+@@ -365,39 +495,45 @@
+         if *clip == 0 {
+             *clip = self.clip_reaching(clipped_bounds, current);
+         }
++        let target = self.target();
++        let order = target
++            .layer_stack
++            .last()
++            .copied()
++            .unwrap_or_else(|| target.primitive_bounds.insert(clipped_bounds));
+         match &mut primitive {
+             Primitive::Shadow(shadow) => {
+                 shadow.order = order;
+-                self.shadows.push(*shadow);
++                target.shadows.push(*shadow);
+             }
+             Primitive::Quad(quad) => {
+                 quad.order = order;
+-                self.quads.push(*quad);
++                target.quads.push(*quad);
+             }
+             Primitive::Path(path) => {
+                 path.order = order;
+-                path.id = PathId(self.paths.len());
+-                self.paths.push(path.clone());
++                path.id = PathId(target.paths.len());
++                target.paths.push(path.clone());
+             }
+             Primitive::Underline(underline) => {
+                 underline.order = order;
+-                self.underlines.push(*underline);
++                target.underlines.push(*underline);
+             }
+             Primitive::MonochromeSprite(sprite) => {
+                 sprite.order = order;
+-                self.monochrome_sprites.push(*sprite);
++                target.monochrome_sprites.push(*sprite);
+             }
+             Primitive::SubpixelSprite(sprite) => {
+                 sprite.order = order;
+-                self.subpixel_sprites.push(*sprite);
++                target.subpixel_sprites.push(*sprite);
+             }
+             Primitive::PolychromeSprite(sprite) => {
+                 sprite.order = order;
+-                self.polychrome_sprites.push(*sprite);
++                target.polychrome_sprites.push(*sprite);
+             }
+             Primitive::Surface(surface) => {
+                 surface.order = order;
+-                self.surfaces.push(surface.clone());
++                target.surfaces.push(surface.clone());
+             }
+         }
+         self.paint_operations
+@@ -431,6 +567,12 @@
+                     blur.rounded_clip = self.copy_rounded_clip(prev_scene, blur.rounded_clip, &mut copied);
+                     self.insert_backdrop_blur(blur);
+                 }
++                PaintOperation::PushFilterGroup(group) => {
++                    let mut group = group_params(group);
++                    group.rounded_clip = self.copy_rounded_clip(prev_scene, group.rounded_clip, &mut copied);
++                    self.push_filter_group(group);
++                }
++                PaintOperation::PopFilterGroup => self.pop_filter_group(),
+                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                 PaintOperation::EndLayer => self.pop_layer(),
+             }
+@@ -451,6 +593,7 @@
+             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
+         self.surfaces.sort_by_key(|surface| surface.order);
+         self.backdrop_blurs.sort_by_key(|blur| blur.order);
++        self.filter_groups.sort_by_key(|group| group.order);
+     }
+ 
+     #[cfg_attr(
+@@ -479,10 +622,26 @@
+             surfaces_start: 0,
+             surfaces_iter: self.surfaces.iter().peekable(),
+             backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
++            filter_groups_iter: self.filter_groups.iter().peekable(),
+         }
+     }
+ }
+ 
++/// a group's settings without its content, as a paint operation records them.
++fn group_params(group: &FilterGroup) -> FilterGroup {
++    FilterGroup {
++        order: 0,
++        bounds: group.bounds,
++        blur_radius: group.blur_radius,
++        opacity: group.opacity,
++        offset: group.offset,
++        mask_corner_radii: group.mask_corner_radii,
++        content_mask: group.content_mask.clone(),
++        rounded_clip: group.rounded_clip,
++        scene: Box::default(),
++    }
++}
++
+ /// What is drawn beneath `bounds` when the renderer reaches `order`, blurred, its saturation
+ /// scaled, and painted back inside the rounded rect. Painted with
+ /// [`crate::Window::paint_backdrop_blur`]. Only the wgpu renderer honors it; others draw nothing.
+@@ -533,6 +692,9 @@
+ pub(crate) enum PaintOperation {
+     Primitive(Primitive),
+     BackdropBlur(BackdropBlur),
++    /// a group's settings; its content follows until the matching `PopFilterGroup`.
++    PushFilterGroup(FilterGroup),
++    PopFilterGroup,
+     StartLayer(Bounds<ScaledPixels>),
+     EndLayer,
+ }
+@@ -604,6 +766,7 @@
+     surfaces_start: usize,
+     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+     backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
++    filter_groups_iter: Peekable<slice::Iter<'a, FilterGroup>>,
+ }
+ 
+ impl<'a> Iterator for BatchIterator<'a> {
+@@ -657,6 +820,18 @@
+         if let Some(blur) = self.backdrop_blurs_iter.peek() {
+             max_order_and_kind = max_order_and_kind.min((blur.order, PrimitiveKind::Shadow));
+         }
++        // a group is drawn after everything of its order, so a batch may reach its order but not past it
++        if let Some(first_order) = first.0 {
++            while self
++                .filter_groups_iter
++                .next_if(|group| group.order < first_order)
++                .is_some()
++            {}
++        }
++        if let Some(group) = self.filter_groups_iter.peek() {
++            max_order_and_kind =
++                max_order_and_kind.min((group.order.saturating_add(1), PrimitiveKind::Shadow));
++        }
+ 
+         match batch_kind {
+             PrimitiveKind::Shadow => {
+diff -ruN -x 'LICENSE*' a/crates/gpui/src/styled.rs b/crates/gpui/src/styled.rs
+--- a/crates/gpui/src/styled.rs
++++ b/crates/gpui/src/styled.rs
+@@ -748,6 +748,14 @@
+         self
+     }
+ 
++    /// blurs this element and its children as one image by `radius`, a gaussian's standard
++    /// deviation, leaving layout and hit testing as they are. what they paint outside this
++    /// element's bounds is cut off; the blur itself spreads past them.
++    fn blur(mut self, radius: impl Into<Pixels>) -> Self {
++        self.style().blur = Some(radius.into());
++        self
++    }
++
+     /// draws this element and its children scaled by `scale` around their center, leaving layout
+     /// and hit testing as they are.
+     fn paint_scale(mut self, scale: f32) -> Self {
+diff -ruN -x 'LICENSE*' a/crates/gpui/src/style.rs b/crates/gpui/src/style.rs
+--- a/crates/gpui/src/style.rs
++++ b/crates/gpui/src/style.rs
+@@ -16,6 +16,25 @@
+ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+ 
++/// how [`Window::paint_filter_group`] draws its content: blurred, faded and moved as one image.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct ElementFilter {
++    /// the gaussian's standard deviation; zero leaves the content sharp.
++    pub blur: Pixels,
++    /// the image's opacity.
++    pub opacity: f32,
++    /// how far the image is moved, unrounded.
++    pub offset: Point<Pixels>,
++    /// when set, the image is cut to the group's bounds (moved with it), rounded by these.
++    pub corner_radii: Option<Corners<Pixels>>,
++}
++
++impl Default for ElementFilter {
++    fn default() -> Self {
++        Self { blur: Pixels::ZERO, opacity: 1., offset: Point::default(), corner_radii: None }
++    }
++}
++
+ /// Use this struct for interfacing with the 'debug_below' styling from your own elements.
+ /// If a parent element has this style set on it, then this struct will be set as a global in
+ /// GPUI.
+@@ -309,6 +328,10 @@
+     /// testing.
+     pub paint_offset: Option<Point<Pixels>>,
+ 
++    /// blurs the element and its children as one image, by this gaussian standard deviation
++    /// (`Window::paint_filter_group`). what they paint outside the element's bounds is cut off.
++    pub blur: Option<Pixels>,
++
+     /// The grid columns of this element
+     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
+     pub grid_cols: Option<GridTemplate>,
+@@ -848,6 +871,7 @@
+             opacity: None,
+             paint_scale: None,
+             paint_offset: None,
++            blur: None,
+             grid_rows: None,
+             grid_cols: None,
+             grid_location: None,
+diff -ruN -x 'LICENSE*' a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1285,6 +1285,8 @@
+     pub(crate) rendered_entity_stack: Vec<EntityId>,
+     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
+     pub(crate) element_opacity: f32,
++    /// how many filter groups are being painted; text inside one is never subpixel.
++    pub(crate) filter_group_depth: u32,
+     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+     /// The rounded clip being drawn in, in window pixels, for hit tests and deferred draws.
+     pub(crate) rounded_clip: Option<Arc<RoundedClipRegion>>,
+@@ -2421,6 +2423,7 @@
+             content_mask_stack: Vec::new(),
+             rounded_clip: None,
+             element_opacity: 1.0,
++            filter_group_depth: 0,
+             requested_autoscroll: None,
+             last_text_input_configuration: None,
+             focused_text_input: None,
+@@ -5162,6 +5165,65 @@
+         });
+     }
+ 
++    /// paints what `f` paints as one image: drawn on its own, then blurred by `filter.blur` (a
++    /// gaussian's standard deviation), moved by `filter.offset` (fractions are sampled between
++    /// pixels, so the content isn't rounded to the pixel grid) and composited with
++    /// `filter.opacity` over what was painted beneath it, inside the current content mask. what
++    /// `f` paints outside `bounds` is cut off; the blur spreads past `bounds` by three deviations.
++    /// the current element opacity applies to the image, not to each primitive in it. text inside
++    /// is drawn without subpixel antialiasing. renderers without filter support draw the content
++    /// unfiltered.
++    ///
++    /// this method should only be called as part of the paint phase of element drawing.
++    pub fn paint_filter_group<R>(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        filter: crate::ElementFilter,
++        f: impl FnOnce(&mut Self) -> R,
++    ) -> R {
++        self.invalidator.debug_assert_paint();
++        let scale_factor = self.scale_factor();
++        let blur = filter.blur.max(Pixels::ZERO);
++        let outer_mask = self.content_mask();
++        // the source keeps what the blur pulls in across the enclosing mask's edge
++        let reach = blur * 3.;
++        let inner_mask = ContentMask { bounds: bounds.intersect(&outer_mask.bounds.dilate(reach)) };
++        self.next_frame.scene.push_filter_group(crate::FilterGroup {
++            bounds: self.cover_bounds(bounds),
++            blur_radius: blur.scale(scale_factor),
++            opacity: filter.opacity * self.element_opacity,
++            offset: filter.offset.scale(scale_factor),
++            mask_corner_radii: filter.corner_radii.map(|radii| radii.scale(scale_factor)),
++            content_mask: self.snapped_content_mask(),
++            ..Default::default()
++        });
++        let previous_opacity = std::mem::replace(&mut self.element_opacity, 1.0);
++        self.filter_group_depth += 1;
++        self.content_mask_stack.push(inner_mask);
++        let result = f(self);
++        self.content_mask_stack.pop();
++        self.filter_group_depth -= 1;
++        self.element_opacity = previous_opacity;
++        self.next_frame.scene.pop_filter_group();
++        result
++    }
++
++    /// [`Self::paint_filter_group`] over `bounds` with a blur of `blur`, or `f` alone when there
++    /// is no blur.
++    pub(crate) fn with_optional_filter_group<R>(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        blur: Option<Pixels>,
++        f: impl FnOnce(&mut Self) -> R,
++    ) -> R {
++        match blur {
++            Some(blur) if blur > Pixels::ZERO && self.invalidator.is_painting() => {
++                self.paint_filter_group(bounds, crate::ElementFilter { blur, ..Default::default() }, f)
++            }
++            _ => f(self),
++        }
++    }
++
+     /// Paint one or more quads into the scene for the next frame at the current stacking context.
+     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
+     /// see [`fill`], [`outline`], and [`quad`] to construct this type.
+@@ -5389,7 +5451,10 @@
+     }
+ 
+     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+-        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
++        // subpixel coverage needs the opaque colour beneath it, and a group draws into a clear target
++        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque
++            || self.filter_group_depth > 0
++        {
+             return false;
+         }
+ 
+diff -ruN -x 'LICENSE*' a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -1367,9 +1367,10 @@
+     radius: u32,
+     // Source texels per destination texel along each axis.
+     box_size: u32,
++    // the source texels holding the region, when fewer than the texture's; 0 for all of it.
++    extent_x: u32,
++    extent_y: u32,
+     pad0: u32,
+-    pad1: u32,
+-    pad2: u32,
+ }
+ 
+ // Must match `BackdropCompositeParams` in `wgpu_renderer.rs`.
+@@ -1405,6 +1406,7 @@
+ fn fs_backdrop_blur(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+     let params = backdrop_pass;
+     let source_size = vec2<f32>(textureDimensions(t_backdrop, 0));
++    let extent = select(source_size, vec2<f32>(f32(params.extent_x), f32(params.extent_y)), params.extent_x > 0u);
+     let box_size = f32(params.box_size);
+     let box_taps = max(params.box_size / 2u, 1u);
+     let box_step = box_size / f32(box_taps);
+@@ -1420,7 +1422,8 @@
+         var box_color = vec4<f32>(0.0);
+         for (var row = 0u; row < box_taps; row++) {
+             for (var column = 0u; column < box_taps; column++) {
+-                let sample_position = tap_center + vec2<f32>(f32(column), f32(row)) * box_step;
++                let sample_position = clamp(tap_center + vec2<f32>(f32(column), f32(row)) * box_step,
++                    vec2<f32>(0.5), extent - 0.5);
+                 box_color += textureSampleLevel(t_backdrop, s_backdrop, sample_position / source_size, 0.0);
+             }
+         }
+@@ -1469,6 +1472,52 @@
+     return mix(original, frosted, coverage);
+ }
+ 
++// --- filter groups --- //
++
++// must match `FilterCompositeParams` in `wgpu_renderer.rs`.
++struct FilterCompositeParams {
++    mask_bounds: Bounds,
++    clip_bounds: Bounds,
++    corner_radii: Corners,
++    source_origin: vec2<f32>,
++    source_scale: vec2<f32>,
++    offset: vec2<f32>,
++    opacity: f32,
++    rounded_clip: u32,
++    has_mask: u32,
++    pad0: u32,
++    pad1: u32,
++    pad2: u32,
++}
++
++@group(1) @binding(0) var<uniform> filter_composite: FilterCompositeParams;
++
++// run under a scissor rect, with blending off: empties the part of a group's target it draws in.
++@fragment
++fn fs_filter_clear() -> @location(0) vec4<f32> {
++    return vec4<f32>(0.0);
++}
++
++@vertex
++fn vs_filter_composite(@builtin(vertex_index) vertex_id: u32) -> @builtin(position) vec4<f32> {
++    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
++    return to_device_position(unit_vertex, filter_composite.clip_bounds);
++}
++
++// the source holds premultiplied colours and is blended over the frame as such, whichever alpha
++// mode the frame's other pipelines use.
++@fragment
++fn fs_filter_composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
++    let params = filter_composite;
++    let source_position = (position.xy - params.offset - params.source_origin) * params.source_scale;
++    let color = textureSampleLevel(t_backdrop_blurred, s_backdrop, source_position, 0.0);
++    var coverage = saturate(params.opacity) * rounded_clip_coverage(params.rounded_clip, position.xy);
++    if (params.has_mask != 0u) {
++        coverage *= saturate(0.5 - quad_sdf(position.xy, params.mask_bounds, params.corner_radii));
++    }
++    return color * coverage;
++}
++
+ // --- surfaces --- //
+ 
+ struct SurfaceParams {
+diff -ruN -x 'LICENSE*' a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -3,7 +3,7 @@
+ use bytemuck::{Pod, Zeroable};
+ use collections::FxHashMap;
+ use gpui::{
+-    AtlasTextureId, BackdropBlur, Background, Bounds, DevicePixels, GpuSpecs, Path, Point,
++    AtlasTextureId, BackdropBlur, Background, DrawOrder, FilterGroup, Bounds, DevicePixels, GpuSpecs, Path, Point,
+     PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+ };
+ use log::warn;
+@@ -20,8 +20,10 @@
+ 
+ const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
+ 
+-/// Region-sized scratch texture sets kept for backdrop blurs.
+-const MAX_BACKDROP_TEXTURES: usize = 8;
++/// region-sized scratch texture sets kept for backdrop blurs and filter groups.
++const MAX_BACKDROP_TEXTURES: usize = 12;
++/// the smallest side of a filter group's scratch textures, in device pixels.
++const FILTER_SCRATCH_MIN_SIZE: u32 = 64;
+ /// The widest gaussian a backdrop blur runs, in device pixels.
+ const MAX_BACKDROP_BLUR_SIGMA: f32 = 96.;
+ /// The widest gaussian a pass runs in its own texels; a larger radius halves the blurred
+@@ -31,6 +33,9 @@
+ const BACKDROP_IDLE_FRAMES: u32 = 120;
+ /// Two blur passes and a composite, each reading its own slot of the parameter buffer.
+ const BACKDROP_PARAM_SLOTS_PER_BLUR: u64 = 3;
++/// filter groups nested deeper than this draw their content unfiltered, which bounds the
++/// frame-sized targets kept.
++const MAX_FILTER_GROUP_DEPTH: usize = 4;
+ 
+ /// Shader variant for backends with storage buffer support: the shared shader
+ /// logic plus the storage-buffer instance transport.
+@@ -118,7 +123,9 @@
+     sigma: f32,
+     radius: u32,
+     box_size: u32,
+-    _pad: [u32; 3],
++    /// the source texels holding the region, when fewer than the texture's; zero for all of it.
++    extent: [u32; 2],
++    _pad: u32,
+ }
+ 
+ /// Must match `BackdropCompositeParams` in `shaders.wgsl`.
+@@ -138,6 +145,22 @@
+     fades: [f32; 4],
+ }
+ 
++/// must match `FilterCompositeParams` in `shaders.wgsl`.
++#[repr(C)]
++#[derive(Clone, Copy, Pod, Zeroable)]
++struct FilterCompositeParams {
++    mask_bounds: PodBounds,
++    clip_bounds: PodBounds,
++    corner_radii: [f32; 4],
++    source_origin: [f32; 2],
++    source_scale: [f32; 2],
++    offset: [f32; 2],
++    opacity: f32,
++    rounded_clip: u32,
++    has_mask: u32,
++    _pad: [u32; 3],
++}
++
+ #[derive(Clone, Debug)]
+ #[repr(C)]
+ struct PathSprite {
+@@ -180,6 +203,8 @@
+     surfaces: wgpu::RenderPipeline,
+     backdrop_blur: wgpu::RenderPipeline,
+     backdrop_composite: wgpu::RenderPipeline,
++    filter_clear: wgpu::RenderPipeline,
++    filter_composite: wgpu::RenderPipeline,
+ }
+ 
+ /// One frame allocation of instance data, ready to bind.
+@@ -193,6 +218,12 @@
+     first_instance: u32,
+ }
+ 
++/// a scene's instance data and its filter groups', in the order of `Scene::filter_groups`.
++struct SceneInstances {
++    bindings: InstanceBindings,
++    groups: Vec<SceneInstances>,
++}
++
+ struct InstanceBindings {
+     quads: InstanceBinding,
+     shadows: InstanceBinding,
+@@ -250,6 +281,15 @@
+     backdrop_frame: Option<BackdropFrame>,
+     backdrop_frame_blitter: Option<wgpu::util::TextureBlitter>,
+     backdrop_free_frames: u32,
++    /// frame-sized targets filter groups draw into, one per nesting depth.
++    filter_targets: Vec<FilterTarget>,
++    /// bound in the texture slots of the pass that empties a group's region, which reads none.
++    filter_placeholder: Option<FilterTarget>,
++}
++
++struct FilterTarget {
++    texture: wgpu::Texture,
++    view: wgpu::TextureView,
+ }
+ 
+ struct CachedTextureBindGroup {
+@@ -285,6 +325,7 @@
+         self.path_msaa_view = None;
+         self.backdrop_textures.clear();
+         self.backdrop_frame = None;
++        self.filter_targets.clear();
+     }
+ 
+     fn release_backdrop_resources(&mut self) {
+@@ -292,6 +333,8 @@
+         self.backdrop_params_buffer = None;
+         self.backdrop_frame = None;
+         self.backdrop_frame_blitter = None;
++        self.filter_targets.clear();
++        self.filter_placeholder = None;
+     }
+ }
+ 
+@@ -1176,9 +1219,44 @@
+             &shader_module,
+         );
+ 
++        let filter_clear = create_pipeline(
++            "filter_clear",
++            "vs_backdrop_blur",
++            "fs_filter_clear",
++            &layouts.globals,
++            &layouts.backdrop,
++            None,
++            wgpu::PrimitiveTopology::TriangleStrip,
++            &[Some(wgpu::ColorTargetState {
++                format: surface_format,
++                blend: None,
++                write_mask: wgpu::ColorWrites::ALL,
++            })],
++            1,
++            &shader_module,
++        );
++        let filter_composite = create_pipeline(
++            "filter_composite",
++            "vs_filter_composite",
++            "fs_filter_composite",
++            &layouts.globals,
++            &layouts.backdrop,
++            None,
++            wgpu::PrimitiveTopology::TriangleStrip,
++            &[Some(wgpu::ColorTargetState {
++                format: surface_format,
++                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
++                write_mask: wgpu::ColorWrites::ALL,
++            })],
++            1,
++            &shader_module,
++        );
++
+         WgpuPipelines {
+             backdrop_blur,
+             backdrop_composite,
++            filter_clear,
++            filter_composite,
+             quads,
+             shadows,
+             path_rasterization,
+@@ -1583,6 +1661,8 @@
+                 backdrop_frame: None,
+                 backdrop_frame_blitter: None,
+                 backdrop_free_frames: 0,
++                filter_targets: Vec::new(),
++                filter_placeholder: None,
+             },
+             atlas,
+             path_globals_offset,
+@@ -1765,11 +1845,11 @@
+         clear_color: wgpu::Color,
+     ) -> Result<wgpu::SubmissionIndex> {
+         let mut instance_offset = 0;
+-        let instance_bindings = self
+-            .write_instances(scene, &mut instance_offset)
++        let instances = self
++            .write_scene_instances(scene, &mut instance_offset)
+             .with_context(|| {
+                 format!(
+-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
++                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites, {} filter groups",
+                     scene.paths.len(),
+                     scene.shadows.len(),
+                     scene.quads.len(),
+@@ -1777,10 +1857,11 @@
+                     scene.monochrome_sprites.len(),
+                     scene.subpixel_sprites.len(),
+                     scene.polychrome_sprites.len(),
++                    scene.filter_groups.len(),
+                 )
+             })?;
+         self.prepare_texture_bind_groups(scene);
+-        self.ensure_backdrop_params_capacity(scene.backdrop_blurs.len());
++        self.ensure_backdrop_params_capacity(effect_count(scene));
+         let target_is_copy_source = target_texture
+             .usage()
+             .contains(wgpu::TextureUsages::COPY_SRC);
+@@ -1801,136 +1882,449 @@
+                     label: Some("main_encoder"),
+                 });
+ 
++        let mut slot = 0;
++        self.draw_scene(
++            &mut encoder,
++            scene,
++            &instances,
++            frame_texture,
++            frame_view,
++            wgpu::LoadOp::Clear(clear_color),
++            0,
++            &mut slot,
++            &mut instance_offset,
++        )?;
++
++        if let Some((_, view)) = &backdrop_frame
++            && let Some(blitter) = &self.resources().backdrop_frame_blitter
+         {
+-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+-                label: Some("main_pass"),
+-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+-                    view: frame_view,
+-                    resolve_target: None,
+-                    ops: wgpu::Operations {
+-                        load: wgpu::LoadOp::Clear(clear_color),
+-                        store: wgpu::StoreOp::Store,
+-                    },
+-                    depth_slice: None,
+-                })],
+-                depth_stencil_attachment: None,
+-                ..Default::default()
+-            });
++            blitter.copy(&self.resources().device, &mut encoder, view, target_view);
++        }
++
++        let submission = self
++            .resources()
++            .queue
++            .submit(std::iter::once(encoder.finish()));
++        Ok(submission)
++    }
++
++    /// draws `scene`'s batches into `frame_view`, running its backdrop blurs and filter groups at
++    /// their draw orders. `depth` is how many filter groups `scene` is inside; `slot` is the next
++    /// free set of effect parameters.
++    #[allow(clippy::too_many_arguments)]
++    fn draw_scene(
++        &mut self,
++        encoder: &mut wgpu::CommandEncoder,
++        scene: &Scene,
++        instances: &SceneInstances,
++        frame_texture: &wgpu::Texture,
++        frame_view: &wgpu::TextureView,
++        load: wgpu::LoadOp<wgpu::Color>,
++        depth: usize,
++        slot: &mut usize,
++        instance_offset: &mut u64,
++    ) -> Result<()> {
++        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++            label: Some("main_pass"),
++            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                view: frame_view,
++                resolve_target: None,
++                ops: wgpu::Operations {
++                    load,
++                    store: wgpu::StoreOp::Store,
++                },
++                depth_slice: None,
++            })],
++            depth_stencil_attachment: None,
++            ..Default::default()
++        });
++        let mut effects = SceneEffects {
++            blurs: scene.backdrop_blurs.iter().peekable(),
++            groups: scene.filter_groups.iter().zip(&instances.groups).peekable(),
++        };
++        for batch in scene.batches() {
++            let batch_order = scene.batch_order(&batch);
++            if effects.due_before(batch_order) {
++                drop(pass);
++                self.draw_effects(encoder, &mut effects, Some(batch_order), frame_texture, frame_view, depth, slot, instance_offset)?;
++                pass = Self::begin_continued_main_pass(encoder, frame_view);
++            }
++
++                match batch {
++                PrimitiveBatch::Quads(range) => self.draw_instances(
++                    &instances.bindings.quads,
++                    &self.resources().pipelines.quads,
++                    instance_range(range),
++                    &mut pass,
++                ),
++                PrimitiveBatch::Shadows(range) => self.draw_instances(
++                    &instances.bindings.shadows,
++                    &self.resources().pipelines.shadows,
++                    instance_range(range),
++                    &mut pass,
++                ),
++                PrimitiveBatch::Paths(range) => {
++                    let paths = &scene.paths[range];
++                    if paths.is_empty() {
++                        continue;
++                    }
+ 
+-            let mut pending_blurs = scene.backdrop_blurs.iter().enumerate().peekable();
+-            for batch in scene.batches() {
+-                let batch_order = scene.batch_order(&batch);
+-                if pending_blurs
+-                    .peek()
+-                    .is_some_and(|(_, blur)| blur.order <= batch_order)
+-                {
+                     drop(pass);
+-                    while let Some((slot, blur)) =
+-                        pending_blurs.next_if(|(_, blur)| blur.order <= batch_order)
+-                    {
+-                        self.draw_backdrop_blur(&mut encoder, blur, slot, frame_texture, frame_view);
++                    let rasterized = self.draw_paths_to_intermediate(
++                        encoder,
++                        paths,
++                        instance_offset,
++                    )?;
++
++                    pass = Self::begin_continued_main_pass(encoder, frame_view);
++
++                    if rasterized {
++                        self.draw_paths_from_intermediate(
++                            paths,
++                            instance_offset,
++                            &mut pass,
++                        )?;
+                     }
+-                    pass = Self::begin_continued_main_pass(&mut encoder, frame_view);
+                 }
+-
+-                match batch {
+-                    PrimitiveBatch::Quads(range) => self.draw_instances(
+-                        &instance_bindings.quads,
+-                        &self.resources().pipelines.quads,
++                PrimitiveBatch::Underlines(range) => self.draw_instances(
++                    &instances.bindings.underlines,
++                    &self.resources().pipelines.underlines,
++                    instance_range(range),
++                    &mut pass,
++                ),
++                PrimitiveBatch::MonochromeSprites { texture_id, range } => {
++                    self.draw_sprites(
++                        &instances.bindings.monochrome_sprites,
++                        texture_id,
++                        &self.resources().pipelines.mono_sprites,
+                         instance_range(range),
+                         &mut pass,
+-                    ),
+-                    PrimitiveBatch::Shadows(range) => self.draw_instances(
+-                        &instance_bindings.shadows,
+-                        &self.resources().pipelines.shadows,
++                    )?;
++                }
++                PrimitiveBatch::SubpixelSprites { texture_id, range } => {
++                    let resources = self.resources();
++                    self.draw_sprites(
++                        &instances.bindings.subpixel_sprites,
++                        texture_id,
++                        resources
++                            .pipelines
++                            .subpixel_sprites
++                            .as_ref()
++                            .unwrap_or(&resources.pipelines.mono_sprites),
+                         instance_range(range),
+                         &mut pass,
+-                    ),
+-                    PrimitiveBatch::Paths(range) => {
+-                        let paths = &scene.paths[range];
+-                        if paths.is_empty() {
+-                            continue;
+-                        }
+-
+-                        drop(pass);
+-                        let rasterized = self.draw_paths_to_intermediate(
+-                            &mut encoder,
+-                            paths,
+-                            &mut instance_offset,
+-                        )?;
+-
+-                        pass = Self::begin_continued_main_pass(&mut encoder, frame_view);
+-
+-                        if rasterized {
+-                            self.draw_paths_from_intermediate(
+-                                paths,
+-                                &mut instance_offset,
+-                                &mut pass,
+-                            )?;
+-                        }
+-                    }
+-                    PrimitiveBatch::Underlines(range) => self.draw_instances(
+-                        &instance_bindings.underlines,
+-                        &self.resources().pipelines.underlines,
++                    )?;
++                }
++                PrimitiveBatch::PolychromeSprites { texture_id, range } => {
++                    self.draw_sprites(
++                        &instances.bindings.polychrome_sprites,
++                        texture_id,
++                        &self.resources().pipelines.poly_sprites,
+                         instance_range(range),
+                         &mut pass,
+-                    ),
+-                    PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+-                        self.draw_sprites(
+-                            &instance_bindings.monochrome_sprites,
+-                            texture_id,
+-                            &self.resources().pipelines.mono_sprites,
+-                            instance_range(range),
+-                            &mut pass,
+-                        )?;
+-                    }
+-                    PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+-                        let resources = self.resources();
+-                        self.draw_sprites(
+-                            &instance_bindings.subpixel_sprites,
+-                            texture_id,
+-                            resources
+-                                .pipelines
+-                                .subpixel_sprites
+-                                .as_ref()
+-                                .unwrap_or(&resources.pipelines.mono_sprites),
+-                            instance_range(range),
+-                            &mut pass,
+-                        )?;
+-                    }
+-                    PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+-                        self.draw_sprites(
+-                            &instance_bindings.polychrome_sprites,
+-                            texture_id,
+-                            &self.resources().pipelines.poly_sprites,
+-                            instance_range(range),
+-                            &mut pass,
+-                        )?;
+-                    }
+-                    // Surfaces are macOS-only for video playback and are not
+-                    // implemented by the WGPU renderer.
+-                    PrimitiveBatch::Surfaces(_surfaces) => {}
++                    )?;
+                 }
++                // surfaces are macOS-only for video playback and are not
++                // implemented by the WGPU renderer.
++                PrimitiveBatch::Surfaces(_surfaces) => {}
+             }
++        }
++
++        // a blur above everything else still frosts what is beneath it
++        drop(pass);
++        self.draw_effects(encoder, &mut effects, None, frame_texture, frame_view, depth, slot, instance_offset)
++    }
+ 
+-            // A blur above everything else still frosts what is beneath it.
+-            drop(pass);
+-            for (slot, blur) in pending_blurs {
+-                self.draw_backdrop_blur(&mut encoder, blur, slot, frame_texture, frame_view);
++    /// runs the backdrop blurs and filter groups in `effects` that come before primitives of
++    /// order `before` (all of them when `None`), in draw order. a blur runs before the primitives
++    /// of its order and a group after them.
++    #[allow(clippy::too_many_arguments)]
++    fn draw_effects(
++        &mut self,
++        encoder: &mut wgpu::CommandEncoder,
++        effects: &mut SceneEffects<'_>,
++        before: Option<DrawOrder>,
++        frame_texture: &wgpu::Texture,
++        frame_view: &wgpu::TextureView,
++        depth: usize,
++        slot: &mut usize,
++        instance_offset: &mut u64,
++    ) -> Result<()> {
++        while let Some((next_is_blur, _)) = effects.next_due(before) {
++            if next_is_blur {
++                if let Some(blur) = effects.blurs.next() {
++                    self.draw_backdrop_blur(encoder, blur, *slot, frame_texture, frame_view);
++                    *slot += 1;
++                }
++            } else if let Some((group, instances)) = effects.groups.next() {
++                self.draw_filter_group(encoder, group, instances, frame_texture, frame_view, depth, slot, instance_offset)?;
+             }
+         }
++        Ok(())
++    }
+ 
+-        if let Some((_, view)) = &backdrop_frame
+-            && let Some(blitter) = &self.resources().backdrop_frame_blitter
++    /// draws `group`'s scene into the frame-sized target of its depth, empties nothing but the
++    /// region it draws in, blurs that region when the group has a blur, and composites it over
++    /// `frame_view` moved by the group's offset. too deeply nested, its scene is drawn straight
++    /// into `frame_view` instead.
++    #[allow(clippy::too_many_arguments)]
++    fn draw_filter_group(
++        &mut self,
++        encoder: &mut wgpu::CommandEncoder,
++        group: &FilterGroup,
++        instances: &SceneInstances,
++        frame_texture: &wgpu::Texture,
++        frame_view: &wgpu::TextureView,
++        depth: usize,
++        slot: &mut usize,
++        instance_offset: &mut u64,
++    ) -> Result<()> {
++        if depth >= MAX_FILTER_GROUP_DEPTH {
++            return self.draw_scene(encoder, &group.scene, instances, frame_texture, frame_view, wgpu::LoadOp::Load, depth, slot, instance_offset);
++        }
++        let frame_size = Size { width: frame_texture.width(), height: frame_texture.height() };
++        let reach = group.blur_reach();
++        // one pixel more than the composite reaches, so the bilinear taps at its edge read cleared texels
++        let source_bounds = group.bounds.dilate(ScaledPixels(reach as f32 + 2.));
++        let (Some(source), Some(composite)) = (
++            device_rect(source_bounds, frame_size),
++            device_rect(group.composite_bounds(), frame_size),
++        ) else {
++            return Ok(());
++        };
++        let group_slot = *slot;
++        *slot += 1;
++        let stride = self.backdrop_param_stride();
++        let first_offset = group_slot as u64 * BACKDROP_PARAM_SLOTS_PER_BLUR * stride;
++        let composite_offset = first_offset + 2 * stride;
++
++        let target = self.ensure_filter_target(depth, frame_size);
++        let placeholder = self.ensure_filter_placeholder();
+         {
+-            blitter.copy(&self.resources().device, &mut encoder, view, target_view);
++            let resources = self.resources();
++            let Some(params_buffer) = resources.backdrop_params_buffer.as_ref() else {
++                return Ok(());
++            };
++            let clear_group = self.backdrop_bind_group(
++                params_buffer,
++                composite_offset,
++                std::mem::size_of::<FilterCompositeParams>(),
++                &placeholder.view,
++                &placeholder.view,
++            );
++            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: Some("filter_clear_pass"),
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: &target.view,
++                    resolve_target: None,
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Load,
++                        store: wgpu::StoreOp::Store,
++                    },
++                    depth_slice: None,
++                })],
++                depth_stencil_attachment: None,
++                ..Default::default()
++            });
++            pass.set_scissor_rect(source.origin.x, source.origin.y, source.size.width, source.size.height);
++            pass.set_pipeline(&resources.pipelines.filter_clear);
++            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
++            pass.set_bind_group(1, &clear_group, &[]);
++            pass.draw(0..4, 0..1);
+         }
+ 
+-        let submission = self
+-            .resources()
+-            .queue
+-            .submit(std::iter::once(encoder.finish()));
+-        Ok(submission)
++        self.draw_scene(encoder, &group.scene, instances, &target.texture, &target.view, wgpu::LoadOp::Load, depth + 1, slot, instance_offset)?;
++
++        let sigma = group.blur_radius.0.min(MAX_BACKDROP_BLUR_SIGMA);
++        let (source_view, source_origin, source_scale) = if reach > 0 {
++            match self.blur_region(encoder, &target.texture, source, sigma, first_offset) {
++                Some((view, scale)) => (view, [source.origin.x as f32, source.origin.y as f32], scale),
++                None => return Ok(()),
++            }
++        } else {
++            (target.view.clone(), [0., 0.], [1. / frame_size.width as f32, 1. / frame_size.height as f32])
++        };
++
++        let radii = group.mask_corner_radii.unwrap_or_default();
++        let params = FilterCompositeParams {
++            mask_bounds: Bounds { origin: group.bounds.origin + group.offset, size: group.bounds.size }.into(),
++            clip_bounds: Bounds {
++                origin: Point { x: ScaledPixels(composite.origin.x as f32), y: ScaledPixels(composite.origin.y as f32) },
++                size: Size { width: ScaledPixels(composite.size.width as f32), height: ScaledPixels(composite.size.height as f32) },
++            }
++            .into(),
++            corner_radii: [radii.top_left.0, radii.top_right.0, radii.bottom_right.0, radii.bottom_left.0],
++            source_origin,
++            source_scale,
++            offset: [group.offset.x.0, group.offset.y.0],
++            opacity: group.opacity,
++            rounded_clip: group.rounded_clip,
++            has_mask: group.mask_corner_radii.is_some() as u32,
++            _pad: [0; 3],
++        };
++        let resources = self.resources();
++        let Some(params_buffer) = resources.backdrop_params_buffer.as_ref() else {
++            return Ok(());
++        };
++        resources.queue.write_buffer(params_buffer, composite_offset, bytemuck::bytes_of(&params));
++        let composite_group = self.backdrop_bind_group(
++            params_buffer,
++            composite_offset,
++            std::mem::size_of::<FilterCompositeParams>(),
++            &source_view,
++            &source_view,
++        );
++        let mut pass = Self::begin_continued_main_pass(encoder, frame_view);
++        pass.set_pipeline(&resources.pipelines.filter_composite);
++        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
++        pass.set_bind_group(1, &composite_group, &[]);
++        pass.draw(0..4, 0..1);
++        Ok(())
++    }
++
++    /// copies `region` of `source` out and blurs the copy in two separable passes, through the
++    /// parameter slots at `first_offset` and the one after it. returns the blurred texture and the
++    /// scale from region pixels to its texture coordinates.
++    fn blur_region(
++        &mut self,
++        encoder: &mut wgpu::CommandEncoder,
++        source: &wgpu::Texture,
++        region: Bounds<u32>,
++        sigma: f32,
++        first_offset: u64,
++    ) -> Option<(wgpu::TextureView, [f32; 2])> {
++        let (width, height) = (region.size.width, region.size.height);
++        let mut downsample = 1u32;
++        while sigma / downsample as f32 > MAX_BACKDROP_TEXEL_SIGMA {
++            downsample *= 2;
++        }
++        let texel_sigma = (sigma / downsample as f32).max(0.1);
++        // whole power-of-two sizes, so groups of many sizes share a few scratch sets
++        let (texture_width, texture_height) = (
++            width.next_power_of_two().max(FILTER_SCRATCH_MIN_SIZE),
++            height.next_power_of_two().max(FILTER_SCRATCH_MIN_SIZE),
++        );
++        self.prepare_backdrop_textures(texture_width, texture_height, downsample);
++        let stride = self.backdrop_param_stride();
++        let resources = self.resources();
++        let textures = resources.backdrop_textures.last()?;
++        let params_buffer = resources.backdrop_params_buffer.as_ref()?;
++        encoder.copy_texture_to_texture(
++            wgpu::TexelCopyTextureInfo {
++                texture: source,
++                mip_level: 0,
++                origin: wgpu::Origin3d { x: region.origin.x, y: region.origin.y, z: 0 },
++                aspect: wgpu::TextureAspect::All,
++            },
++            wgpu::TexelCopyTextureInfo {
++                texture: &textures.backdrop,
++                mip_level: 0,
++                origin: wgpu::Origin3d::ZERO,
++                aspect: wgpu::TextureAspect::All,
++            },
++            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
++        );
++        let horizontal = BackdropBlurPassParams {
++            direction: [1., 0.],
++            sigma: texel_sigma,
++            radius: (texel_sigma * 3.).ceil() as u32,
++            box_size: downsample,
++            extent: [width, height],
++            _pad: 0,
++        };
++        let vertical = BackdropBlurPassParams {
++            direction: [0., 1.],
++            box_size: 1,
++            extent: [width.div_ceil(downsample), height.div_ceil(downsample)],
++            ..horizontal
++        };
++        let vertical_offset = first_offset + stride;
++        resources.queue.write_buffer(params_buffer, first_offset, bytemuck::bytes_of(&horizontal));
++        resources.queue.write_buffer(params_buffer, vertical_offset, bytemuck::bytes_of(&vertical));
++        let pass_size = std::mem::size_of::<BackdropBlurPassParams>();
++        // a pass binds its source in both texture slots: the other texture of the set is its target
++        let horizontal_group = self.backdrop_bind_group(params_buffer, first_offset, pass_size, &textures.backdrop_view, &textures.backdrop_view);
++        let vertical_group = self.backdrop_bind_group(params_buffer, vertical_offset, pass_size, &textures.horizontal_view, &textures.horizontal_view);
++        let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
++        let pipeline = &resources.pipelines.backdrop_blur;
++        let globals = &resources.globals_bind_group;
++        // only the region and a texel past it are blurred; the rest of the texture stays clear
++        let extent = Size {
++            width: (width.div_ceil(downsample) + 1).min(texture_width.div_ceil(downsample)),
++            height: (height.div_ceil(downsample) + 1).min(texture_height.div_ceil(downsample)),
++        };
++        Self::draw_backdrop_pass(encoder, &textures.horizontal_view, clear, pipeline, globals, &horizontal_group, Some(extent));
++        Self::draw_backdrop_pass(encoder, &textures.blurred_view, clear, pipeline, globals, &vertical_group, Some(extent));
++        let scale = [
++            1. / (texture_width.div_ceil(downsample) * downsample) as f32,
++            1. / (texture_height.div_ceil(downsample) * downsample) as f32,
++        ];
++        Some((textures.blurred_view.clone(), scale))
++    }
++
++    fn backdrop_bind_group(
++        &self,
++        params_buffer: &wgpu::Buffer,
++        offset: u64,
++        size: usize,
++        source: &wgpu::TextureView,
++        blurred: &wgpu::TextureView,
++    ) -> wgpu::BindGroup {
++        let resources = self.resources();
++        resources.device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: Some("filter_bind_group"),
++            layout: &resources.bind_group_layouts.backdrop,
++            entries: &[
++                wgpu::BindGroupEntry {
++                    binding: 0,
++                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
++                        buffer: params_buffer,
++                        offset,
++                        size: NonZeroU64::new(size as u64),
++                    }),
++                },
++                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(source) },
++                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(blurred) },
++                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler) },
++            ],
++        })
++    }
++
++    /// the frame-sized target groups at `depth` draw into, created or resized as needed.
++    fn ensure_filter_target(&mut self, depth: usize, size: Size<u32>) -> FilterTarget {
++        let format = self.target_format;
++        let resources = &mut self.resources;
++        while resources.filter_targets.len() <= depth {
++            resources.filter_targets.push(create_filter_target(&resources.device, format, size));
++        }
++        let target = &mut resources.filter_targets[depth];
++        if target.texture.width() != size.width || target.texture.height() != size.height {
++            *target = create_filter_target(&resources.device, format, size);
++        }
++        FilterTarget { texture: target.texture.clone(), view: target.view.clone() }
++    }
++
++    fn ensure_filter_placeholder(&mut self) -> FilterTarget {
++        let format = self.target_format;
++        let resources = &mut self.resources;
++        let placeholder = resources.filter_placeholder.get_or_insert_with(|| {
++            create_filter_target(&resources.device, format, Size { width: 1, height: 1 })
++        });
++        FilterTarget { texture: placeholder.texture.clone(), view: placeholder.view.clone() }
++    }
++
++    fn write_scene_instances(
++        &mut self,
++        scene: &Scene,
++        instance_offset: &mut u64,
++    ) -> Result<SceneInstances> {
++        let bindings = self.write_instances(scene, instance_offset)?;
++        let groups = scene
++            .filter_groups
++            .iter()
++            .map(|group| self.write_scene_instances(&group.scene, instance_offset))
++            .collect::<Result<Vec<_>>>()?;
++        Ok(SceneInstances { bindings, groups })
+     }
+ 
+     /// Resumes the main pass after it was ended to rasterize paths or run a backdrop blur.
+@@ -1957,7 +2351,7 @@
+     /// Releases the blur resources once enough frames in a row had no blur.
+     fn retire_idle_backdrop_resources(&mut self, scene: &Scene) {
+         let resources = &mut self.resources;
+-        if !scene.backdrop_blurs.is_empty() {
++        if !scene.backdrop_blurs.is_empty() || !scene.filter_groups.is_empty() {
+             resources.backdrop_free_frames = 0;
+             return;
+         }
+@@ -1965,6 +2359,7 @@
+             && resources.backdrop_params_buffer.is_none()
+             && resources.backdrop_frame.is_none()
+             && resources.backdrop_frame_blitter.is_none()
++            && resources.filter_targets.is_empty()
+         {
+             return;
+         }
+@@ -1978,6 +2373,7 @@
+         let alignment = u64::from(self.resources.device.limits().min_uniform_buffer_offset_alignment);
+         (std::mem::size_of::<BackdropCompositeParams>() as u64)
+             .max(std::mem::size_of::<BackdropBlurPassParams>() as u64)
++            .max(std::mem::size_of::<FilterCompositeParams>() as u64)
+             .next_multiple_of(alignment.max(1))
+     }
+ 
+@@ -2192,7 +2588,8 @@
+             sigma: texel_sigma,
+             radius: (texel_sigma * 3.).ceil() as u32,
+             box_size: downsample,
+-            _pad: [0; 3],
++            extent: [0; 2],
++            _pad: 0,
+         };
+         let vertical = BackdropBlurPassParams {
+             direction: [0., 1.],
+@@ -2287,9 +2684,9 @@
+         let pipelines = &resources.pipelines;
+         let globals = &resources.globals_bind_group;
+         let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+-        Self::draw_backdrop_pass(encoder, &textures.horizontal_view, clear, &pipelines.backdrop_blur, globals, &horizontal_group);
+-        Self::draw_backdrop_pass(encoder, &textures.blurred_view, clear, &pipelines.backdrop_blur, globals, &vertical_group);
+-        Self::draw_backdrop_pass(encoder, frame_view, wgpu::LoadOp::Load, &pipelines.backdrop_composite, globals, &composite_group);
++        Self::draw_backdrop_pass(encoder, &textures.horizontal_view, clear, &pipelines.backdrop_blur, globals, &horizontal_group, None);
++        Self::draw_backdrop_pass(encoder, &textures.blurred_view, clear, &pipelines.backdrop_blur, globals, &vertical_group, None);
++        Self::draw_backdrop_pass(encoder, frame_view, wgpu::LoadOp::Load, &pipelines.backdrop_composite, globals, &composite_group, None);
+     }
+ 
+     fn draw_backdrop_pass(
+@@ -2299,6 +2696,7 @@
+         pipeline: &wgpu::RenderPipeline,
+         globals: &wgpu::BindGroup,
+         params: &wgpu::BindGroup,
++        extent: Option<Size<u32>>,
+     ) {
+         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+             label: Some("backdrop_pass"),
+@@ -2314,6 +2712,9 @@
+             depth_stencil_attachment: None,
+             ..Default::default()
+         });
++        if let Some(extent) = extent {
++            pass.set_scissor_rect(0, 0, extent.width, extent.height);
++        }
+         pass.set_pipeline(pipeline);
+         pass.set_bind_group(0, globals, &[]);
+         pass.set_bind_group(1, params, &[]);
+@@ -2384,18 +2785,24 @@
+     }
+ 
+     fn prepare_texture_bind_groups(&mut self, scene: &Scene) {
+-        let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
+-        for batch in scene.batches() {
+-            let texture_id = match batch {
+-                PrimitiveBatch::MonochromeSprites { texture_id, .. }
+-                | PrimitiveBatch::SubpixelSprites { texture_id, .. }
+-                | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
+-                _ => continue,
+-            };
+-            if !texture_ids.contains(&texture_id) {
+-                texture_ids.push(texture_id);
++        fn collect(scene: &Scene, texture_ids: &mut SmallVec<[AtlasTextureId; 8]>) {
++            for batch in scene.batches() {
++                let texture_id = match batch {
++                    PrimitiveBatch::MonochromeSprites { texture_id, .. }
++                    | PrimitiveBatch::SubpixelSprites { texture_id, .. }
++                    | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
++                    _ => continue,
++                };
++                if !texture_ids.contains(&texture_id) {
++                    texture_ids.push(texture_id);
++                }
++            }
++            for group in &scene.filter_groups {
++                collect(&group.scene, texture_ids);
+             }
+         }
++        let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
++        collect(scene, &mut texture_ids);
+ 
+         self.resources_mut()
+             .atlas_texture_bind_groups
+@@ -3104,14 +3511,13 @@
+     fn render(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
+         self.check_gpu_errors()?;
+         self.ensure_render_target(size)?;
+-        let view = self
++        let target = self
+             .render_target
+             .as_ref()
+-            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
+-            .view
+-            .clone();
++            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?;
++        let (texture, view) = (target.texture.clone(), target.view.clone());
+         self.core
+-            .render_frame(scene, &view, size, false, wgpu::Color::BLACK)?;
++            .render_frame(scene, &texture, &view, size, false, wgpu::Color::BLACK)?;
+         Ok(())
+     }
+ 
+@@ -3250,6 +3656,76 @@
+     }
+ }
+ 
++/// a scene's backdrop blurs and filter groups not yet drawn, in draw order.
++struct SceneEffects<'a> {
++    blurs: std::iter::Peekable<std::slice::Iter<'a, BackdropBlur>>,
++    groups: std::iter::Peekable<std::iter::Zip<std::slice::Iter<'a, FilterGroup>, std::slice::Iter<'a, SceneInstances>>>,
++}
++
++impl SceneEffects<'_> {
++    /// whether an effect is due before the primitives of `order`.
++    fn due_before(&mut self, order: DrawOrder) -> bool {
++        self.next_due(Some(order)).is_some()
++    }
++
++    /// the next effect if it is due before the primitives of `before` (or at all, for `None`):
++    /// whether it is a blur, and its order.
++    fn next_due(&mut self, before: Option<DrawOrder>) -> Option<(bool, DrawOrder)> {
++        // blurs sort before the primitives of their order (rank 0), groups after them (rank 2)
++        let blur = self.blurs.peek().map(|blur| (blur.order, 0u8));
++        let group = self.groups.peek().map(|(group, _)| (group.order, 2u8));
++        let next = match (blur, group) {
++            (None, None) => return None,
++            (Some(blur), None) => blur,
++            (None, Some(group)) => group,
++            (Some(blur), Some(group)) => blur.min(group),
++        };
++        if before.is_some_and(|order| next >= (order, 1)) {
++            return None;
++        }
++        Some((next.1 == 0, next.0))
++    }
++}
++
++/// how many parameter slot sets a frame of `scene` uses: one per backdrop blur and filter group,
++/// nested ones included.
++fn effect_count(scene: &Scene) -> usize {
++    scene.backdrop_blurs.len()
++        + scene.filter_groups.iter().map(|group| 1 + effect_count(&group.scene)).sum::<usize>()
++}
++
++/// `bounds` grown to whole device pixels and cut to a `size` target, or `None` when nothing is left.
++fn device_rect(bounds: Bounds<ScaledPixels>, size: Size<u32>) -> Option<Bounds<u32>> {
++    if !(bounds.size.width.0 > 0. && bounds.size.height.0 > 0.) {
++        return None;
++    }
++    let left = bounds.origin.x.0.floor().max(0.) as u32;
++    let top = bounds.origin.y.0.floor().max(0.) as u32;
++    let right = (bounds.right().0.ceil().max(0.) as u32).min(size.width);
++    let bottom = (bounds.bottom().0.ceil().max(0.) as u32).min(size.height);
++    (right > left && bottom > top).then(|| Bounds {
++        origin: Point { x: left, y: top },
++        size: Size { width: right - left, height: bottom - top },
++    })
++}
++
++fn create_filter_target(device: &wgpu::Device, format: wgpu::TextureFormat, size: Size<u32>) -> FilterTarget {
++    let texture = device.create_texture(&wgpu::TextureDescriptor {
++        label: Some("filter_target"),
++        size: wgpu::Extent3d { width: size.width.max(1), height: size.height.max(1), depth_or_array_layers: 1 },
++        mip_level_count: 1,
++        sample_count: 1,
++        dimension: wgpu::TextureDimension::D2,
++        format,
++        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
++            | wgpu::TextureUsages::TEXTURE_BINDING
++            | wgpu::TextureUsages::COPY_SRC,
++        view_formats: &[],
++    });
++    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
++    FilterTarget { texture, view }
++}
++
+ fn instance_range(range: Range<usize>) -> Range<u32> {
+     range.start as u32..range.end as u32
+ }
+diff -ruN -x 'LICENSE*' a/crates/gpui_windows/build.rs b/crates/gpui_windows/build.rs
+--- a/crates/gpui_windows/build.rs
++++ b/crates/gpui_windows/build.rs
+@@ -51,6 +51,8 @@
+             "polychrome_sprite",
+             "backdrop_blur_pass",
+             "backdrop_blur",
++            "filter_clear",
++            "filter_composite",
+         ];
+ 
+         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);
+diff -ruN -x 'LICENSE*' a/crates/gpui_windows/src/directx_renderer/backdrop_blur.rs b/crates/gpui_windows/src/directx_renderer/backdrop_blur.rs
+--- a/crates/gpui_windows/src/directx_renderer/backdrop_blur.rs
++++ b/crates/gpui_windows/src/directx_renderer/backdrop_blur.rs
+@@ -13,35 +13,37 @@
+ const BACKDROP_TEXTURE_GRANULARITY: u32 = 64;
+ /// The largest gaussian standard deviation run, in device pixels. Beyond it the frost no longer
+ /// changes visibly while the work keeps growing.
+-const MAX_BACKDROP_BLUR_SIGMA: f32 = 64.;
++pub(super) const MAX_BACKDROP_BLUR_SIGMA: f32 = 64.;
+ /// `backdrop_taps` in shaders.hlsl: two folded tap pairs per vector, enough for the 3-sigma
+ /// reach of [`MAX_BACKDROP_BLUR_SIGMA`].
+-const BACKDROP_TAP_VECTORS: usize = 48;
++pub(super) const BACKDROP_TAP_VECTORS: usize = 48;
+ 
+ /// `cbuffer BackdropBlurParams` (b2) in shaders.hlsl. Every field group fills whole 16-byte
+ /// registers, so no field straddles one.
+ #[derive(Clone, Copy)]
+ #[repr(C)]
+-struct BackdropBlurParams {
+-    bounds: [f32; 4],
+-    corner_radii: [f32; 4],
+-    content_mask: [f32; 4],
+-    region_origin: [f32; 2],
+-    region_size: [f32; 2],
+-    source_size: [f32; 2],
+-    source_extent: [f32; 2],
+-    direction: [f32; 2],
+-    scale: [f32; 2],
+-    saturation: f32,
+-    opacity: f32,
+-    center_weight: f32,
+-    tap_pair_count: u32,
++pub(super) struct BackdropBlurParams {
++    pub(super) bounds: [f32; 4],
++    pub(super) corner_radii: [f32; 4],
++    pub(super) content_mask: [f32; 4],
++    pub(super) region_origin: [f32; 2],
++    pub(super) region_size: [f32; 2],
++    pub(super) source_size: [f32; 2],
++    pub(super) source_extent: [f32; 2],
++    pub(super) direction: [f32; 2],
++    pub(super) scale: [f32; 2],
++    pub(super) saturation: f32,
++    pub(super) opacity: f32,
++    pub(super) center_weight: f32,
++    pub(super) tap_pair_count: u32,
+     /// Top, right, bottom, left: how far in from each edge the effect fades out (0: hard).
+-    fades: [f32; 4],
++    pub(super) fades: [f32; 4],
+     /// One-based index into the rounded clips (t2), or 0.
+-    rounded_clip: u32,
+-    _pad: [u32; 3],
+-    taps: [[f32; 4]; BACKDROP_TAP_VECTORS],
++    pub(super) rounded_clip: u32,
++    /// filter composites only: 1 cuts the image to `bounds` rounded by `corner_radii`.
++    pub(super) has_mask: u32,
++    pub(super) _pad: [u32; 2],
++    pub(super) taps: [[f32; 4]; BACKDROP_TAP_VECTORS],
+ }
+ 
+ const _: () = assert!(std::mem::size_of::<BackdropBlurParams>() == (9 + BACKDROP_TAP_VECTORS) * 16);
+@@ -53,7 +55,7 @@
+ /// Writes the normalized gaussian for `sigma` as folded tap pairs: taps `k` and `k + 1` (odd
+ /// `k`) become one bilinear sample between them carrying both weights, which halves the samples
+ /// of every pass. Returns the centre tap's weight and the number of pairs written.
+-fn gaussian_tap_pairs(sigma: f32, taps: &mut [[f32; 4]; BACKDROP_TAP_VECTORS]) -> (f32, u32) {
++pub(super) fn gaussian_tap_pairs(sigma: f32, taps: &mut [[f32; 4]; BACKDROP_TAP_VECTORS]) -> (f32, u32) {
+     let radius = ((sigma * 3.).ceil() as usize).min(BACKDROP_TAP_VECTORS * 4);
+     let weight = |k: usize| {
+         if k > radius {
+@@ -78,16 +80,16 @@
+     (1. / total, pair_count as u32)
+ }
+ 
+-struct BackdropTexture {
+-    texture: ID3D11Texture2D,
+-    view: Option<ID3D11ShaderResourceView>,
+-    render_target_view: Option<ID3D11RenderTargetView>,
+-    width: u32,
+-    height: u32,
++pub(super) struct BackdropTexture {
++    pub(super) texture: ID3D11Texture2D,
++    pub(super) view: Option<ID3D11ShaderResourceView>,
++    pub(super) render_target_view: Option<ID3D11RenderTargetView>,
++    pub(super) width: u32,
++    pub(super) height: u32,
+ }
+ 
+ impl BackdropTexture {
+-    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
++    pub(super) fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+         let desc = D3D11_TEXTURE2D_DESC {
+             Width: width,
+             Height: height,
+@@ -114,13 +116,13 @@
+ /// The scratch textures one blur region goes through, sized for a bucketed region of `width` ×
+ /// `height`: `source` holds the region as drawn so far, `horizontal` and `blurred` the two
+ /// gaussian passes, each `downsample` times smaller along the axes blurred so far.
+-struct BackdropTextures {
++pub(super) struct BackdropTextures {
+     width: u32,
+     height: u32,
+     downsample: u32,
+-    source: BackdropTexture,
+-    horizontal: BackdropTexture,
+-    blurred: BackdropTexture,
++    pub(super) source: BackdropTexture,
++    pub(super) horizontal: BackdropTexture,
++    pub(super) blurred: BackdropTexture,
+ }
+ 
+ impl BackdropTextures {
+@@ -137,14 +139,14 @@
+     }
+ }
+ 
+-struct BackdropBlurPipeline {
+-    pass_vertex: ID3D11VertexShader,
+-    pass_fragment: ID3D11PixelShader,
++pub(super) struct BackdropBlurPipeline {
++    pub(super) pass_vertex: ID3D11VertexShader,
++    pub(super) pass_fragment: ID3D11PixelShader,
+     composite_vertex: ID3D11VertexShader,
+     composite_fragment: ID3D11PixelShader,
+-    params_buffer: Option<ID3D11Buffer>,
+-    sampler: Option<ID3D11SamplerState>,
+-    replace_blend_state: ID3D11BlendState,
++    pub(super) params_buffer: Option<ID3D11Buffer>,
++    pub(super) sampler: Option<ID3D11SamplerState>,
++    pub(super) replace_blend_state: ID3D11BlendState,
+ }
+ 
+ impl BackdropBlurPipeline {
+@@ -188,7 +190,7 @@
+     }
+ 
+     /// Draws a quad over the top-left `extent` texels of `target`, sampling `source` at t0.
+-    fn draw_pass(
++    pub(super) fn draw_pass(
+         &self,
+         device_context: &ID3D11DeviceContext,
+         target: &BackdropTexture,
+@@ -250,6 +252,10 @@
+         self.pipeline.is_some()
+     }
+ 
++    pub(super) fn pipeline(&self) -> Option<&BackdropBlurPipeline> {
++        self.pipeline.as_ref()
++    }
++
+     /// Counts a drawn frame against the scratch textures, releasing them once enough frames
+     /// have gone by without a blur. The pipeline is kept: it holds no window-sized memory.
+     pub(super) fn note_frame(&mut self, frame_had_blurs: bool) {
+@@ -272,7 +278,7 @@
+ 
+     /// A scratch set for a `width` × `height` region, created on demand; it becomes the most
+     /// recently used.
+-    fn prepare(&mut self, device: &ID3D11Device, width: u32, height: u32, downsample: u32) -> Result<Option<(&BackdropBlurPipeline, &BackdropTextures)>> {
++    pub(super) fn prepare(&mut self, device: &ID3D11Device, width: u32, height: u32, downsample: u32) -> Result<Option<(&BackdropBlurPipeline, &BackdropTextures)>> {
+         if self.pipeline.is_none() {
+             return Ok(None);
+         }
+@@ -331,7 +337,7 @@
+ 
+         let devices = self.devices.as_ref().context("devices missing")?;
+         let resources = self.resources.as_ref().context("resources missing")?;
+-        let render_target = resources.render_target.as_ref().context("render target missing")?;
++        let (render_target, render_target_view) = self.current_target(resources)?;
+         let Some((pipeline, textures)) = self.backdrop_blurs.prepare(&devices.device, width, height, downsample)? else {
+             return Ok(());
+         };
+@@ -358,7 +364,8 @@
+             tap_pair_count: 0,
+             fades: [blur.fades.top.0, blur.fades.right.0, blur.fades.bottom.0, blur.fades.left.0],
+             rounded_clip: blur.rounded_clip,
+-            _pad: [0; 3],
++            has_mask: 0,
++            _pad: [0; 2],
+             taps: [[0.; 4]; BACKDROP_TAP_VECTORS],
+         };
+         let (center_weight, tap_pair_count) = gaussian_tap_pairs(sigma, &mut params.taps);
+@@ -366,7 +373,7 @@
+         let region = D3D11_BOX { left, top, front: 0, right, bottom, back: 1 };
+         unsafe {
+             device_context.OMSetRenderTargets(None, None);
+-            device_context.CopySubresourceRegion(&textures.source.texture, 0, 0, 0, 0, render_target, 0, Some(&region));
++            device_context.CopySubresourceRegion(&textures.source.texture, 0, 0, 0, 0, &render_target, 0, Some(&region));
+             device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+             device_context.VSSetShader(&pipeline.pass_vertex, None);
+             device_context.PSSetShader(&pipeline.pass_fragment, None);
+@@ -400,7 +407,7 @@
+             )?;
+             unsafe {
+                 device_context.PSSetShaderResources(0, Some(&[None]));
+-                device_context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
++                device_context.OMSetRenderTargets(Some(slice::from_ref(&render_target_view)), None);
+                 device_context.PSSetShaderResources(0, Some(slice::from_ref(&textures.source.view)));
+                 device_context.PSSetShaderResources(4, Some(slice::from_ref(&textures.blurred.view)));
+                 device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+@@ -417,7 +424,7 @@
+         unsafe {
+             device_context.PSSetShaderResources(0, Some(&[None]));
+             device_context.PSSetShaderResources(4, Some(&[None]));
+-            device_context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
++            device_context.OMSetRenderTargets(Some(slice::from_ref(&render_target_view)), None);
+             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+         }
+         result
+diff -ruN -x 'LICENSE*' a/crates/gpui_windows/src/directx_renderer/filter_groups.rs b/crates/gpui_windows/src/directx_renderer/filter_groups.rs
+--- a/crates/gpui_windows/src/directx_renderer/filter_groups.rs
++++ b/crates/gpui_windows/src/directx_renderer/filter_groups.rs
+@@ -0,0 +1,379 @@
++// filter groups: a group's scene is drawn into a frame-sized target of its own, blurred with
++// the backdrop blur's passes and composited over the target it belongs to, premultiplied.
++use std::borrow::Cow;
++
++use super::backdrop_blur::{
++    BACKDROP_TAP_VECTORS, BackdropBlurParams, BackdropTexture, MAX_BACKDROP_BLUR_SIGMA,
++    gaussian_tap_pairs,
++};
++use super::*;
++
++/// drawn frames without a filter group after which the group targets are released.
++const FILTER_GROUP_IDLE_FRAMES: u32 = 120;
++/// groups nested deeper than this draw their content unfiltered, which bounds the frame-sized
++/// targets kept.
++const MAX_FILTER_GROUP_DEPTH: usize = 4;
++
++/// where a scene's primitives start in the uploaded buffers, and its groups', in the order of
++/// `Scene::filter_groups`.
++#[derive(Default)]
++pub(super) struct SceneBases {
++    pub(super) shadows: usize,
++    pub(super) quads: usize,
++    pub(super) underlines: usize,
++    pub(super) monochrome_sprites: usize,
++    pub(super) subpixel_sprites: usize,
++    pub(super) polychrome_sprites: usize,
++    pub(super) groups: Vec<SceneBases>,
++}
++
++/// the primitives uploaded for a frame: the scene's own when it has no groups, else every
++/// scene's one after another.
++#[derive(Default)]
++pub(super) struct ScenePrimitives<'a> {
++    pub(super) shadows: Cow<'a, [Shadow]>,
++    pub(super) quads: Cow<'a, [Quad]>,
++    pub(super) underlines: Cow<'a, [Underline]>,
++    pub(super) monochrome_sprites: Cow<'a, [MonochromeSprite]>,
++    pub(super) subpixel_sprites: Cow<'a, [SubpixelSprite]>,
++    pub(super) polychrome_sprites: Cow<'a, [PolychromeSprite]>,
++}
++
++impl<'a> ScenePrimitives<'a> {
++    pub(super) fn borrowed(scene: &'a Scene) -> Self {
++        Self {
++            shadows: Cow::Borrowed(&scene.shadows),
++            quads: Cow::Borrowed(&scene.quads),
++            underlines: Cow::Borrowed(&scene.underlines),
++            monochrome_sprites: Cow::Borrowed(&scene.monochrome_sprites),
++            subpixel_sprites: Cow::Borrowed(&scene.subpixel_sprites),
++            polychrome_sprites: Cow::Borrowed(&scene.polychrome_sprites),
++        }
++    }
++
++    /// appends `scene`'s primitives and then its groups', depth first.
++    pub(super) fn append(&mut self, scene: &Scene) -> SceneBases {
++        let mut bases = SceneBases {
++            shadows: self.shadows.len(),
++            quads: self.quads.len(),
++            underlines: self.underlines.len(),
++            monochrome_sprites: self.monochrome_sprites.len(),
++            subpixel_sprites: self.subpixel_sprites.len(),
++            polychrome_sprites: self.polychrome_sprites.len(),
++            groups: Vec::new(),
++        };
++        self.shadows.to_mut().extend_from_slice(&scene.shadows);
++        self.quads.to_mut().extend_from_slice(&scene.quads);
++        self.underlines.to_mut().extend_from_slice(&scene.underlines);
++        self.monochrome_sprites.to_mut().extend_from_slice(&scene.monochrome_sprites);
++        self.subpixel_sprites.to_mut().extend_from_slice(&scene.subpixel_sprites);
++        self.polychrome_sprites.to_mut().extend_from_slice(&scene.polychrome_sprites);
++        bases.groups = scene.filter_groups.iter().map(|group| self.append(&group.scene)).collect();
++        bases
++    }
++}
++
++struct FilterGroupPipeline {
++    clear_vertex: ID3D11VertexShader,
++    clear_fragment: ID3D11PixelShader,
++    composite_vertex: ID3D11VertexShader,
++    composite_fragment: ID3D11PixelShader,
++    replace_blend_state: ID3D11BlendState,
++    /// premultiplied over: a group's target holds premultiplied colour.
++    over_blend_state: ID3D11BlendState,
++}
++
++impl FilterGroupPipeline {
++    fn new(device: &ID3D11Device) -> Result<Self> {
++        let shader = |module, target| RawShaderBytes::new(module, target);
++        let clear_vertex = create_vertex_shader(device, shader(ShaderModule::FilterClear, ShaderTarget::Vertex)?.as_bytes())?;
++        let clear_fragment = create_fragment_shader(device, shader(ShaderModule::FilterClear, ShaderTarget::Fragment)?.as_bytes())?;
++        let composite_vertex = create_vertex_shader(device, shader(ShaderModule::FilterComposite, ShaderTarget::Vertex)?.as_bytes())?;
++        let composite_fragment = create_fragment_shader(device, shader(ShaderModule::FilterComposite, ShaderTarget::Fragment)?.as_bytes())?;
++        let mut replace = D3D11_BLEND_DESC::default();
++        replace.RenderTarget[0].BlendEnable = false.into();
++        replace.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
++        let mut replace_blend_state = None;
++        unsafe { device.CreateBlendState(&replace, Some(&mut replace_blend_state))? };
++        let mut over = D3D11_BLEND_DESC::default();
++        let target = &mut over.RenderTarget[0];
++        target.BlendEnable = true.into();
++        target.BlendOp = D3D11_BLEND_OP_ADD;
++        target.BlendOpAlpha = D3D11_BLEND_OP_ADD;
++        target.SrcBlend = D3D11_BLEND_ONE;
++        target.SrcBlendAlpha = D3D11_BLEND_ONE;
++        target.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
++        target.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
++        target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
++        let mut over_blend_state = None;
++        unsafe { device.CreateBlendState(&over, Some(&mut over_blend_state))? };
++        Ok(Self {
++            clear_vertex,
++            clear_fragment,
++            composite_vertex,
++            composite_fragment,
++            replace_blend_state: replace_blend_state.context("Creating filter clear blend state")?,
++            over_blend_state: over_blend_state.context("Creating filter composite blend state")?,
++        })
++    }
++}
++
++pub(super) struct FilterGroups {
++    /// none when the pipeline couldn't be built: groups then draw their content unfiltered.
++    pipeline: Option<FilterGroupPipeline>,
++    /// frame-sized targets, one per nesting depth.
++    targets: Vec<BackdropTexture>,
++    idle_frames: u32,
++}
++
++impl FilterGroups {
++    pub(super) fn new(device: &ID3D11Device) -> Self {
++        let pipeline = match FilterGroupPipeline::new(device) {
++            Ok(pipeline) => Some(pipeline),
++            Err(error) => {
++                // no logger may be installed; a console build of the app still shows this
++                eprintln!("gpui: filter groups unavailable on DirectX: {error:#}");
++                log::error!("filter groups unavailable on DirectX: {error:#}");
++                None
++            }
++        };
++        Self { pipeline, targets: Vec::new(), idle_frames: 0 }
++    }
++
++    /// counts a drawn frame against the group targets, releasing them once enough frames have
++    /// gone by without a group.
++    pub(super) fn note_frame(&mut self, frame_had_groups: bool) {
++        if frame_had_groups {
++            self.idle_frames = 0;
++            return;
++        }
++        if self.targets.is_empty() {
++            return;
++        }
++        self.idle_frames = self.idle_frames.saturating_add(1);
++        if self.idle_frames >= FILTER_GROUP_IDLE_FRAMES {
++            self.targets.clear();
++        }
++    }
++
++    pub(super) fn release_textures(&mut self) {
++        self.targets.clear();
++    }
++
++    /// the target groups at `depth` draw into, as texture, shader view and render target view.
++    fn target(
++        &mut self,
++        device: &ID3D11Device,
++        depth: usize,
++        size: (u32, u32),
++    ) -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>, Option<ID3D11RenderTargetView>)> {
++        while self.targets.len() <= depth {
++            self.targets.push(BackdropTexture::new(device, size.0, size.1)?);
++        }
++        let target = &mut self.targets[depth];
++        if target.width != size.0 || target.height != size.1 {
++            *target = BackdropTexture::new(device, size.0, size.1)?;
++        }
++        Ok((target.texture.clone(), target.view.clone(), target.render_target_view.clone()))
++    }
++}
++
++/// `bounds` grown to whole pixels and cut to a `size` target, or `None` when nothing is left:
++/// left, top, right, bottom.
++fn device_rect(bounds: Bounds<ScaledPixels>, size: (u32, u32)) -> Option<(u32, u32, u32, u32)> {
++    if !(bounds.size.width.0 > 0. && bounds.size.height.0 > 0.) {
++        return None;
++    }
++    let left = bounds.origin.x.0.floor().max(0.) as u32;
++    let top = bounds.origin.y.0.floor().max(0.) as u32;
++    let right = (bounds.right().0.ceil().max(0.) as u32).min(size.0);
++    let bottom = (bounds.bottom().0.ceil().max(0.) as u32).min(size.1);
++    (right > left && bottom > top).then_some((left, top, right, bottom))
++}
++
++impl DirectXRenderer {
++    /// the texture and view batches draw into now: a group's target, or the frame's.
++    pub(super) fn current_target(
++        &self,
++        resources: &DirectXResources,
++    ) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)> {
++        match &self.target_override {
++            Some((texture, view)) => Ok((texture.clone(), view.clone())),
++            None => Ok((
++                resources.render_target.clone().context("render target missing")?,
++                resources.render_target_view.clone(),
++            )),
++        }
++    }
++
++    pub(super) fn current_target_view<'a>(
++        &'a self,
++        resources: &'a DirectXResources,
++    ) -> &'a Option<ID3D11RenderTargetView> {
++        match &self.target_override {
++            Some((_, view)) => view,
++            None => &resources.render_target_view,
++        }
++    }
++
++    /// draws `group`'s scene into its depth's target (emptying only the region it draws in),
++    /// blurs that region when the group has a blur, and composites it over the current target
++    /// moved by the group's offset. without the pipelines, or nested too deeply, the scene is
++    /// drawn straight into the current target instead.
++    pub(super) fn draw_filter_group(
++        &mut self,
++        group: &FilterGroup,
++        bases: &SceneBases,
++        depth: usize,
++    ) -> Result<()> {
++        if depth >= MAX_FILTER_GROUP_DEPTH
++            || self.filter_groups.pipeline.is_none()
++            || !self.backdrop_blurs.available()
++        {
++            return self.draw_scene(&group.scene, bases, depth);
++        }
++        let frame = (self.width, self.height);
++        let reach = group.blur_reach();
++        // one pixel more than the composite reaches, so the bilinear taps at its edge read cleared texels
++        let (Some(source), Some(composite)) = (
++            device_rect(group.bounds.dilate(ScaledPixels(reach as f32 + 2.)), frame),
++            device_rect(group.composite_bounds(), frame),
++        ) else {
++            return Ok(());
++        };
++        let devices = self.devices.clone().context("devices missing")?;
++        let device_context = &devices.device_context;
++        let (target_texture, target_view, target_rtv) =
++            self.filter_groups.target(&devices.device, depth, frame)?;
++        let full_viewport = self.resources.as_ref().context("resources missing")?.viewport;
++
++        {
++            let pipeline = self.filter_groups.pipeline.as_ref().context("filter pipeline missing")?;
++            let region = D3D11_VIEWPORT {
++                TopLeftX: source.0 as f32,
++                TopLeftY: source.1 as f32,
++                Width: (source.2 - source.0) as f32,
++                Height: (source.3 - source.1) as f32,
++                MinDepth: 0.0,
++                MaxDepth: 1.0,
++            };
++            unsafe {
++                // a texture bound for sampling is silently unbound when it becomes a render target
++                device_context.PSSetShaderResources(0, Some(&[None]));
++                device_context.PSSetShaderResources(4, Some(&[None]));
++                device_context.OMSetRenderTargets(Some(slice::from_ref(&target_rtv)), None);
++                device_context.RSSetViewports(Some(slice::from_ref(&region)));
++                device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
++                device_context.VSSetShader(&pipeline.clear_vertex, None);
++                device_context.PSSetShader(&pipeline.clear_fragment, None);
++                device_context.OMSetBlendState(&pipeline.replace_blend_state, None, 0xFFFFFFFF);
++                device_context.Draw(4, 0);
++                device_context.RSSetViewports(Some(slice::from_ref(&full_viewport)));
++            }
++        }
++
++        let previous = self.target_override.replace((target_texture.clone(), target_rtv));
++        let drawn = self.draw_scene(&group.scene, bases, depth + 1);
++        self.target_override = previous;
++        drawn?;
++
++        let resources = self.resources.as_ref().context("resources missing")?;
++        let (_, parent_view) = self.current_target(resources)?;
++
++        let radii = group.mask_corner_radii.unwrap_or_default();
++        let mask = Bounds { origin: group.bounds.origin + group.offset, size: group.bounds.size };
++        let mut params = BackdropBlurParams {
++            bounds: [mask.origin.x.0, mask.origin.y.0, mask.size.width.0, mask.size.height.0],
++            corner_radii: [radii.top_left.0, radii.top_right.0, radii.bottom_right.0, radii.bottom_left.0],
++            content_mask: [
++                composite.0 as f32,
++                composite.1 as f32,
++                (composite.2 - composite.0) as f32,
++                (composite.3 - composite.1) as f32,
++            ],
++            region_origin: [group.offset.x.0, group.offset.y.0],
++            region_size: [frame.0 as f32, frame.1 as f32],
++            source_size: [frame.0 as f32, frame.1 as f32],
++            source_extent: [frame.0 as f32, frame.1 as f32],
++            direction: [0.; 2],
++            scale: [1.; 2],
++            saturation: 1.,
++            opacity: group.opacity,
++            center_weight: 1.,
++            tap_pair_count: 0,
++            fades: [0.; 4],
++            rounded_clip: group.rounded_clip,
++            has_mask: group.mask_corner_radii.is_some() as u32,
++            _pad: [0; 2],
++            taps: [[0.; 4]; BACKDROP_TAP_VECTORS],
++        };
++
++        let sigma = group.blur_radius.0.min(MAX_BACKDROP_BLUR_SIGMA);
++        let (width, height) = (source.2 - source.0, source.3 - source.1);
++        let downsample = ((sigma / 8.) as u32).clamp(1, 4);
++        let image = if reach > 0 {
++            let Some((blur_pipeline, textures)) =
++                self.backdrop_blurs.prepare(&devices.device, width, height, downsample)?
++            else {
++                return Ok(());
++            };
++            let (blurred_width, blurred_height) = (width.div_ceil(downsample), height.div_ceil(downsample));
++            let (center_weight, tap_pair_count) = gaussian_tap_pairs(sigma.max(0.5), &mut params.taps);
++            params.center_weight = center_weight;
++            params.tap_pair_count = tap_pair_count;
++            let region = D3D11_BOX { left: source.0, top: source.1, front: 0, right: source.2, bottom: source.3, back: 1 };
++            unsafe {
++                device_context.OMSetRenderTargets(None, None);
++                device_context.CopySubresourceRegion(&textures.source.texture, 0, 0, 0, 0, &target_texture, 0, Some(&region));
++                device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
++                device_context.VSSetShader(&blur_pipeline.pass_vertex, None);
++                device_context.PSSetShader(&blur_pipeline.pass_fragment, None);
++                device_context.PSSetSamplers(1, Some(slice::from_ref(&blur_pipeline.sampler)));
++                device_context.VSSetConstantBuffers(2, Some(slice::from_ref(&blur_pipeline.params_buffer)));
++                device_context.PSSetConstantBuffers(2, Some(slice::from_ref(&blur_pipeline.params_buffer)));
++            }
++            params.source_size = [textures.source.width as f32, textures.source.height as f32];
++            params.source_extent = [width as f32, height as f32];
++            params.direction = [1., 0.];
++            params.scale = [downsample as f32, 1.];
++            blur_pipeline.draw_pass(device_context, &textures.horizontal, (blurred_width, height), &textures.source, &params)?;
++            params.source_size = [textures.horizontal.width as f32, textures.horizontal.height as f32];
++            params.source_extent = [blurred_width as f32, height as f32];
++            params.direction = [0., 1.];
++            params.scale = [1., downsample as f32];
++            blur_pipeline.draw_pass(device_context, &textures.blurred, (blurred_width, blurred_height), &textures.horizontal, &params)?;
++            params.source_size = [textures.blurred.width as f32, textures.blurred.height as f32];
++            params.source_extent = [blurred_width as f32, blurred_height as f32];
++            params.scale = [downsample as f32; 2];
++            params.region_origin = [source.0 as f32 + group.offset.x.0, source.1 as f32 + group.offset.y.0];
++            textures.blurred.view.clone()
++        } else {
++            target_view
++        };
++        let blur_pipeline = self.backdrop_blurs.pipeline().context("backdrop blur pipeline missing")?;
++
++        let pipeline = self.filter_groups.pipeline.as_ref().context("filter pipeline missing")?;
++        update_buffer(
++            device_context,
++            blur_pipeline.params_buffer.as_ref().context("backdrop blur params buffer missing")?,
++            slice::from_ref(&params),
++        )?;
++        unsafe {
++            device_context.PSSetShaderResources(0, Some(&[None]));
++            device_context.OMSetRenderTargets(Some(slice::from_ref(&parent_view)), None);
++            device_context.RSSetViewports(Some(slice::from_ref(&full_viewport)));
++            device_context.PSSetShaderResources(4, Some(slice::from_ref(&image)));
++            device_context.PSSetSamplers(1, Some(slice::from_ref(&blur_pipeline.sampler)));
++            device_context.VSSetConstantBuffers(2, Some(slice::from_ref(&blur_pipeline.params_buffer)));
++            device_context.PSSetConstantBuffers(2, Some(slice::from_ref(&blur_pipeline.params_buffer)));
++            device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
++            device_context.VSSetShader(&pipeline.composite_vertex, None);
++            device_context.PSSetShader(&pipeline.composite_fragment, None);
++            device_context.OMSetBlendState(&pipeline.over_blend_state, None, 0xFFFFFFFF);
++            device_context.Draw(4, 0);
++            // the next group may render into the texture just sampled
++            device_context.PSSetShaderResources(4, Some(&[None]));
++        }
++        Ok(())
++    }
++}
+diff -ruN -x 'LICENSE*' a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -22,9 +22,11 @@
+ use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
+ use crate::*;
+ use backdrop_blur::BackdropBlurs;
++use filter_groups::{FilterGroups, SceneBases};
+ use gpui::*;
+ 
+ mod backdrop_blur;
++mod filter_groups;
+ 
+ pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
+ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+@@ -60,6 +62,10 @@
+ 
+     /// The backdrop blur pipeline and its scratch textures.
+     backdrop_blurs: BackdropBlurs,
++    /// filter group pipelines and the frame-sized targets groups draw into.
++    filter_groups: FilterGroups,
++    /// the target batches draw into while a filter group's scene is drawn; the frame's otherwise.
++    target_override: Option<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)>,
+ }
+ 
+ /// Direct3D objects
+@@ -215,6 +221,7 @@
+         let pipelines = DirectXRenderPipelines::new(&devices.device)
+             .context("Creating DirectX render pipelines")?;
+         let backdrop_blurs = BackdropBlurs::new(&devices.device);
++        let filter_groups = FilterGroups::new(&devices.device);
+ 
+         let direct_composition = if disable_direct_composition {
+             None
+@@ -240,6 +247,8 @@
+             height: 1,
+             skip_draws: false,
+             backdrop_blurs,
++            filter_groups,
++            target_override: None,
+         })
+     }
+ 
+@@ -369,6 +378,7 @@
+         self.globals = globals;
+         self.pipelines = pipelines;
+         self.backdrop_blurs = BackdropBlurs::new(&self.devices.as_ref().context("devices missing")?.device);
++        self.filter_groups = FilterGroups::new(&self.devices.as_ref().context("devices missing")?.device);
+         self.direct_composition = direct_composition;
+         self.skip_draws = true;
+         Ok(())
+@@ -385,7 +395,9 @@
+             return Ok(());
+         }
+         self.render(scene, background_appearance)?;
+-        self.backdrop_blurs.note_frame(!scene.backdrop_blurs.is_empty());
++        let has_effects = !scene.backdrop_blurs.is_empty() || !scene.filter_groups.is_empty();
++        self.backdrop_blurs.note_frame(has_effects);
++        self.filter_groups.note_frame(!scene.filter_groups.is_empty());
+         self.present()
+     }
+ 
+@@ -408,43 +420,73 @@
+             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+             _ => [0.0f32; 4],
+         })?;
+-        self.upload_scene_buffers(scene)?;
++        let bases = self.upload_scene_buffers(scene)?;
++        self.target_override = None;
++        let result = self.draw_scene(scene, &bases, 0);
++        self.target_override = None;
++        result
++    }
+ 
++    /// draws `scene`'s batches into the current target, running its backdrop blurs and filter
++    /// groups at their draw orders: a blur before the primitives of its order, a group after
++    /// them. `bases` locates its primitives in the uploaded buffers; `depth` is how many filter
++    /// groups it is inside.
++    fn draw_scene(&mut self, scene: &Scene, bases: &SceneBases, depth: usize) -> Result<()> {
+         let annotation = self
+             .devices
+             .as_ref()
+             .and_then(|devices| devices.annotation.clone())
+             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
+         let mut pending_blurs = scene.backdrop_blurs.iter().peekable();
++        let mut pending_groups = scene.filter_groups.iter().zip(&bases.groups).peekable();
+         for batch in scene.batches() {
+             let batch_order = scene.batch_order(&batch);
+-            while let Some(blur) = pending_blurs.next_if(|blur| blur.order <= batch_order) {
+-                let _annotation = annotation
+-                    .as_ref()
+-                    .map(|annotation| Annotation::new(annotation, HSTRING::from("backdrop blur")));
+-                self.draw_backdrop_blur(blur).context("drawing a backdrop blur")?;
++            loop {
++                let blur = pending_blurs.peek().map(|blur| (blur.order, 0u8));
++                let group = pending_groups.peek().map(|(group, _)| (group.order, 2u8));
++                let next = match (blur, group) {
++                    (None, None) => break,
++                    (Some(blur), None) => blur,
++                    (None, Some(group)) => group,
++                    (Some(blur), Some(group)) => blur.min(group),
++                };
++                if next >= (batch_order, 1) {
++                    break;
++                }
++                if next.1 == 0 {
++                    if let Some(blur) = pending_blurs.next() {
++                        let _annotation = annotation
++                            .as_ref()
++                            .map(|annotation| Annotation::new(annotation, HSTRING::from("backdrop blur")));
++                        self.draw_backdrop_blur(blur).context("drawing a backdrop blur")?;
++                    }
++                } else if let Some((group, group_bases)) = pending_groups.next() {
++                    let _annotation = annotation
++                        .as_ref()
++                        .map(|annotation| Annotation::new(annotation, HSTRING::from("filter group")));
++                    self.draw_filter_group(group, group_bases, depth).context("drawing a filter group")?;
++                }
+             }
+             let _annotation = annotation
+                 .as_ref()
+                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
+             match batch {
+-                PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
+-                PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
++                PrimitiveBatch::Shadows(range) => self.draw_shadows(bases.shadows + range.start, range.len()),
++                PrimitiveBatch::Quads(range) => self.draw_quads(bases.quads + range.start, range.len()),
+                 PrimitiveBatch::Paths(range) => {
+                     let paths = &scene.paths[range];
+                     self.draw_paths_to_intermediate(paths)?;
+                     self.draw_paths_from_intermediate(paths)
+                 }
+-                PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
+-                PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+-                    self.draw_monochrome_sprites(texture_id, range.start, range.len())
+-                }
+-                PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+-                    self.draw_subpixel_sprites(texture_id, range.start, range.len())
+-                }
+-                PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+-                    self.draw_polychrome_sprites(texture_id, range.start, range.len())
++                PrimitiveBatch::Underlines(range) => {
++                    self.draw_underlines(bases.underlines + range.start, range.len())
+                 }
++                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
++                    .draw_monochrome_sprites(texture_id, bases.monochrome_sprites + range.start, range.len()),
++                PrimitiveBatch::SubpixelSprites { texture_id, range } => self
++                    .draw_subpixel_sprites(texture_id, bases.subpixel_sprites + range.start, range.len()),
++                PrimitiveBatch::PolychromeSprites { texture_id, range } => self
++                    .draw_polychrome_sprites(texture_id, bases.polychrome_sprites + range.start, range.len()),
+                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+             }
+             .with_context(|| {
+@@ -462,13 +504,19 @@
+                 )
+             })?;
+         }
+-        // A blur above everything else still frosts what is beneath it.
++        // a blur above everything else still frosts what is beneath it
+         for blur in pending_blurs {
+             let _annotation = annotation
+                 .as_ref()
+                 .map(|annotation| Annotation::new(annotation, HSTRING::from("backdrop blur")));
+             self.draw_backdrop_blur(blur).context("drawing a backdrop blur")?;
+         }
++        for (group, group_bases) in pending_groups {
++            let _annotation = annotation
++                .as_ref()
++                .map(|annotation| Annotation::new(annotation, HSTRING::from("filter group")));
++            self.draw_filter_group(group, group_bases, depth).context("drawing a filter group")?;
++        }
+         Ok(())
+     }
+ 
+@@ -584,6 +632,7 @@
+         }
+ 
+         self.backdrop_blurs.release_textures();
++        self.filter_groups.release_textures();
+         resources.recreate_resources(devices, width, height)?;
+ 
+         unsafe {
+@@ -595,7 +644,9 @@
+         Ok(())
+     }
+ 
+-    fn upload_scene_buffers(&mut self, scene: &Scene) -> Result<()> {
++    /// uploads the primitives of `scene` and of its filter groups, nested ones included, and
++    /// returns where each scene's start in the buffers.
++    fn upload_scene_buffers(&mut self, scene: &Scene) -> Result<SceneBases> {
+         let devices = self.devices.as_ref().context("devices missing")?;
+ 
+         self.pipelines.rounded_clips.upload(
+@@ -604,55 +655,63 @@
+             &scene.rounded_clips,
+         )?;
+ 
+-        if !scene.shadows.is_empty() {
++        let (primitives, bases) = if scene.filter_groups.is_empty() {
++            (filter_groups::ScenePrimitives::borrowed(scene), SceneBases::default())
++        } else {
++            let mut primitives = filter_groups::ScenePrimitives::default();
++            let bases = primitives.append(scene);
++            (primitives, bases)
++        };
++
++        if !primitives.shadows.is_empty() {
+             self.pipelines.shadow_pipeline.update_buffer(
+                 &devices.device,
+                 &devices.device_context,
+-                &scene.shadows,
++                &primitives.shadows,
+             )?;
+         }
+ 
+-        if !scene.quads.is_empty() {
++        if !primitives.quads.is_empty() {
+             self.pipelines.quad_pipeline.update_buffer(
+                 &devices.device,
+                 &devices.device_context,
+-                &scene.quads,
++                &primitives.quads,
+             )?;
+         }
+ 
+-        if !scene.underlines.is_empty() {
++        if !primitives.underlines.is_empty() {
+             self.pipelines.underline_pipeline.update_buffer(
+                 &devices.device,
+                 &devices.device_context,
+-                &scene.underlines,
++                &primitives.underlines,
+             )?;
+         }
+ 
+-        if !scene.monochrome_sprites.is_empty() {
++        if !primitives.monochrome_sprites.is_empty() {
+             self.pipelines.mono_sprites.update_buffer(
+                 &devices.device,
+                 &devices.device_context,
+-                &scene.monochrome_sprites,
++                &primitives.monochrome_sprites,
+             )?;
+         }
+ 
+-        if !scene.subpixel_sprites.is_empty() {
++        if !primitives.subpixel_sprites.is_empty() {
+             self.pipelines.subpixel_sprites.update_buffer(
+                 &devices.device,
+                 &devices.device_context,
+-                &scene.subpixel_sprites,
++                &primitives.subpixel_sprites,
+             )?;
+         }
+ 
+-        if !scene.polychrome_sprites.is_empty() {
++        if !primitives.polychrome_sprites.is_empty() {
+             self.pipelines.poly_sprites.update_buffer(
+                 &devices.device,
+                 &devices.device_context,
+-                &scene.polychrome_sprites,
++                &primitives.polychrome_sprites,
+             )?;
+         }
+ 
+-        Ok(())
++        Ok(bases)
+     }
+ 
+     fn draw_shadows(&mut self, start: usize, len: usize) -> Result<()> {
+@@ -742,10 +801,10 @@
+                 0,
+                 RENDER_TARGET_FORMAT,
+             );
+-            // Restore main render target
++            // restore the target batches draw into
+             devices
+                 .device_context
+-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
++                .OMSetRenderTargets(Some(slice::from_ref(self.current_target_view(resources))), None);
+         }
+ 
+         Ok(())
+@@ -1799,6 +1858,8 @@
+         PolychromeSprite,
+         BackdropBlurPass,
+         BackdropBlur,
++        FilterClear,
++        FilterComposite,
+     }
+ 
+     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+@@ -1880,6 +1941,14 @@
+                     ShaderTarget::Vertex => BACKDROP_BLUR_VERTEX_BYTES,
+                     ShaderTarget::Fragment => BACKDROP_BLUR_FRAGMENT_BYTES,
+                 },
++                ShaderModule::FilterClear => match target {
++                    ShaderTarget::Vertex => FILTER_CLEAR_VERTEX_BYTES,
++                    ShaderTarget::Fragment => FILTER_CLEAR_FRAGMENT_BYTES,
++                },
++                ShaderModule::FilterComposite => match target {
++                    ShaderTarget::Vertex => FILTER_COMPOSITE_VERTEX_BYTES,
++                    ShaderTarget::Fragment => FILTER_COMPOSITE_FRAGMENT_BYTES,
++                },
+             };
+             Self { inner: bytes }
+         }
+@@ -1964,6 +2033,8 @@
+                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                 ShaderModule::BackdropBlurPass => "backdrop_blur_pass",
+                 ShaderModule::BackdropBlur => "backdrop_blur",
++                ShaderModule::FilterClear => "filter_clear",
++                ShaderModule::FilterComposite => "filter_composite",
+             }
+         }
+     }
+diff -ruN -x 'LICENSE*' a/crates/gpui_windows/src/shaders.hlsl b/crates/gpui_windows/src/shaders.hlsl
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -1464,3 +1464,42 @@
+     if (backdrop_fades.w > 0.) { coverage *= saturate((position.x - low.x) / backdrop_fades.w); }
+     return lerp(original, frosted, coverage);
+ }
++
++/*
++**
++**              Filter groups
++**
++*/
++
++// a composite reads the cbuffer above as `FilterGroup` in directx_renderer/filter_groups.rs
++// fills it: backdrop_bounds is the mask rect and backdrop_clip.y switches it on,
++// backdrop_content_mask the rect composited, and backdrop_region_origin where the image's first
++// texel lands (the group's offset included).
++
++BackdropBlurPassVertexOutput filter_clear_vertex(uint vertex_id: SV_VertexID) {
++    return backdrop_blur_pass_vertex(vertex_id);
++}
++
++// drawn with blending off over a viewport the size of the region: empties it.
++float4 filter_clear_fragment(BackdropBlurPassVertexOutput input): SV_Target {
++    return float4(0., 0., 0., 0.);
++}
++
++BackdropBlurPassVertexOutput filter_composite_vertex(uint vertex_id: SV_VertexID) {
++    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
++    BackdropBlurPassVertexOutput output;
++    output.position = to_device_position(unit_vertex, backdrop_content_mask);
++    return output;
++}
++
++// the image holds premultiplied colour and is blended over the target as such.
++float4 filter_composite_fragment(BackdropBlurPassVertexOutput input): SV_Target {
++    float2 position = input.position.xy;
++    float2 local = position - backdrop_region_origin;
++    float4 color = sample_backdrop(t_backdrop_blurred, (local - 0.5) / backdrop_scale + 0.5);
++    float coverage = saturate(backdrop_opacity) * rounded_clip_coverage(backdrop_clip.x, position);
++    if (backdrop_clip.y != 0u) {
++        coverage *= saturate(0.5 - quad_sdf(position, backdrop_bounds, backdrop_corner_radii));
++    }
++    return color * coverage;
++}

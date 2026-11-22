@@ -1,4 +1,4 @@
-//! Albums: a grid or a split list, with sort, filter and search in the top bar.
+//! Albums: a grid or a split list.
 
 use crate::i18n::{tr, trn};
 use gpui::prelude::*;
@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use gpui::{AnyElement, Context, SharedString, div};
 
-use crate::pages::{AlbumScope, Block, CardItem, PageMetrics, Route, grid_columns};
+use crate::pages::{AlbumScope, Block, CardItem, PageMetrics, Route, grid_fit};
 use crate::persist::PlayerMode;
 use crate::shell::{Layout, Shell};
 use crate::theme::size::*;
@@ -37,7 +37,6 @@ impl Default for AlbumsView {
     }
 }
 
-/// The All Albums row's id in the split list.
 const ALL: &str = "__all";
 
 impl Shell {
@@ -114,8 +113,7 @@ impl Shell {
         if self.split_on(SplitPage::Albums) {
             return vec![self.build_albums_split(found, layout)];
         }
-        let width = f32::from(layout.main_width) / self.theme.token_scale() - m.gutter * 2.0;
-        let columns = grid_columns(width, m.grid_card, m.card_gap);
+        let (columns, _) = grid_fit(self.grid_width(layout), m.grid_card, m.card_gap);
         let items: Vec<CardItem> = found.into_iter().map(|index| CardItem::Album { index, by_artist }).collect();
         grid_blocks(items, columns)
     }

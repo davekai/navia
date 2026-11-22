@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::prelude::*;
-use gpui::{AnyElement, Bounds, Context, FontWeight, Hsla, Pixels, Window, anchored, deferred, div, point, px, relative};
+use gpui::{AnyElement, Bounds, Context, FontWeight, Hsla, Pixels, Window, anchored, deferred, div, point, px, relative, svg};
 use navia_core::audio_quality::{Delivery, FileFacts, Source, Tier};
 
 use crate::i18n::{fmt_int, tr, trf};
@@ -19,10 +19,6 @@ use crate::ui_controls::track_bounds;
 /// How long the pointer rests on the badge before the details open, or away before they close.
 const HOVER_OPEN: Duration = Duration::from_millis(350);
 const HOVER_CLOSE: Duration = Duration::from_millis(180);
-/// Gap between the badge and its popover, and the popover's maximum width.
-const POP_GAP: f32 = 8.0;
-const POP_MAX_W: f32 = 400.0;
-const EDGE: f32 = 10.0;
 
 /// The badge's popover, opened by hover or pinned by a click.
 #[derive(Default)]
@@ -31,14 +27,14 @@ pub struct QualityPopover {
     pinned: bool,
     generation: u64,
     badge: Rc<RefCell<Bounds<Pixels>>>,
-    /// The song the cached facts are for, and the facts.
     facts: Option<(usize, Option<FileFacts>)>,
 }
 
-/// Everything the badge shows for the song playing now.
 pub struct QualityInfo {
     pub facts: FileFacts,
     pub delivery: Option<Delivery>,
+    /// the output device's own rate, where the output can tell
+    pub device_rate: Option<u32>,
 }
 
 pub(crate) fn khz(hz: u32) -> String {
@@ -66,25 +62,41 @@ pub fn source_label(source: Source) -> &'static str {
     }
 }
 
-/// Every known fact in one line, like "FLAC · 24-bit · 96 kHz · 2,304 kbps · Stereo".
+pub(crate) fn kbps(n: u32) -> String {
+    trf("{n} kbps", &[("n", &fmt_int(n as i64))])
+}
+
+/// the file in one line, like "FLAC · 24-bit · 96 kHz · Stereo"; the bitrate only for lossy files
 pub fn detail_line(f: &FileFacts) -> String {
     let mut parts = vec![f.format_name()];
     parts.extend(f.bit_depth.map(|b| trf("{n}-bit", &[("n", &b.to_string())])));
     parts.extend(f.sample_rate.map(khz));
-    parts.extend(f.kbps.map(|k| trf("{n} kbps", &[("n", &fmt_int(k as i64))])));
+    parts.extend(f.kbps.filter(|_| !f.is_lossless()).map(kbps));
     parts.extend(f.channels.map(channels));
     parts.join(" · ")
 }
 
 impl QualityInfo {
-    fn transcode(&self) -> Option<(String, u32)> {
-        self.delivery.as_ref().and_then(|d| d.transcode).map(|(codec, kbps)| (codec.label().to_string(), kbps))
+    /// the format and bitrate the server converts to; a bitrate of 0 is one it didn't say
+    pub(crate) fn transcode(&self) -> Option<(String, Option<u32>)> {
+        self.delivery.as_ref().and_then(|d| d.transcode).map(|(codec, kbps)| (codec.label().to_string(), (kbps > 0).then_some(kbps)))
+    }
+
+    /// what's heard, like "Original · 48 kHz output"
+    pub fn playing_line(&self) -> String {
+        let mut parts = vec![match self.transcode() {
+            Some((format, Some(n))) => trf("Converted to {format} {bitrate}", &[("format", &format), ("bitrate", &kbps(n))]),
+            Some((format, None)) => trf("Converted to {format}", &[("format", &format)]),
+            None => tr("Original").to_string(),
+        }];
+        parts.extend(self.device_rate.map(|r| trf("{rate} output", &[("rate", &khz(r))])));
+        parts.join(" · ")
     }
 
     /// The badge's text. The bar says Hi-Res for Hi-Res Lossless, to save room.
     pub fn label(&self, short: bool) -> String {
         if let Some((format, kbps)) = self.transcode() {
-            return format!("{format} {kbps}");
+            return kbps.map_or(format.clone(), |k| format!("{format} {k}"));
         }
         match self.facts.tier() {
             Tier::HiRes if short => tr("Hi-Res").to_string(),
@@ -116,7 +128,7 @@ impl Shell {
             }
         }?;
         let delivery = core.player.delivered().map(|d| Delivery::of(&d));
-        Some(QualityInfo { facts, delivery })
+        Some(QualityInfo { facts, delivery, device_rate: self.player.device_rate })
     }
 
     fn quality_hover(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -138,6 +150,18 @@ impl Shell {
         self.quality_pop.pinned
     }
 
+    /// as a click on the badge does
+    pub fn pin_quality_popover(&mut self, cx: &mut Context<Self>) {
+        self.quality_pop.pinned = !self.quality_pop.pinned;
+        self.quality_pop.hovered = false;
+        self.quality_pop.generation += 1;
+        cx.notify();
+    }
+
+    pub fn quality_pop_open(&self) -> bool {
+        self.quality_pop.pinned || self.quality_pop.hovered
+    }
+
     /// Esc and a click elsewhere close the details. True when they were open.
     pub fn close_quality_popover(&mut self, cx: &mut Context<Self>) -> bool {
         let open = self.quality_pop.pinned || self.quality_pop.hovered;
@@ -150,12 +174,19 @@ impl Shell {
         open
     }
 
-    /// The badge after the time. `bar` picks the bar's smaller, dimmer style. `ink` is the time
-    /// row's color, which the badge uses.
-    pub fn quality_badge(&mut self, bar: bool, ink: Hsla, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// `bar` is the bar's smaller, dimmer badge; `ink` is the time row's own color, which it takes.
+    /// `narrow` keeps only the lossless wave where there is one.
+    pub fn quality_badge(&mut self, bar: bool, narrow: bool, ink: Hsla, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = self.theme;
         let info = self.quality_info()?;
         let transcoded = info.transcode().is_some();
+        let text = if bar { 11.5 } else { 12.0 };
+        let waves = match info.facts.tier() {
+            _ if transcoded => 0,
+            Tier::HiRes => 2,
+            Tier::Lossless => 1,
+            Tier::Lossy => 0,
+        };
         let open = self.quality_pop.pinned || self.quality_pop.hovered;
         let color: Hsla = if bar { if open { t.t1().into() } else { t.t2().into() } } else { ink };
         // The outline is the text color at 34%, lighter while transcoding.
@@ -174,7 +205,7 @@ impl Shell {
             .rounded(t.s(5.0))
             .border_1()
             .border_color(outline)
-            .text_size(t.text(if bar { 11.5 } else { 12.0 }))
+            .text_size(t.text(text))
             .font_weight(FontWeight::MEDIUM)
             .line_height(relative(1.0))
             .text_color(color)
@@ -183,7 +214,8 @@ impl Shell {
             .hover(|s| s.bg(t.hover()).opacity(1.0))
             .child(track_bounds(store))
             .when(transcoded, |d| d.child(icon(&t, "arrows-clockwise-bold", 10.0, Hsla { a: color.a * 0.75, ..color })))
-            .child(info.label(bar))
+            .when(waves > 0, |d| d.child(lossless_glyph(&t, text, waves, color)))
+            .when(!(narrow && waves > 0), |d| d.child(info.label(bar)))
             .on_hover(cx.listener(|this, on: &bool, _, cx| {
                 if !this.quality_pop.pinned {
                     this.quality_hover(*on, cx);
@@ -192,10 +224,7 @@ impl Shell {
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.quality_pop.pinned = !this.quality_pop.pinned;
-                this.quality_pop.hovered = false;
-                this.quality_pop.generation += 1;
-                cx.notify();
+                this.pin_quality_popover(cx);
             }));
         Some(el.into_any_element())
     }
@@ -215,33 +244,22 @@ impl Shell {
         if badge.size.width <= px(0.0) {
             return None;
         }
-        let row = |label: &'static str, value: String, note: Option<&'static str>| {
-            div()
-                .flex()
-                .flex_row()
-                .gap(t.s(14.0))
-                .child(div().flex_none().w(t.s(54.0)).text_color(t.t2()).child(label))
-                .child(div().flex_1().min_w(px(0.0)).flex().flex_col().child(value).when_some(note, |d, n| d.child(div().mt(px(1.0)).text_color(t.t2()).child(n))))
-        };
-        let mut rows = div().flex().flex_col().gap(t.s(7.0));
-        match info.transcode() {
-            Some((format, kbps)) => {
-                rows = rows
-                    .child(row(tr("Playing"), format!("{format} · {}", trf("{n} kbps", &[("n", &fmt_int(kbps as i64))])), Some(tr("Transcoded by the server"))))
-                    .child(row(tr("Original"), detail_line(&info.facts), None));
-            }
-            None => rows = rows.child(row(tr("Playing"), detail_line(&info.facts), Some(tr("The original file")))),
-        }
-        let from = info.delivery.as_ref().map(|d| source_label(d.source));
-        if let Some(from) = from {
-            rows = rows.child(row(tr("From||where a song plays from"), from.to_string(), None));
-        }
+        // a label column as wide as its longest label, then the values; one line each keeps the rows level
+        let mut rows: Vec<(&'static str, String)> = vec![(tr("File"), detail_line(&info.facts)), (tr("Playing"), info.playing_line())];
+        rows.extend(info.delivery.as_ref().map(|d| (tr("From||where a song plays from"), source_label(d.source).to_string())));
+        let column = |cells: Vec<String>, dim: bool| div().flex().flex_col().flex_none().gap(t.s(QUALITY_POP_ROW_GAP)).whitespace_nowrap().when(dim, |d| d.text_color(t.t2())).children(cells);
+        let rows = div()
+            .flex()
+            .flex_row()
+            .gap(t.s(QUALITY_POP_COL_GAP))
+            .child(column(rows.iter().map(|(l, _)| l.to_string()).collect(), true))
+            .child(column(rows.into_iter().map(|(_, v)| v).collect(), false));
         let panel = crate::ui::float_panel(&t)
             .id("quality-popover")
-            .max_w(t.s(POP_MAX_W))
-            .pt(t.s(10.0))
-            .px(t.s(14.0))
-            .pb(t.s(11.0))
+            .max_w(t.s(QUALITY_POP_MAX_W))
+            .pt(t.s(QUALITY_POP_PAD_TOP))
+            .px(t.s(QUALITY_POP_PAD_X))
+            .pb(t.s(QUALITY_POP_PAD_BOTTOM))
             .text_size(t.text(TEXT_XS))
             .line_height(relative(1.35))
             .text_color(t.t1())
@@ -259,12 +277,22 @@ impl Shell {
             }));
         // Centered above the badge, shifted to stay inside the window.
         let center = badge.center().x;
-        let top = badge.top() - t.s(POP_GAP);
+        let top = badge.top() - t.s(QUALITY_POP_GAP);
         let _ = window;
         Some(
-            deferred(anchored().position(point(center, top)).anchor(gpui::Anchor::BottomCenter).snap_to_window_with_margin(self.float_margin()).child(panel))
+            deferred(anchored().position(point(center, top)).anchor(gpui::Anchor::BottomCenter).snap_to_window_with_margin(self.float_margin_by(t.s(QUALITY_POP_EDGE))).child(panel))
                 .with_priority(9)
                 .into_any_element(),
         )
     }
+}
+
+/// the lossless wave, once for a lossless file and twice, stacked, for a hi-res one
+fn lossless_glyph(t: &crate::theme::Theme, text: f32, waves: usize, color: Hsla) -> AnyElement {
+    let size = t.text(text * QUALITY_GLYPH);
+    let gap = t.text(text * QUALITY_GLYPH_TWIN_GAP);
+    let wave = |dy: Pixels| svg().path(crate::assets::icon("wave-sine-bold.svg")).absolute().left_0().top(dy).size(size).text_color(color);
+    let mut glyph = div().relative().flex_none().size(size);
+    glyph = if waves > 1 { glyph.child(wave(gap * -0.5)).child(wave(gap * 0.5)) } else { glyph.child(wave(px(0.0))) };
+    glyph.into_any_element()
 }

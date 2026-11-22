@@ -1,6 +1,7 @@
 //! Discover's For You rows and the mix page, from the core's `library::for_you`. Rows hide when the server has no data
 //! for them. Nothing is created on the server until Save as Playlist.
 
+use crate::ui::FullTextTip;
 use crate::i18n::{tr, trf};
 use gpui::prelude::*;
 use crate::focus::FocusStop;
@@ -53,8 +54,9 @@ impl Shell {
         }
         sections.push(today);
         sections.push(self.shelf_block(tr("Not Played Recently"), None, albums(&page.not_played_recently), false, 2));
+        let loading = self.for_you.loading;
         let page = Shell::sections(m.section_gap, sections);
-        if page.is_empty() {
+        if page.is_empty() && !loading {
             return vec![Shell::plain_block(|this, _, _, _| this.library_empty_state("clock-regular", tr("Nothing here yet"), tr("These rows fill in once you've built up some play history."), false).into_any_element())];
         }
         page
@@ -78,19 +80,18 @@ impl Shell {
         let t = self.theme;
         let Some(mix) = self.for_you.mixes.get(index as usize).cloned() else { return div().into_any_element() };
         let art = self.mix_cover(&mix, width, layout);
-        let lift = -t.s(CARD_LIFT);
-        let art = div().relative().group_hover(group.clone(), move |s| s.top(lift)).child(art).into_any_element();
         let route = Route::Mix(mix.id.clone());
         crate::ui::press_dim(div().id(("card", ix)))
-            .group(group)
+            .relative()
             .flex()
             .flex_col()
             .flex_none()
             .w(t.s(width))
             .line_height(relative(1.3))
             .child(art)
-            .child(div().mt(t.s(CARD_TEXT_GAP)).truncate().font_weight(FontWeight::MEDIUM).child(mix_title(&mix)))
-            .child(div().text_color(t.t2()).line_clamp(2).text_ellipsis().child(mix_artists_line(&mix)))
+            .child(div().id("name").mt(t.s(CARD_TEXT_GAP)).truncate().font_weight(FontWeight::MEDIUM).child(mix_title(&mix)).full_text_tip(&t, mix_title(&mix)))
+            .child(div().id("sub").text_color(t.t2()).line_clamp(2).text_ellipsis().child(mix_artists_line(&mix)).full_text_tip(&t, mix_artists_line(&mix)))
+            .child(crate::ui::card_track(&group))
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| this.navigate(route.clone(), cx)))
             .into_any_element()
@@ -100,7 +101,7 @@ impl Shell {
     fn mix_cover(&mut self, mix: &MixInfo, size: f32, layout: &Layout) -> AnyElement {
         let key = mix_art_key(mix);
         let art = self.artwork(Some(&key), "playlist-regular", size, ArtShape::Rounded(R_MD), layout);
-        div().relative().size(self.theme.s(size)).child(art).child(crate::ui::cover_label(&self.theme, tr("Mix"), crate::ui::LabelAt::Bottom)).into_any_element()
+        div().relative().size(self.theme.s(size)).child(art).child(crate::ui::cover_label(&self.theme, tr("Mix"), crate::ui::LabelAt::Bottom, crate::ui::LabelStyle::Chip)).into_any_element()
     }
 
     pub fn build_mix(&mut self, id: &SharedString, _layout: &Layout) -> Vec<Block> {
@@ -129,19 +130,19 @@ impl Shell {
         blocks
     }
 
-    fn render_mix_head(&mut self, mix: &MixInfo, layout: &Layout, _cx: &mut Context<Self>) -> AnyElement {
+    fn render_mix_head(&mut self, mix: &MixInfo, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let m = PageMetrics::of(layout);
-        let cover = div().relative().flex_none().rounded(t.s(R_MD)).shadow(vec![crate::ui::shadow_art(&t)]).child(self.mix_cover(mix, m.hero_art, layout));
+        let cover = crate::ui::hero_art_frame(&t, R_MD, self.mix_cover(mix, m.hero_art, layout));
         let meta = format!("{} • {}", songs_and_length(mix.songs.len() as u32, mix.duration_s), tr("Updated today"));
         let info = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w(px(0.0))
-            .child(div().text_size(t.text(m.title)).text_color(t.t_em()).font_weight(FontWeight::BOLD).line_height(relative(1.1)).line_clamp(3).text_ellipsis().child(mix_title(mix)))
+            .child(div().text_size(t.text(m.title)).text_color(t.t_em()).font_weight(FontWeight::BOLD).line_height(relative(1.1)).line_clamp(3).text_ellipsis().id("mix-title").child(mix_title(mix)).full_text_tip(&t, mix_title(mix)))
             .child(div().mt(t.s(14.0)).child(meta))
-            .child(div().mt(t.s(14.0)).text_color(t.t2()).line_clamp(3).text_ellipsis().child(mix_artists_line(mix)));
+            .child(self.header_more_text("mix-artists", crate::view_about::AboutText { title: mix_title(mix), subtitle: Some(tr("Mix").into()), art: Some(mix_art_key(mix)), text: mix_artists_line(mix) }, cx));
         let main = f32::from(layout.main_width) / t.token_scale();
         let mut head = div().flex().gap(t.s(25.0)).px(t.s(m.gutter)).w(layout.main_width).items_center();
         head = if main <= 620.0 { head.flex_col().items_start() } else { head.flex_row() };

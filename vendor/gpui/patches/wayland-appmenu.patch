@@ -1,0 +1,118 @@
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1382,6 +1382,7 @@
+     }
+     fn request_decorations(&self, _decorations: WindowDecorations) {}
+     fn show_window_menu(&self, _position: Point<Pixels>) {}
++    fn set_app_menu_address(&self, _service_name: &str, _object_path: &str) {}
+     fn start_window_move(&self) {}
+     fn can_start_external_drag(&self) -> bool {
+         false
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -3284,6 +3284,12 @@
+         self.platform_window.show_window_menu(position)
+     }
+ 
++    /// points the desktop's global menu at a `com.canonical.dbusmenu` object on the session bus
++    /// (KDE Plasma's app menu, `org_kde_kwin_appmenu`). does nothing where the compositor has none.
++    pub fn set_app_menu_address(&self, service_name: &str, object_path: &str) {
++        self.platform_window.set_app_menu_address(service_name, object_path)
++    }
++
+     /// Handle window movement for Linux and macOS.
+     /// Tells the compositor to take control of window movement (Wayland and X11)
+     ///
+--- a/crates/gpui_linux/src/linux/wayland/client.rs
++++ b/crates/gpui_linux/src/linux/wayland/client.rs
+@@ -77,6 +77,7 @@
+     wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
+     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
+ };
++use wayland_protocols_plasma::appmenu::client::{org_kde_kwin_appmenu, org_kde_kwin_appmenu_manager};
+ use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blur_manager};
+ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+ use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
+@@ -257,6 +258,7 @@
+     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+     pub kde_blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
++    pub kde_appmenu_manager: Option<org_kde_kwin_appmenu_manager::OrgKdeKwinAppmenuManager>,
+     /// KWin, which reads the blur region against the window geometry instead of the surface.
+     pub is_kwin: bool,
+     pub background_effects_manager:
+@@ -311,6 +313,7 @@
+             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
+             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
+             kde_blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
++            kde_appmenu_manager: globals.bind(&qh, 1..=2, ()).ok(),
+             is_kwin: globals.contents().with_list(|list| list.iter().any(|g| g.interface == "org_kde_kwin_appmenu_manager" || g.interface == "kde_output_device_registry_v2")),
+             background_effects_manager: globals.bind(&qh, 1..=1, ()).ok(),
+             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
+@@ -1681,6 +1684,8 @@
+ delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1);
+ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
+ delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
++delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_appmenu_manager::OrgKdeKwinAppmenuManager);
++delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_appmenu::OrgKdeKwinAppmenu);
+ delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
+ delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+ 
+--- a/crates/gpui_linux/src/linux/wayland/window.rs
++++ b/crates/gpui_linux/src/linux/wayland/window.rs
+@@ -29,6 +29,7 @@
+     wp::fractional_scale::v1::client::wp_fractional_scale_v1,
+     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
+ };
++use wayland_protocols_plasma::appmenu::client::org_kde_kwin_appmenu;
+ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
+ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
+ 
+@@ -110,6 +111,7 @@
+     app_id: Option<String>,
+     appearance: WindowAppearance,
+     kde_blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
++    kde_appmenu: Option<org_kde_kwin_appmenu::OrgKdeKwinAppmenu>,
+     background_effects: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
+     viewport: Option<wp_viewport::WpViewport>,
+     outputs: HashMap<ObjectId, Output>,
+@@ -626,6 +628,7 @@
+             surface,
+             app_id: options.app_id,
+             kde_blur: None,
++            kde_appmenu: None,
+             background_effects: None,
+             viewport,
+             globals,
+@@ -805,6 +808,10 @@
+             blur.release();
+         }
+ 
++        if let Some(appmenu) = &state.kde_appmenu {
++            appmenu.release();
++        }
++
+         // Destroy background effects, this has no dependencies.
+         if let Some(background_effects) = &state.background_effects {
+             background_effects.destroy();
+@@ -2100,6 +2107,20 @@
+             .clone()
+     }
+ 
++    fn set_app_menu_address(&self, service_name: &str, object_path: &str) {
++        let mut state = self.borrow_mut();
++        let Some(manager) = state.globals.kde_appmenu_manager.clone() else {
++            return;
++        };
++        if state.kde_appmenu.is_none() {
++            let appmenu = manager.create(&state.surface, &state.globals.qh, ());
++            state.kde_appmenu = Some(appmenu);
++        }
++        if let Some(appmenu) = &state.kde_appmenu {
++            appmenu.set_address(service_name.to_string(), object_path.to_string());
++        }
++    }
++
+     fn show_window_menu(&self, position: Point<Pixels>) {
+         let state = self.borrow();
+         let serial = state.client.get_serial(SerialKind::MousePress);

@@ -12,10 +12,8 @@ use navia_core::listen_along::{self as la, FollowStep, Followed, NowPlaying};
 use crate::i18n::trf;
 use crate::shell::Shell;
 
-/// Listening Now and following, for the signed-in account.
 #[derive(Default)]
 pub struct ListenState {
-    /// The people listed in "Listening Now".
     pub listing: Vec<NowPlaying>,
     /// When `listing` was last read from the server. It's dropped once older than `la::LISTING_KEEP`.
     pub listing_at: Option<Instant>,
@@ -23,7 +21,6 @@ pub struct ListenState {
     /// "<user> stopped listening", shown for a few seconds after following ends on its own.
     pub ended: Option<String>,
     ended_generation: u64,
-    /// When the next check is due.
     next_check: Option<Instant>,
     checking: bool,
     /// Where the listener's own song resumes after following, as its row, queue place and position.
@@ -44,8 +41,17 @@ pub struct ListenState {
     /// control playback, and when this user last changed playback.
     pub listeners: Vec<la::Listener>,
     pub host_change_ms: u64,
-    /// The marks the reports carry, as control and following.
-    marks: Option<(bool, bool)>,
+    /// the listener whose song or place this host took, while it plays it.
+    led: Option<la::Led>,
+    /// (control, following, session song queued).
+    marks: Option<(bool, bool, bool)>,
+    /// from asking the player to start a song mid-way to it playing, measured on the last start.
+    start_latency_ms: u64,
+    starting_since: Option<Instant>,
+    /// the listening session's hand-over of queued songs at a song's end.
+    pub handover: la::Handover,
+    /// the player ends after the playing song: the other side's session song comes next.
+    holding: bool,
 }
 
 /// The person followed and their song as it plays here.
@@ -64,7 +70,12 @@ pub struct Following {
     /// When the listener last changed playback while following, and the followed player's state at
     /// the last check.
     pub own_change_ms: Option<u64>,
-    pub seen: Option<(bool, u64)>,
+    pub seen: Option<la::Seen>,
+    /// the listener chose this song or place; the host comes to it.
+    pub lead: bool,
+    /// "Sending to <user>…" while the host hasn't taken the listener's change.
+    pub sending: bool,
+    pub two_way_since: Option<u64>,
 }
 
 impl Shell {
@@ -82,28 +93,52 @@ impl Shell {
     pub fn apply_listen_marks(&mut self) {
         let control = self.listeners_control();
         let following = self.listen.following.as_ref().is_some_and(|f| ly::friend_of(&f.followed.player).is_none());
-        if self.listen.marks == Some((control, following)) {
+        let queued = self.session_on() && self.session_mine();
+        if self.listen.marks == Some((control, following, queued)) {
             return;
         }
-        self.listen.marks = Some((control, following));
+        self.listen.marks = Some((control, following, queued));
         if let Some(core) = self.core.as_ref() {
             let lib = core.lib.clone();
-            std::thread::spawn(move || lib.set_listen_marks(control, following));
-        }
-        if !control {
-            self.listen.listeners.clear();
+            std::thread::spawn(move || lib.set_listen_marks(control, following, queued));
         }
     }
 
-    /// Handles play or pause while following, keeping the follow. A pause holds and play catches up
-    /// at once. If the host lets listeners control playback, their Navia mirrors it.
-    pub fn along_toggle(&mut self, play: Option<bool>, cx: &mut Context<Self>) -> bool {
+    /// where a song started mid-way should start so it lands where the other side is by then.
+    fn catch_up_ms(&self, position_ms: u64, playing: bool) -> u64 {
+        if playing { position_ms + self.listen.start_latency_ms } else { position_ms }
+    }
+
+    /// measures how long a mid-way start takes to play, for the next one.
+    fn note_start(&mut self) {
+        self.listen.starting_since = Some(Instant::now());
+    }
+
+    pub fn note_started(&mut self, status: PlayerStatus) {
+        if status == PlayerStatus::Playing
+            && let Some(at) = self.listen.starting_since.take()
+        {
+            self.listen.start_latency_ms = (at.elapsed().as_millis() as u64).min(la::RESYNC_DRIFT.as_millis() as u64);
+        }
+    }
+
+    /// the listener's change waits for the host that lets listeners control it.
+    fn mark_own_change(&mut self, lead: bool) {
         let controls = self.along_controls();
+        if let Some(f) = self.listen.following.as_mut() {
+            f.own_change_ms = controls.then(ly::now_ms);
+            f.sending = controls;
+            f.lead = controls && (lead || f.lead);
+        }
+    }
+
+    /// a pause holds; play catches up at once. a host that lets listeners control mirrors it.
+    pub fn along_toggle(&mut self, play: Option<bool>, cx: &mut Context<Self>) -> bool {
         let Some(f) = self.listen.following.as_mut() else { return false };
         let play = play.unwrap_or(!self.player.playing);
         f.held = !play;
-        // Only a host that lets listeners control playback mirrors it. Otherwise play catches up at once.
-        f.own_change_ms = controls.then(ly::now_ms);
+        // without control, play catches up with the host at once
+        self.mark_own_change(false);
         if let Some(core) = self.core.as_ref() {
             if play { core.player.play() } else { core.player.pause() }
         }
@@ -121,9 +156,7 @@ impl Shell {
         if !self.along_controls() {
             return false;
         }
-        if let Some(f) = self.listen.following.as_mut() {
-            f.own_change_ms = Some(ly::now_ms());
-        }
+        self.mark_own_change(true);
         if let Some(core) = self.core.as_ref() {
             core.player.seek_ms(ms);
         }
@@ -141,10 +174,10 @@ impl Shell {
         let Some(core) = self.core.as_ref() else { return false };
         let Some((_, song)) = core.lib.db.songs_by_rowid(&[rowid]).ok().and_then(|r| r.into_iter().next()) else { return false };
         let Some(f) = self.listen.following.as_mut() else { return false };
-        f.own_change_ms = Some(ly::now_ms());
         f.held = false;
         let entry = NowPlaying { song, state: Some(la::SessionState::Playing), position_ms: Some(0), ..f.song.clone() };
         f.song = entry.clone();
+        self.mark_own_change(true);
         self.load_followed(&entry, cx);
         true
     }
@@ -173,7 +206,7 @@ impl Shell {
     /// The host side when not following anyone. Tracks who listens along and, if allowed, mirrors
     /// their changes here.
     fn host_check(&mut self, entries: &[NowPlaying], cx: &mut Context<Self>) {
-        if !self.listeners_control() || self.listen.following.is_some() {
+        if !self.listen_active() || self.listen.following.is_some() {
             self.listen.listeners.clear();
             return;
         }
@@ -183,37 +216,177 @@ impl Shell {
             return;
         };
         let viewer = core.lib.username().to_string();
-        let host = la::Host { song_id, position_ms: (self.player.position.max(0.0) * 1000.0) as u64, playing: self.player.playing, own_change_ms: self.listen.host_change_ms };
+        let led = self.listen.led.clone().filter(|l| l.song_id == song_id);
+        let host = la::Host { song_id, position_ms: (self.player.position.max(0.0) * 1000.0) as u64, playing: self.player.playing, own_change_ms: self.listen.host_change_ms, led };
         let now = la::listeners(entries, &viewer, &host, &self.listen.listeners, ly::now_ms());
-        let action = la::host_mirror(&host, &self.listen.listeners, &now, true);
+        let mirror = la::host_mirror(&host, &self.listen.listeners, &now, self.listeners_control());
         self.listen.listeners = now;
-        let Some(action) = action else { return };
+        let Some(mirror) = mirror else { return };
+        self.listen.led = mirror.led(&host, ly::now_ms());
         let player = core.player.clone();
-        match action {
-            la::HostAction::Pause => player.pause(),
-            la::HostAction::Play => player.play(),
-            la::HostAction::Seek(ms) => {
-                player.seek_ms(ms);
-                self.player.position = ms as f32 / 1000.0;
+        let seek = |this: &mut Self, ms: u64| {
+            player.seek_ms(ms);
+            this.player.position = ms as f32 / 1000.0;
+        };
+        match mirror.action {
+            la::HostAction::Pause(place) => {
+                place.into_iter().for_each(|ms| seek(self, ms));
+                player.pause();
             }
+            la::HostAction::Play(place) => {
+                place.into_iter().for_each(|ms| seek(self, ms));
+                player.play();
+            }
+            la::HostAction::Seek(ms) => seek(self, ms),
             la::HostAction::Song { song_id, position_ms, playing } => {
                 let Some(rowid) = core.lib.rowid_for_song(&song_id) else { return };
-                // Plays now as a queued song, and the host's queue continues after it.
+                let clash = self.listen.handover.theirs_arrived(ly::now_ms());
+                self.set_session_hold(false);
+                // as a queued song; the host's queue carries on after it
                 self.queue_songs_at(&[rowid], 0, true, cx);
+                let at = self.catch_up_ms(position_ms, playing);
+                self.note_start();
                 let Some(core) = self.core.as_ref() else { return };
                 core.player.next();
-                if position_ms > la::RESYNC_DRIFT.as_millis() as u64 {
-                    core.player.seek_ms(position_ms);
+                if at > 0 {
+                    core.player.seek_ms(at);
                 }
                 if playing { core.player.play() } else { core.player.pause() }
+                // both sides started a session song at once: the listener's plays, the host's waits next
+                if let Some(own) = clash {
+                    self.session_put_back(&own, cx);
+                }
             }
         }
         cx.notify();
     }
 
-    /// Records that this user changed playback, for last-change-wins with listeners.
+    /// a listening session: following someone whose Navia lets listeners control it, or hosting
+    /// listeners with that setting on.
+    pub fn session_on(&self) -> bool {
+        if !self.listen_active() {
+            return false;
+        }
+        match self.listen.following.as_ref() {
+            Some(f) => ly::friend_of(&f.followed.player).is_none() && f.song.allows_control(),
+            None => self.listeners_control() && !self.listen.listeners.is_empty(),
+        }
+    }
+
+    /// this side's session songs are its Next in Queue (the listener's waiting queue's while following).
+    pub fn session_mine(&self) -> bool {
+        self.core.as_ref().is_some_and(|c| c.pq.queued_run() > 0)
+    }
+
+    /// who on the other side has songs queued for the session, by name.
+    pub fn session_theirs(&self) -> Vec<String> {
+        match self.listen.following.as_ref() {
+            Some(f) => f.song.has_session_queue().then(|| f.followed.user.clone()).into_iter().collect(),
+            None => self.listen.listeners.iter().filter(|l| l.queued).map(|l| l.user.clone()).collect(),
+        }
+    }
+
+    fn session_left_ms(&self) -> Option<u64> {
+        let song = self.player.current.as_ref().filter(|s| s.duration_s > 0)?;
+        Some((song.duration_s as u64 * 1000).saturating_sub((self.player.position.max(0.0) * 1000.0) as u64))
+    }
+
+    /// each check: the turn for the coming end, the host's hold while it's the other side's, and
+    /// the bounded wait at the end.
+    fn session_check(&mut self) {
+        if !self.session_on() {
+            self.set_session_hold(false);
+            self.listen.handover = la::Handover::default();
+            return;
+        }
+        let host = self.listen.following.is_none();
+        let (mine, theirs) = (self.session_mine(), !self.session_theirs().is_empty());
+        if self.listen.handover.waiting_since.is_none() {
+            let turn = self.listen.handover.plan(mine, theirs, host);
+            if host {
+                self.set_session_hold(turn == la::Turn::Theirs);
+            }
+        }
+        if self.listen.handover.wait_over(ly::now_ms()) && host {
+            // their song didn't come: the host's own queue carries on
+            self.set_session_hold(false);
+            if let Some(core) = self.core.as_ref() {
+                core.player.next();
+            }
+        }
+    }
+
+    fn set_session_hold(&mut self, on: bool) {
+        if self.listen.holding == on {
+            return;
+        }
+        self.listen.holding = on;
+        if let Some(core) = self.core.as_ref() {
+            core.player.set_hold_after_current(on);
+        }
+    }
+
+    /// the host's song ended while holding for the other side's song: wait for it (bounded), or
+    /// carry on when nobody has one any more.
+    pub fn session_queue_ended(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.listen.holding {
+            return false;
+        }
+        let (mine, theirs) = (self.session_mine(), !self.session_theirs().is_empty());
+        if self.session_on() && self.listen.handover.at_end(mine, theirs, true, ly::now_ms()) == la::Turn::Theirs {
+            self.check_listening(cx);
+            return true;
+        }
+        self.set_session_hold(false);
+        if let Some(core) = self.core.as_ref() {
+            core.player.next();
+        }
+        true
+    }
+
+    /// the host moved to the next song: its own session song, when that was the turn.
+    pub fn session_track_changed(&mut self) {
+        if self.listen.following.is_some() || !self.session_on() {
+            return;
+        }
+        self.set_session_hold(false);
+        let queued = self.core.as_ref().is_some_and(|c| c.pq.current_queued());
+        let id = self.player.current.as_ref().map(|s| s.id.to_string()).unwrap_or_default();
+        if queued && self.listen.handover.turn == Some(la::Turn::Mine) {
+            self.listen.handover.started_mine(&id, ly::now_ms());
+        } else if self.listen.handover.waiting_since.is_none() {
+            self.listen.handover.song_changed();
+        }
+    }
+
+    /// the followed song ended here: in a session, this side's turn plays its first queued song.
+    pub fn session_followed_ended(&mut self, cx: &mut Context<Self>) {
+        if !self.session_on() {
+            return;
+        }
+        let (mine, theirs) = (self.session_mine(), !self.session_theirs().is_empty());
+        if self.listen.handover.at_end(mine, theirs, false, ly::now_ms()) != la::Turn::Mine {
+            return;
+        }
+        let Some(rowid) = self.core.as_mut().and_then(|c| c.pq.take_queued_next()) else { return };
+        self.mirror_queue();
+        if self.along_play_song(rowid, cx) {
+            let id = self.player.current.as_ref().map(|s| s.id.to_string()).unwrap_or_default();
+            self.listen.handover.started_mine(&id, ly::now_ms());
+        }
+    }
+
+    /// a session song of this side's that didn't get played goes back to the front of its queue.
+    fn session_put_back(&mut self, song_id: &str, cx: &mut Context<Self>) {
+        if let Some(rowid) = self.core.as_ref().and_then(|c| c.lib.rowid_for_song(song_id)) {
+            self.queue_songs_at(&[rowid], 0, true, cx);
+        }
+    }
+
+    /// for last-change-wins with listeners.
     pub fn note_host_change(&mut self) {
         self.listen.host_change_ms = ly::now_ms();
+        self.listen.led = None;
     }
     /// Others are listed only while this user shares too, with sharing on, Private mode off and a
     /// connection.
@@ -264,7 +437,6 @@ impl Shell {
         self.listen.following.as_ref().and_then(|f| ly::friend_of(&f.followed.player))
     }
 
-    /// Whether the friend with this Discord id is followed now.
     pub fn following_friend_id(&self, id: &str) -> bool {
         self.following_friend() == Some(id)
     }
@@ -327,13 +499,14 @@ impl Shell {
         self.friends_tick(cx);
         self.apply_listen_marks();
         if !self.listen_active() {
+            self.session_check();
             if !self.listen.listing.is_empty() {
                 self.listen.listing.clear();
                 cx.notify();
             }
             return;
         }
-        // Checks that keep failing leave nothing behind that looks current.
+        // so failing checks leave nothing that looks current.
         if !self.listen.listing.is_empty() && self.listen.listing_at.is_none_or(|at| at.elapsed() > la::LISTING_KEEP) {
             self.listen.listing.clear();
             cx.notify();
@@ -361,7 +534,7 @@ impl Shell {
         self.refresh_friends(cx);
     }
 
-    /// Reads the friends now, and takes one step while following one.
+    /// takes one step while following one.
     fn refresh_friends(&mut self, cx: &mut Context<Self>) {
         let Some(core) = self.core.as_ref() else { return };
         if self.listen.friends_checking {
@@ -411,7 +584,12 @@ impl Shell {
             playing: self.player.playing,
             held: f.held,
             own_change_ms: f.own_change_ms,
-            seen: f.seen,
+            lead: f.lead,
+            seen: f.seen.clone(),
+            ended: self.player.status == PlayerStatus::Stopped,
+            viewer: self.core.as_ref().map(|c| c.lib.username().to_string()).unwrap_or_default(),
+            two_way_since: f.two_way_since,
+            now_ms: ly::now_ms(),
         }
     }
 
@@ -436,8 +614,9 @@ impl Shell {
                 if shell.core_generation != generation {
                     return;
                 }
-                // Poll often while listeners may control playback, to notice them join and act.
-                let every = if shell.listen.following.is_some() || shell.listeners_control() { la::FOLLOW_POLL } else { la::LIST_POLL };
+                // often enough to notice listeners join and act, and faster at a session song's end
+                let session = la::check_every(shell.session_on(), shell.session_left_ms(), shell.listen.handover.waiting_since.is_some());
+                let every = if shell.listen.following.is_some() || shell.listeners_control() { session } else { la::LIST_POLL };
                 shell.listen.next_check = Some(Instant::now() + every);
                 if let Some(entries) = found {
                     shell.on_now_playing(entries, cx);
@@ -452,14 +631,23 @@ impl Shell {
         self.listen.listing = la::people(&entries, &viewer, self.listen_active());
         self.listen.listing_at = Some(Instant::now());
         if let Some(f) = self.listen.following.as_ref().filter(|f| ly::friend_of(&f.followed.player).is_none()) {
+            let now = ly::now_ms();
             let step = la::follow_step(&f.followed, &entries, &self.local_along(f));
-            let seen = la::followed_entry(&f.followed, &entries).map(|e| (e.state.is_some_and(la::SessionState::is_playing), ly::now_ms()));
+            let seen = la::Seen::of(&f.followed, &entries, now);
+            let two_way = la::two_way(&f.followed, &entries, &viewer);
             self.apply_follow_step(step, cx);
             if let Some(f) = self.listen.following.as_mut() {
                 f.seen = seen;
+                f.two_way_since = if two_way { f.two_way_since.or(Some(now)) } else { None };
             }
         }
+        if let Some(f) = self.listen.following.as_mut()
+            && let Some(e) = la::followed_entry(&f.followed, &entries)
+        {
+            f.song.player = e.player.clone();
+        }
         self.host_check(&entries, cx);
+        self.session_check();
         self.apply_listen_marks();
         cx.notify();
     }
@@ -471,9 +659,31 @@ impl Shell {
             FollowStep::Keep { player, .. } => {
                 if let Some(f) = self.listen.following.as_mut() {
                     f.followed.player = player;
+                    f.own_change_ms = None;
+                    f.sending = false;
+                }
+            }
+            FollowStep::Sending { player } => {
+                if let Some(f) = self.listen.following.as_mut() {
+                    f.followed.player = player;
+                    f.sending = true;
                 }
             }
             FollowStep::Resync { entry, player } => self.follow_to(entry, player, cx),
+            FollowStep::NotTaken { entry, player } => {
+                let user = entry.user.clone();
+                let mine = self.listen.handover.started.take().map(|(id, _)| id).filter(|id| self.player.current.as_ref().is_some_and(|s| s.id.as_ref() == id.as_str()));
+                self.follow_to(entry, player, cx);
+                if let Some(id) = mine {
+                    self.session_put_back(&id, cx);
+                }
+                self.show_toast(trf("{user} didn’t take your change", &[("user", &user)]), cx);
+            }
+            FollowStep::Lead { user } => {
+                // they listen along with this Navia now; it keeps playing as their host
+                self.stop_listening(false, cx);
+                self.show_toast(trf("{user} is listening along with you", &[("user", &user)]), cx);
+            }
             FollowStep::NotInLibrary { key, song, artist } => self.skip_missing(key, &song, &artist, cx),
         }
     }
@@ -517,8 +727,8 @@ impl Shell {
         let song = navia_core::client::Song { title: track.song.clone(), ..Default::default() };
         let entry = NowPlaying { user: friend.display_name(), player: ly::friend_player(id), song, state: Some(la::SessionState::Playing), position_ms: Some(0), minutes_ago: 0 };
         let followed = Followed { user: entry.user.clone(), player: entry.player.clone() };
-        self.listen.following = Some(Following { followed, song: entry, rowid: None, back_ms, waiting: true, held: false, own_change_ms: None, seen: None });
-        // The confirm already said this song is missing, so the chip shows the wait without a toast.
+        self.listen.following = Some(Following { followed, song: entry, rowid: None, back_ms, waiting: true, held: false, own_change_ms: None, seen: None, lead: false, sending: false, two_way_since: None });
+        // the confirm already said so, so no toast.
         self.listen.skipped = Some(track.key());
         self.skip_missing(track.key(), &track.song, track.first_artist(), cx);
     }
@@ -537,7 +747,7 @@ impl Shell {
             self.player.station = None;
         }
         let followed = Followed { user: entry.user.clone(), player: entry.player.clone() };
-        self.listen.following = Some(Following { followed, song: entry.clone(), rowid: None, back_ms, waiting: false, held: false, own_change_ms: None, seen: None });
+        self.listen.following = Some(Following { followed, song: entry.clone(), rowid: None, back_ms, waiting: false, held: false, own_change_ms: None, seen: None, lead: false, sending: false, two_way_since: None });
         self.load_followed(&entry, cx);
         self.listen.next_check = Some(Instant::now() + la::FOLLOW_POLL);
     }
@@ -548,12 +758,16 @@ impl Shell {
         f.followed.player = player;
         f.waiting = false;
         f.held = false;
+        f.own_change_ms = None;
+        f.lead = false;
+        f.sending = false;
         let same_song = f.song.song.id == entry.song.id;
         f.song = entry.clone();
         let Some(core) = self.core.as_ref() else { return };
-        let at = entry.position_ms.unwrap_or(0);
-        let playing = entry.state.is_some_and(la::SessionState::is_playing);
+        let playing = entry.playing();
+        let at = self.catch_up_ms(entry.position_ms.unwrap_or(0), playing);
         if !same_song {
+            self.listen.handover.theirs_arrived(ly::now_ms());
             self.load_followed(&entry, cx);
             return;
         }
@@ -570,12 +784,16 @@ impl Shell {
 
     /// Plays the followed song alone in the player. The listener's queue stays as it is.
     fn load_followed(&mut self, entry: &NowPlaying, cx: &mut Context<Self>) {
-        let Some(core) = self.core.as_mut() else { return };
-        let rowid = core.lib.rowid_for_song(&entry.song.id);
+        if self.core.is_none() {
+            return;
+        }
+        let rowid = self.core.as_ref().and_then(|c| c.lib.rowid_for_song(&entry.song.id));
         let duration = entry.song.duration.map(|d| d.max(0) as u64 * 1000);
-        let at = entry.position_ms.unwrap_or(0);
-        let playing = entry.state.is_some_and(la::SessionState::is_playing);
-        // Their songs cut in as they change, without a crossfade.
+        let playing = entry.playing();
+        let at = if entry.position_ms.unwrap_or(0) > 0 { self.catch_up_ms(entry.position_ms.unwrap_or(0), playing) } else { 0 };
+        self.note_start();
+        let Some(core) = self.core.as_mut() else { return };
+        // no crossfade.
         core.player.set_following(true);
         core.player.set_queue(vec![QueueItem::new(entry.song.id.clone(), duration)], 0, at, !playing);
         let song = crate::core_library::song_from_core(entry.song.clone());
@@ -704,7 +922,6 @@ impl Shell {
         }
     }
 
-    /// Whether `user` on this server is followed now.
     pub fn following_user(&self, user: &str) -> bool {
         self.listen.following.as_ref().is_some_and(|f| ly::friend_of(&f.followed.player).is_none() && f.followed.user.eq_ignore_ascii_case(user))
     }

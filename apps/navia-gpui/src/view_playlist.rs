@@ -1,5 +1,4 @@
-//! The Playlist page: cover and details, actions, and the song table.
-
+use crate::ui::FullTextTip;
 use crate::i18n::{tr, trf, trn};
 use gpui::prelude::*;
 use navia_core::library::collections::CollectionKind;
@@ -12,7 +11,7 @@ use crate::shell::{Layout, Shell};
 use crate::theme::size::*;
 use crate::ui::{divider, glass_edge, glass_pill, icon, icon_button};
 use crate::view_album::{SongFilter, pill_group};
-use crate::view_cards::{ArtShape, songs_and_length};
+use crate::view_cards::songs_and_length;
 use crate::view_menu::{MenuPanel, MenuRow};
 use crate::smart_model::{Say, summarize_criteria};
 use crate::ui_controls::track_bounds;
@@ -31,12 +30,11 @@ pub struct PlaylistRemove {
 pub struct PlaylistDetail {
     pub filter: SongFilter,
     pub query: String,
-    pub desc_open: bool,
 }
 
 impl Default for PlaylistDetail {
     fn default() -> Self {
-        Self { filter: SongFilter::All, query: String::new(), desc_open: false }
+        Self { filter: SongFilter::All, query: String::new() }
     }
 }
 
@@ -281,30 +279,41 @@ impl Shell {
 
     fn render_playlist_head(&mut self, p: &PlaylistDetails, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
-        let m = PageMetrics::of(layout);
         let cover_id = self.playlist_art_key(&p.id);
-        let art = self.artwork(Some(&cover_id), "playlist-regular", m.hero_art, ArtShape::Rounded(R_MD), layout);
-        let cover = div()
-            .relative()
-            .flex_none()
-            .rounded(t.s(R_MD))
-            .shadow(vec![crate::ui::shadow_art(&t)])
-            .child(art);
-        // "By <name>" uses the real owner, so an admin still sees whose it is.
+        // follows the real owner, so an admin still sees whose it is.
         let meta = if p.mine || p.owner.is_empty() {
             format!("{} • {}", songs_and_length(p.song_count, p.duration_s), if p.public { tr("Public") } else { tr("Private") })
         } else {
             format!("{} • {} • {}", songs_and_length(p.song_count, p.duration_s), if p.public { tr("Public") } else { tr("Private") }, trf("By {owner}", &[("owner", &p.owner)]))
         };
         let meta = format!("{meta}{}", self.download_status_line(CollectionKind::Playlist, &p.id).unwrap_or_default());
-        let mut info = div().flex().flex_col().flex_1().min_w(px(0.0)).child(div().text_size(t.text(m.title)).text_color(t.t_em()).font_weight(FontWeight::BOLD).line_height(relative(1.1)).line_clamp(3).text_ellipsis().child(p.name.clone())).child(div().mt(t.s(14.0)).flex().flex_row().flex_wrap().items_center().gap_x(t.s(12.0)).gap_y(t.s(6.0)).child(meta).when(p.smart, |d| d.child(self.smart_rules_pill(p, cx))));
+        let mut info = div().mt(t.s(14.0)).flex().flex_row().flex_wrap().items_center().gap_x(t.s(12.0)).gap_y(t.s(6.0)).child(meta).when(p.smart, |d| d.child(self.smart_rules_pill(p, cx))).into_any_element();
         if !p.description.is_empty() {
-            let open = self.playlist_detail.desc_open;
-            info = info.child(self.more_text("playlist-desc", p.description.clone(), open, false, cx, |this, cx| {
-                this.playlist_detail.desc_open = !this.playlist_detail.desc_open;
-                cx.notify();
-            }));
+            let more = self.header_more_text("playlist-desc", self.playlist_about(p), cx);
+            info = div().child(info).child(more).into_any_element();
         }
+        self.render_collection_head(&cover_id, p.name.clone(), info, layout, cx)
+    }
+
+    /// what the playlist's About sheet shows; whose it is only when it isn't yours.
+    pub fn playlist_about(&self, p: &PlaylistDetails) -> crate::view_about::AboutText {
+        let by = (!p.mine && !p.owner.is_empty()).then(|| SharedString::from(trf("By {owner}", &[("owner", &p.owner)])));
+        crate::view_about::AboutText { title: p.name.clone(), subtitle: by, art: Some(self.playlist_art_key(&p.id)), text: p.description.clone() }
+    }
+
+    /// the page header, for playlists and Liked Songs.
+    pub(crate) fn render_collection_head(&mut self, cover_key: &SharedString, title: SharedString, below: AnyElement, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
+        let m = PageMetrics::of(layout);
+        let art = self.hero_artwork(cover_key, "playlist-regular", m.hero_art, R_MD, layout, cx);
+        self.collection_head(art, title, below, layout)
+    }
+
+    /// also the artist Top Songs page, around the artist's photo.
+    pub(crate) fn collection_head(&mut self, art: AnyElement, title: SharedString, below: AnyElement, layout: &Layout) -> AnyElement {
+        let t = self.theme;
+        let m = PageMetrics::of(layout);
+        let cover = crate::ui::hero_art_frame(&t, R_MD, art);
+        let info = div().flex().flex_col().flex_1().min_w(px(0.0)).child(div().text_size(t.text(m.title)).text_color(t.t_em()).font_weight(FontWeight::BOLD).line_height(relative(1.1)).line_clamp(3).text_ellipsis().id("playlist-title").child(title.clone()).full_text_tip(&t, title)).child(below);
         let main = f32::from(layout.main_width) / t.token_scale();
         let mut head = div().flex().gap(t.s(25.0)).px(t.s(m.gutter)).w(layout.main_width).items_center();
         head = if main <= 620.0 { head.flex_col().items_start() } else { head.flex_row() };
@@ -326,7 +335,7 @@ impl Shell {
             .pl(t.s(9.0))
             .pr(t.s(10.0))
             .rounded_full()
-            .bg(t.glass_frost_fill())
+            .bg(t.glass())
             .shadow(glass_edge())
             .text_size(t.text(TEXT_SM))
             .font_weight(FontWeight::MEDIUM)
@@ -384,7 +393,7 @@ impl Shell {
         let public = p.public;
         let mut action_list = vec![
             self.download_toggle("playlist-download", CollectionKind::Playlist, p.id.clone(), p.name.clone(), has_songs, cx),
-            icon_button(&t, "playlist-share", "user-plus-regular", false)
+            icon_button(&t, "playlist-share", tr("Share"), "user-plus-regular", false)
                 .stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                     let mut rows = Vec::new();
                     if owned {
@@ -398,16 +407,18 @@ impl Shell {
         ];
         if owned {
             action_list.push(
-                icon_button(&t, "playlist-edit", "pencil-simple-regular", false)
+                icon_button(&t, "playlist-edit", tr("Edit"), "pencil-simple-regular", false)
                     .stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                         let details_id = id.clone();
-                        let mut rows = vec![MenuRow::item(tr("Edit Details"), "pencil-simple-regular", move |this, cx| this.open_edit_playlist(details_id.clone(), cx))];
+                        let mut rows = vec![this.edit_details_row(&details_id)];
                         if smart {
                             let id = id.clone();
                             rows.push(MenuRow::item(tr("Edit Rules"), "lightning-fill", move |this, cx| this.navigate(crate::pages::Route::SmartEditor(Some(id.clone())), cx)));
                         }
                         rows.push(MenuRow::Divider);
                         rows.extend(this.playlist_cover_rows(&id));
+                        rows.push(MenuRow::Divider);
+                        rows.push(this.delete_playlist_row(&id));
                         this.open_toolbar_menu(rows, event, cx);
                     }))
                     .into_any_element(),
@@ -415,9 +426,10 @@ impl Shell {
         }
         let info_id = p.id.clone();
         action_list.push(
-            icon_button(&t, "playlist-more", "dots-three-bold", false)
+            icon_button(&t, "playlist-more", tr("More"), "dots-three-bold", false)
                 .stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-                    let rows = vec![this.add_to_playlist_row(tr("Add to Playlist"), menu_songs.clone(), name.clone()), this.info_row(crate::view_info::InfoTarget::Playlist(info_id.clone()))];
+                    let mut rows = vec![this.add_to_playlist_row(tr("Add to Playlist"), menu_songs.clone(), name.clone()), this.info_row(crate::view_info::InfoTarget::Playlist(info_id.clone()))];
+                    rows.extend(this.pin_row(&info_id));
                     this.open_toolbar_menu(rows, event, cx);
                 }))
                 .into_any_element(),
@@ -438,8 +450,8 @@ impl Shell {
             .child(div().flex_1())
             .child(
                 glass_pill(&t)
-                    .child(icon_button(&t, "playlist-sort", "arrows-down-up-regular", sort.is_some()).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-                        // The playlist's own order first, then the ascending column sorts.
+                    .child(icon_button(&t, "playlist-sort", tr("Sort"), "arrows-down-up-regular", sort.is_some()).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                        // The playlist's own order first, then the column sorts (ascending).
                         let rows = [(None, tr("Playlist Order")), (Some(SortColumn::Title), tr("Title")), (Some(SortColumn::Artist), tr("Artist")), (Some(SortColumn::Album), tr("Album")), (Some(SortColumn::Time), tr("Length"))]
                             .into_iter()
                             .map(|(o, label)| {
@@ -450,7 +462,7 @@ impl Shell {
                         this.open_toolbar_menu(rows, event, cx);
                     })))
                     .child(divider(&t))
-                    .child(icon_button(&t, "playlist-filter", "funnel-simple-regular", filter != SongFilter::All).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    .child(icon_button(&t, "playlist-filter", tr("Filter"), "funnel-simple-regular", filter != SongFilter::All).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                         let rows = this.song_filter_rows(filter, |this, f| this.playlist_detail.filter = f);
                         this.open_toolbar_menu(rows, event, cx);
                     }))),

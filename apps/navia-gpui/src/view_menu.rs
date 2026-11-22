@@ -21,7 +21,7 @@ pub type MenuAction = Rc<dyn Fn(&mut Shell, &mut Context<Shell>)>;
 pub enum MenuRow {
     Item {
         label: SharedString,
-        icon: Option<&'static str>,
+        icon: Option<MenuIcon>,
         checked: Option<bool>,
         /// A smaller second line under the label: why the row is disabled, or a detail like a receiver's model.
         reason: Option<SharedString>,
@@ -36,6 +36,8 @@ pub enum MenuRow {
         count: Option<SharedString>,
         /// Opens this submenu beside the row on hover, click, Enter, Space or →.
         submenu: Option<Rc<Submenu>>,
+        /// an icon button in the row above the list; the label is its tooltip.
+        quick: bool,
     },
     Divider,
     /// Who is signed in, above the account menu's rows.
@@ -44,11 +46,18 @@ pub enum MenuRow {
     Heading { label: SharedString, icon: Option<&'static str>, busy: bool },
 }
 
-/// A submenu's content: lead rows the filter never hides, like New Playlist, then a filterable list.
+/// a row's icon: a named glyph, or the filled download mark of something downloaded.
+#[derive(Clone, Copy)]
+pub enum MenuIcon {
+    Named(&'static str),
+    Downloaded,
+}
+
+/// lead rows the filter never hides, then a list it narrows.
 pub struct Submenu {
     pub lead: Vec<MenuRow>,
     pub items: Vec<MenuRow>,
-    /// The filter field's placeholder. Typing anywhere in the submenu goes to it.
+    /// typing anywhere in the submenu goes to it.
     pub find: Option<&'static str>,
     /// Shown in place of the list when the filter matches nothing.
     pub empty: Option<&'static str>,
@@ -67,7 +76,7 @@ pub struct SubmenuState {
 
 impl MenuRow {
     fn new_item(label: SharedString, icon: Option<&'static str>, checked: Option<bool>, reason: Option<SharedString>, action: Option<MenuAction>, toggle: bool) -> Self {
-        MenuRow::Item { label, icon, checked, reason, busy: false, action, toggle, shortcut: None, count: None, submenu: None }
+        MenuRow::Item { label, icon: icon.map(MenuIcon::Named), checked, reason, busy: false, action, toggle, shortcut: None, count: None, submenu: None, quick: false }
     }
 
     pub fn item(label: impl Into<SharedString>, icon: &'static str, action: impl Fn(&mut Shell, &mut Context<Shell>) + 'static) -> Self {
@@ -80,11 +89,10 @@ impl MenuRow {
     }
 
     pub fn submenu(label: impl Into<SharedString>, icon: &'static str, submenu: Submenu) -> Self {
-        // The action never runs. It only marks the row as enabled for the keyboard.
-        MenuRow::Item { label: label.into(), icon: Some(icon), checked: None, reason: None, busy: false, action: Some(Rc::new(|_, _| {})), toggle: false, shortcut: None, count: None, submenu: Some(Rc::new(submenu)) }
+        // never run; it marks the row as enabled for the keyboard.
+        MenuRow::Item { label: label.into(), icon: Some(MenuIcon::Named(icon)), checked: None, reason: None, busy: false, action: Some(Rc::new(|_, _| {})), toggle: false, shortcut: None, count: None, submenu: Some(Rc::new(submenu)), quick: false }
     }
 
-    /// A switch row that flips without closing the menu.
     pub fn toggle(label: impl Into<SharedString>, icon: &'static str, on: bool, action: impl Fn(&mut Shell, &mut Context<Shell>) + 'static) -> Self {
         Self::new_item(label.into(), Some(icon), Some(on), None, Some(Rc::new(action)), true)
     }
@@ -100,7 +108,18 @@ impl MenuRow {
         matches!(self, MenuRow::Item { action: Some(_), .. })
     }
 
-    /// Shows how many songs a choice matches, before its check.
+    pub fn quick(mut self, glyph: MenuIcon) -> Self {
+        if let MenuRow::Item { quick, icon, .. } = &mut self {
+            *quick = true;
+            *icon = Some(glyph);
+        }
+        self
+    }
+
+    fn is_quick(&self) -> bool {
+        matches!(self, MenuRow::Item { quick: true, .. })
+    }
+
     pub fn with_count(mut self, n: impl Into<SharedString>) -> Self {
         if let MenuRow::Item { count, .. } = &mut self {
             *count = Some(n.into());
@@ -108,7 +127,6 @@ impl MenuRow {
         self
     }
 
-    /// Shows a keyboard shortcut at the row's end.
     pub fn with_shortcut(mut self, keys: impl Into<SharedString>) -> Self {
         if let MenuRow::Item { shortcut, .. } = &mut self {
             *shortcut = Some(keys.into());
@@ -128,7 +146,7 @@ impl MenuRow {
     /// A row with an optional `detail` line, a check, and a spinner while `busy`. Without `action` the row is disabled
     /// and the detail says why.
     pub fn detailed(label: impl Into<SharedString>, detail: Option<SharedString>, checked: bool, busy: bool, action: Option<MenuAction>) -> Self {
-        MenuRow::Item { label: label.into(), icon: None, checked: Some(checked), reason: detail, busy, action, toggle: false, shortcut: None, count: None, submenu: None }
+        MenuRow::Item { label: label.into(), icon: None, checked: Some(checked), reason: detail, busy, action, toggle: false, shortcut: None, count: None, submenu: None, quick: false }
     }
 
     /// A radio-style row for sorts and filters.
@@ -151,7 +169,9 @@ pub struct MenuState {
     pub sub: Option<SubmenuState>,
     /// The output device menu. Its rows are rebuilt in place when the device list changes.
     pub outputs: bool,
-    /// Bumped when the pointer moves to another row, so only the latest close timer acts.
+    /// refilled once the playlist's songs arrive.
+    pub playlist: Option<SharedString>,
+    /// so only the latest close timer acts.
     sub_close: u64,
     /// Where the menu and each row were last drawn, for placing submenus.
     bounds: Rc<RefCell<Bounds<Pixels>>>,
@@ -167,27 +187,27 @@ pub struct MenuPanel {
     pub scroll: ScrollHandle,
 }
 
-/// A menu row's height, then the filter field's height and the gap below it.
-const ROW_H: f32 = 36.0;
-const FILTER_H: f32 = 34.0;
-const FILTER_GAP: f32 = 4.0;
-const MENU_PAD: f32 = 6.0;
-/// Gap kept from the window's edges.
+/// kept from the window's edges.
 const EDGE: f32 = 10.0;
-/// How long the pointer may cross other rows on its way into an open submenu before it closes.
+/// how long the pointer may cross other rows on its way into a submenu.
 const SUB_CLOSE_MS: u64 = 250;
 
 impl Shell {
     /// How far floating panels stay inside the window. `EDGE` past the window frame's shadow and resize border, so
     /// nothing runs past the visible edge.
     pub fn float_margin(&self) -> gpui::Edges<Pixels> {
-        gpui::Edges { top: self.edge.top + px(EDGE), right: self.edge.right + px(EDGE), bottom: self.edge.bottom + px(EDGE), left: self.edge.left + px(EDGE) }
+        self.float_margin_by(px(EDGE))
+    }
+
+    /// the window's edge plus `edge`, for a float with its own distance from the edge.
+    pub fn float_margin_by(&self, edge: Pixels) -> gpui::Edges<Pixels> {
+        gpui::Edges { top: self.edge.top + edge, right: self.edge.right + edge, bottom: self.edge.bottom + edge, left: self.edge.left + edge }
     }
 
     pub fn open_menu(&mut self, rows: Vec<MenuRow>, position: Point<Pixels>, align_end: bool, cx: &mut Context<Self>) {
         let focused = rows.iter().position(MenuRow::enabled);
         let row_bounds = rows.iter().map(|_| Rc::default()).collect();
-        self.menu = Some(MenuState { rows, position, align_end, focused, keyboard: false, panel: None, sub: None, outputs: false, sub_close: 0, bounds: Rc::default(), row_bounds });
+        self.menu = Some(MenuState { rows, position, align_end, focused, keyboard: false, panel: None, sub: None, outputs: false, playlist: None, sub_close: 0, bounds: Rc::default(), row_bounds });
         self.leave_menu_find();
         cx.notify();
     }
@@ -200,7 +220,7 @@ impl Shell {
         }
     }
 
-    /// Arrow, Page and Home/End keys scroll a menu's panel, since its text has nothing to focus.
+    /// a panel's text has nothing to focus, so these keys scroll it.
     fn panel_scroll(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
         let step = self.theme.s(40.0);
         let Some(panel) = self.menu.as_ref().and_then(|m| m.panel.as_ref()) else { return false };
@@ -304,7 +324,6 @@ impl Shell {
         rows
     }
 
-    /// How many shown rows are lead rows, and how many matched the filter.
     fn sub_counts(spec: &Submenu, query: &str) -> (usize, usize) {
         let shown = Self::sub_rows(spec, query).len();
         (spec.lead.len(), shown - spec.lead.len())
@@ -357,7 +376,7 @@ impl Shell {
         if let Some(sub) = self.menu.as_mut().and_then(|m| m.sub.as_mut()) {
             sub.focused = target;
             if let Some(i) = target {
-                Self::scroll_sub_to(sub, &spec, i, self.theme.s(ROW_H));
+                Self::scroll_sub_to(sub, &spec, i, self.theme.s(MENU_ROW_H));
             }
         }
         if let Some(menu) = self.menu.as_mut() {
@@ -408,37 +427,57 @@ impl Shell {
         }
     }
 
-    /// A song menu. `remove` is "Remove from This Playlist" for rows of an editable playlist.
-    pub fn song_rows(&self, songs: &[u32], remove: Option<MenuRow>) -> Vec<MenuRow> {
+    /// `play` does what a double-click on the row does.
+    pub fn play_row_item(play: impl Fn(&mut Shell, &mut Context<Shell>) + 'static) -> MenuRow {
+        MenuRow::item(tr("Play"), "play-regular", play)
+    }
+
+    /// for songs with no list around them: they become the queue.
+    pub fn play_songs_row(songs: &[u32]) -> MenuRow {
+        let songs = songs.to_vec();
+        Self::play_row_item(move |this, cx| this.play_songs(songs.clone(), 0, false, cx))
+    }
+
+    /// Pause for the song that's playing, Play (resume) for it while paused.
+    fn play_pause_row(&self) -> MenuRow {
+        let (label, glyph) = if self.player.playing { (tr("Pause"), "pause-lines-regular") } else { (tr("Play"), "play-regular") };
+        MenuRow::item(label, glyph, |this, cx| this.toggle_play(cx))
+    }
+
+    /// on the current song `play` becomes Pause or resume; `remove` sits in Add to Playlist's group.
+    pub fn song_rows(&self, songs: &[u32], play: Option<MenuRow>, remove: Option<MenuRow>) -> Vec<MenuRow> {
+        let current = self.player.station.is_none() && matches!(songs, [s] if self.player.song_ix == Some(*s as usize));
+        let play = if current { Some(self.play_pause_row()) } else { play };
+        let lead = |mut rows: Vec<MenuRow>| {
+            if let Some(play) = play.clone() {
+                rows.push(play);
+                rows.push(MenuRow::Divider);
+            }
+            rows
+        };
         if songs.len() > 1 {
-            let (a, b, c, n) = (songs.to_vec(), songs.to_vec(), songs.to_vec(), songs.len());
-            let downloaded = songs.iter().all(|s| self.is_downloaded(*s));
-            let d = songs.to_vec();
-            let mut rows = vec![
-                MenuRow::item(trf("Play {n} Next", &[("n", &crate::i18n::fmt_int(n as i64))]), "queue-regular", move |this, cx| this.play_next(&a, cx)),
-                MenuRow::item(trf("Add {n} to Queue", &[("n", &crate::i18n::fmt_int(n as i64))]), "queue-regular", move |this, cx| this.add_to_queue(&b, cx)),
-                self.add_to_playlist_row(trf("Add {n} to Playlist", &[("n", &crate::i18n::fmt_int(n as i64))]), c, SharedString::default()),
-            ];
+            let (a, n) = (songs.to_vec(), songs.len());
+            let mut rows = lead(self.song_quick_rows(songs, SharedString::default()));
+            let count = crate::i18n::fmt_int(n as i64);
+            rows.push(MenuRow::item(trf("Add {n} to Queue", &[("n", &count)]), "queue-regular", move |this, cx| this.add_to_queue(&a, cx)));
+            rows.push(MenuRow::Divider);
+            rows.push(self.add_to_playlist_row(trf("Add {n} to Playlist", &[("n", &count)]), songs.to_vec(), SharedString::default()));
             rows.extend(remove);
+            rows.push(MenuRow::Divider);
             rows.push(self.share_songs_row(songs));
-            rows.push(if downloaded {
-                MenuRow::item(tr("Remove Downloads"), "x-regular", move |this, cx| this.set_downloaded(&d, false, cx))
-            } else {
-                MenuRow::item(tr("Download Selected"), "arrow-down-regular", move |this, cx| this.set_downloaded(&d, true, cx))
-            });
             return rows;
         }
         let Some(&song_ix) = songs.first() else { return Vec::new() };
         let Some(song) = self.song_peek(song_ix) else { return Vec::new() };
-        let mut rows = vec![
-            MenuRow::item(tr("Play Next"), "arrow-bend-up-right-regular", move |this, cx| this.play_next(&[song_ix], cx)),
-            MenuRow::item(tr("Add to Queue"), "queue-regular", move |this, cx| this.add_to_queue(&[song_ix], cx)),
-            self.add_to_playlist_row(tr("Add to Playlist"), vec![song_ix], song.title.clone()),
-        ];
-        rows.extend(remove);
-        if self.is_downloaded(song_ix) {
-            rows.push(MenuRow::item(tr("Remove Download"), "x-regular", move |this, cx| this.set_downloaded(&[song_ix], false, cx)));
+        let mut rows = lead(self.song_quick_rows(songs, song.title.clone()));
+        rows.push(MenuRow::item(tr("Add to Queue"), "queue-regular", move |this, cx| this.add_to_queue(&[song_ix], cx)));
+        // hidden once the server has nothing for this song; unknown stays offered since asking is slow.
+        if !self.no_song_radio.contains(&song.id) {
+            rows.push(MenuRow::item(tr("Song Radio"), "radio-regular", move |this, cx| this.start_song_radio(song_ix, cx)));
         }
+        rows.push(MenuRow::Divider);
+        rows.push(self.add_to_playlist_row(tr("Add to Playlist"), songs.to_vec(), song.title.clone()));
+        rows.extend(remove);
         rows.push(MenuRow::Divider);
         let album = song.album_id.clone();
         rows.push(MenuRow::item(tr("Go to Album"), "disc-regular", move |this, cx| this.navigate(Route::Album(album.clone()), cx)));
@@ -448,18 +487,42 @@ impl Shell {
             let id = artist.id.clone();
             rows.push(MenuRow::item(tr("Go to Artist"), "microphone-stage-regular", move |this, cx| this.navigate(Route::Artist(id.clone()), cx)));
         }
-        // Hidden once the server says it has nothing for this song. Unknown stays offered, since asking is slow and
-        // only happens when the row is chosen.
-        if !self.no_song_radio.contains(&song.id) {
-            rows.push(MenuRow::item(tr("Start Song Radio"), "radio-regular", move |this, cx| this.start_song_radio(song_ix, cx)));
-        }
         rows.push(self.share_songs_row(&[song_ix]));
         rows.push(self.info_row(crate::view_info::InfoTarget::Song(song.id.clone())));
         rows
     }
 
-    /// Add to Playlist: a filterable submenu with New Playlist, then the user's own regular playlists, most recently
-    /// changed first. `name` is the new playlist's starting name.
+    /// for several songs each acts on all of them; `name` starts a new playlist's name.
+    fn song_quick_rows(&self, songs: &[u32], name: SharedString) -> Vec<MenuRow> {
+        let one = songs.len() == 1;
+        let n = crate::i18n::fmt_int(songs.len() as i64);
+        let favorite = songs.iter().all(|s| self.is_starred(*s));
+        let downloaded = songs.iter().all(|s| self.is_downloaded(*s));
+        let (fav, dl, next) = (songs.to_vec(), songs.to_vec(), songs.to_vec());
+        let favorite_row = MenuRow::check(tr("Favorite"), favorite, move |this, cx| {
+            for &s in &fav {
+                if this.is_starred(s) == favorite {
+                    this.toggle_song_star(s, cx);
+                }
+            }
+        })
+        .quick(MenuIcon::Named(if favorite { "heart-fill" } else { "heart-regular" }));
+        let download_row = if downloaded {
+            MenuRow::item(if one { tr("Remove Download") } else { tr("Remove Downloads") }, "x-regular", move |this, cx| this.set_downloaded(&dl, false, cx)).quick(MenuIcon::Downloaded)
+        } else {
+            MenuRow::item(if one { tr("Download") } else { tr("Download Selected") }, "arrow-down-regular", move |this, cx| this.set_downloaded(&dl, true, cx)).quick(MenuIcon::Named("arrow-down-regular"))
+        };
+        let next_label: SharedString = if one { tr("Play Next").into() } else { trf("Play {n} Next", &[("n", &n)]).into() };
+        let add_label: SharedString = if one { tr("Add to Playlist").into() } else { trf("Add {n} to Playlist", &[("n", &n)]).into() };
+        vec![
+            favorite_row,
+            download_row,
+            MenuRow::item(next_label, "arrow-bend-up-right-regular", move |this, cx| this.play_next(&next, cx)).quick(MenuIcon::Named("arrow-bend-up-right-regular")),
+            self.add_to_playlist_row(add_label, songs.to_vec(), name).quick(MenuIcon::Named("plus-regular")),
+        ]
+    }
+
+    /// a filter, New Playlist (named `name` to start), then the user's own regular playlists.
     pub fn add_to_playlist_row(&self, label: impl Into<SharedString>, songs: Vec<u32>, name: SharedString) -> MenuRow {
         if songs.is_empty() {
             return MenuRow::disabled(label, "list-plus-regular", tr("No songs to add"));
@@ -489,7 +552,7 @@ impl Shell {
     /// "Remove from This Playlist" for these positions in the playlist's shown list.
     pub fn remove_row(&self, places: Vec<usize>) -> Option<MenuRow> {
         let target = self.playlist_remove.clone()?;
-        let label = if places.len() > 1 { trf("Remove {n} from This Playlist", &[("n", &crate::i18n::fmt_int(places.len() as i64))]) } else { tr("Remove from This Playlist").to_string() };
+        let label = if places.len() > 1 { trf("Remove {n} from Playlist", &[("n", &crate::i18n::fmt_int(places.len() as i64))]) } else { tr("Remove from Playlist").to_string() };
         Some(MenuRow::item(label, "minus-circle-regular", move |this, cx| {
             let shown: Vec<usize> = places.iter().filter_map(|&p| target.places.get(p).copied()).collect();
             match this.core.as_ref() {
@@ -506,8 +569,8 @@ impl Shell {
         MenuRow::item(label, "minus-circle-regular", move |this, cx| this.queue_remove(&positions, cx))
     }
 
-    pub fn open_song_menu(&mut self, songs: Vec<u32>, position: Point<Pixels>, align_end: bool, cx: &mut Context<Self>) {
-        let rows = self.song_rows(&songs, None);
+    pub fn open_song_menu(&mut self, songs: Vec<u32>, play: Option<MenuRow>, position: Point<Pixels>, align_end: bool, cx: &mut Context<Self>) {
+        let rows = self.song_rows(&songs, play, None);
         self.open_menu(rows, position, align_end, cx);
     }
 
@@ -515,8 +578,13 @@ impl Shell {
     pub fn open_list_song_menu(&mut self, list: usize, places: Vec<usize>, position: Point<Pixels>, align_end: bool, cx: &mut Context<Self>) {
         let Some(all) = self.page.lists.get(list).cloned() else { return };
         let songs: Vec<u32> = places.iter().filter_map(|&p| all.get(p).copied()).collect();
+        // one row plays as a double-click does; several play as their own queue.
+        let play = match places[..] {
+            [place] => Self::play_row_item(move |this, cx| this.play_page_list(list, place, false, cx)),
+            _ => Self::play_songs_row(&songs),
+        };
         let remove = if self.playlist_remove.as_ref().is_some_and(|r| r.list == list) { self.remove_row(places) } else { None };
-        let rows = self.song_rows(&songs, remove);
+        let rows = self.song_rows(&songs, Some(play), remove);
         self.open_menu(rows, position, align_end, cx);
     }
 
@@ -527,7 +595,7 @@ impl Shell {
         let mut rows = if self.player.station.is_some() {
             vec![MenuRow::item(tr("Stop Station"), "stop-regular", |this, cx| this.core_stop_station(cx))]
         } else {
-            self.song_rows(&[song_ix as u32], None)
+            self.song_rows(&[song_ix as u32], None, None)
         };
         rows.push(MenuRow::Divider);
         rows.push(MenuRow::item(tr("Mini Player"), "picture-in-picture-regular", |this, cx| this.open_mini_player(cx)).with_shortcut(Shell::mini_shortcut_label()));
@@ -552,6 +620,11 @@ impl Shell {
             return;
         }
         let rows = self.output_menu_rows();
+        self.replace_menu_rows(rows, cx);
+    }
+
+    /// keeps its spot and the keyboard's row.
+    pub fn replace_menu_rows(&mut self, rows: Vec<MenuRow>, cx: &mut Context<Self>) {
         if let Some(menu) = self.menu.as_mut() {
             menu.row_bounds = rows.iter().map(|_| Rc::default()).collect();
             menu.focused = menu.focused.filter(|&i| i < rows.len()).or_else(|| rows.iter().position(MenuRow::enabled));
@@ -593,12 +666,22 @@ impl Shell {
 
     pub fn play_next(&mut self, songs: &[u32], cx: &mut Context<Self>) {
         self.queue_songs_at(songs, 0, true, cx);
+        self.flash_rows(songs);
+        if self.session_on() {
+            self.show_toast(tr("Playing next in the session").to_string(), cx);
+            return;
+        }
         self.show_toast(if songs.len() == 1 { tr("Playing next").to_string() } else { trf("{n} songs playing next", &[("n", &crate::i18n::fmt_int(songs.len() as i64))]) }, cx);
     }
 
     pub fn add_to_queue(&mut self, songs: &[u32], cx: &mut Context<Self>) {
         let run = self.player.queued_run;
         self.queue_songs_at(songs, run, true, cx);
+        self.flash_rows(songs);
+        if self.session_on() {
+            self.show_toast(tr("Added to the session queue").to_string(), cx);
+            return;
+        }
         self.show_toast(if songs.len() == 1 { tr("Added to queue").to_string() } else { trf("{n} songs added to queue", &[("n", &crate::i18n::fmt_int(songs.len() as i64))]) }, cx);
     }
 
@@ -679,7 +762,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Moves the keyboard highlight in the open menu, wrapping and skipping disabled rows.
+    /// wraps and skips disabled rows.
     pub fn menu_move(&mut self, delta: i32, cx: &mut Context<Self>) {
         let Some(menu) = self.menu.as_mut() else { return };
         let enabled: Vec<usize> = menu.rows.iter().enumerate().filter(|(_, r)| matches!(r, MenuRow::Item { action: Some(_), .. })).map(|(i, _)| i).collect();
@@ -699,7 +782,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// Jumps to the first or last enabled row.
     fn menu_jump(&mut self, last: bool, cx: &mut Context<Self>) {
         let Some(menu) = self.menu.as_mut() else { return };
         let enabled = menu.rows.iter().enumerate().filter(|(_, r)| matches!(r, MenuRow::Item { action: Some(_), .. })).map(|(i, _)| i);
@@ -745,6 +827,7 @@ impl Shell {
             "home" => self.menu_jump(false, cx),
             "end" => self.menu_jump(true, cx),
             "space" => self.menu_activate(cx),
+            "left" | "right" if !mods.modified() && self.quick_move(if key == "right" { 1 } else { -1 }, cx) => {}
             "right" if !mods.modified() => {
                 if let Some(i) = self.menu.as_ref().and_then(|m| m.focused) {
                     self.open_submenu(i, true, cx);
@@ -755,7 +838,6 @@ impl Shell {
         }
     }
 
-    /// A letter typed while a submenu with a filter is open goes to the filter.
     fn type_into_menu_find(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
         let mods = event.keystroke.modifiers;
         let Some(text) = event.keystroke.key_char.clone().filter(|c| !c.chars().any(char::is_control)) else { return };
@@ -808,45 +890,113 @@ impl Shell {
     /// its submenu open.
     pub(crate) fn menu_row(&self, id: (&'static str, usize), row: &MenuRow, lit: bool, icon_slots: bool) -> Option<gpui::Stateful<gpui::Div>> {
         let t = self.theme;
-        let MenuRow::Item { label, icon: icon_name, checked, reason, busy, action, toggle, shortcut, count, submenu } = row else { return None };
+        let MenuRow::Item { label, icon: glyph, checked, reason, busy, action, toggle, shortcut, count, submenu, .. } = row else { return None };
         let enabled = action.is_some();
+        // an off row says why in its tooltip; only an enabled row's detail gets a second line.
+        let detail = if enabled { reason.clone() } else { None };
         let color: gpui::Hsla = if enabled { t.t1().into() } else { t.t3().into() };
         let mut el = div()
             .id(id)
             .flex()
             .flex_row()
             .items_center()
-            .gap(t.s(11.0))
-            .min_h(t.s(ROW_H))
-            .px(t.s(11.0))
-            .py(t.s(if reason.is_some() { 6.0 } else { 0.0 }))
-            .rounded(t.s(10.0))
+            .gap(t.s(MENU_GAP))
+            .min_h(t.s(MENU_ROW_H))
+            .px(t.s(MENU_ROW_PAD_X))
+            .py(t.s(if detail.is_some() { MENU_ROW_PAD_Y } else { 0.0 }))
+            .rounded(t.s(MENU_ROW_R))
+            .text_size(t.text(MENU_TEXT))
             .text_color(color)
             .when(lit, |d| d.bg(t.hover()));
-        if let Some(name) = icon_name {
-            el = el.child(icon(&t, name, 17.0, color));
+        if let Some(glyph) = glyph {
+            el = el.child(menu_icon(&t, *glyph, MENU_ICON, color));
         } else if icon_slots {
-            el = el.child(div().flex_none().size(t.s(17.0)));
+            el = el.child(div().flex_none().size(t.s(MENU_ICON)));
         }
-        // An enabled row's second line is a detail, and a disabled row's says why.
-        let note = if enabled { t.t2() } else { t.t3() };
-        let text = div().flex_1().min_w(px(0.0)).child(div().truncate().child(label.clone())).when_some(reason.clone(), |d, reason| d.child(div().text_size(t.text(TEXT_XS)).line_height(relative(1.25)).text_color(note).child(reason)));
-        el = el.child(text).when_some(shortcut.clone(), |d, keys| d.child(div().ml(t.s(18.0)).flex_none().text_size(t.text(TEXT_SM)).text_color(t.t3()).child(keys)));
-        el = el.when_some(count.clone(), |d, n| d.child(div().flex_none().text_size(t.text(TEXT_XS)).text_color(t.t3()).child(n)));
+        let note = t.t2();
+        let text = div().flex_1().min_w(px(0.0)).child(div().truncate().child(label.clone())).when_some(detail, |d, reason| d.child(div().w(px(0.0)).min_w_full().text_size(t.text(MENU_DETAIL_TEXT)).line_height(relative(1.25)).text_color(note).child(reason)));
+        el = el.child(text).when_some(shortcut.clone(), |d, keys| d.child(div().ml(t.s(MENU_END_GAP)).flex_none().text_color(t.t3()).child(keys)));
+        el = el.when_some(count.clone(), |d, n| d.child(div().flex_none().text_size(t.text(MENU_DETAIL_TEXT)).text_color(t.t3()).child(n)));
         el = if *busy {
-            el.child(div().ml(t.s(18.0)).flex_none().child(crate::ui::spinner(&t, (id.0, id.1 + 10_000), 15.0, t.t2())))
+            el.child(div().ml(t.s(MENU_END_GAP)).flex_none().child(crate::ui::spinner(&t, (id.0, id.1 + 10_000), MENU_SPINNER, t.t2())))
         } else if submenu.is_some() {
-            el.child(div().ml(t.s(18.0)).flex_none().child(icon(&t, "caret-right-bold", 13.0, t.t2())))
+            el.child(div().ml(t.s(MENU_END_GAP)).flex_none().child(icon(&t, "caret-right-bold", MENU_CARET, t.t2())))
         } else if *toggle {
-            // The settings switch one step smaller, to fit inside the row.
-            el.child(crate::ui_controls::switch_look(&t, *checked == Some(true), SWITCH_COMPACT).ml(t.s(18.0)))
+            // a step smaller, so it sits inside the row.
+            el.child(crate::ui_controls::switch_look(&t, *checked == Some(true), SWITCH_COMPACT).ml(t.s(MENU_END_GAP)))
         } else {
-            el.when(*checked == Some(true), |d| d.child(div().size(t.s(7.0)).rounded_full().bg(t.accent_hsla())))
+            el.when(*checked == Some(true), |d| d.child(div().flex_none().size(t.s(MENU_CHECK)).rounded_full().bg(t.accent_hsla())))
         };
         if enabled {
             el = el.hover(|s| s.bg(t.hover()));
+        } else if let Some(why) = reason.clone() {
+            el = el.tooltip(crate::ui::tip(&t, why));
         }
         Some(el)
+    }
+
+    /// the icon in a square, lit like a row, with the label (or why it's off) as its tooltip.
+    fn quick_button(&self, i: usize, row: &MenuRow, lit: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let t = self.theme;
+        let MenuRow::Item { label, icon: glyph, reason, action, submenu, .. } = row else { return None };
+        let color: gpui::Hsla = if action.is_some() { t.t1().into() } else { t.t3().into() };
+        let tip_text = if action.is_none() { reason.clone().unwrap_or_else(|| label.clone()) } else { label.clone() };
+        let mut el = div()
+            .id(("menu-quick", i))
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .size(t.s(MENU_QUICK_SIZE))
+            .rounded(t.s(MENU_ROW_R))
+            .when(lit, |d| d.bg(t.hover()))
+            .children(glyph.map(|g| menu_icon(&t, g, MENU_QUICK_ICON, color)))
+            .tooltip(crate::ui::tip(&t, tip_text));
+        if let Some(action) = action.clone() {
+            let has_sub = submenu.is_some();
+            el = el
+                .hover(|s| s.bg(t.hover()))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered && this.menu.as_ref().and_then(|m| m.sub.as_ref()).is_some_and(|s| s.row != i) {
+                        this.submenu_close_soon(cx);
+                    }
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if has_sub {
+                        this.open_submenu(i, true, cx);
+                    } else {
+                        this.run_menu_row(i, action.clone(), false, cx);
+                    }
+                }));
+        }
+        Some(el)
+    }
+
+    fn quick_move(&mut self, delta: i32, cx: &mut Context<Self>) -> bool {
+        let Some(menu) = self.menu.as_mut() else { return false };
+        let Some(at) = menu.focused.filter(|&f| menu.rows.get(f).is_some_and(MenuRow::is_quick)) else { return false };
+        let row: Vec<usize> = menu.rows.iter().enumerate().filter(|(_, r)| r.is_quick() && r.enabled()).map(|(i, _)| i).collect();
+        let Some(pos) = row.iter().position(|&i| i == at) else { return false };
+        let to = pos as i32 + delta;
+        if let Some(&next) = usize::try_from(to).ok().and_then(|to| row.get(to)) {
+            menu.focused = Some(next);
+            menu.keyboard = true;
+            menu.sub = None;
+            self.leave_menu_find();
+            cx.notify();
+        }
+        true
+    }
+
+    pub fn script_menu_quick(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else { return };
+        menu.focused = menu.rows.iter().position(|r| r.is_quick() && r.enabled());
+        menu.keyboard = true;
+        cx.notify();
+    }
+
+    pub fn script_menu_quick_move(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.quick_move(delta, cx);
     }
 
     pub fn render_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -858,18 +1008,38 @@ impl Shell {
         let rows = menu.rows.clone();
         let (bounds, row_bounds) = (menu.bounds.clone(), menu.row_bounds.clone());
         let panel = menu.panel.as_ref().map(|p| self.render_menu_panel(p, !rows.is_empty()));
-        let mut list = crate::ui::float_panel(&t).min_w(t.s(210.0)).max_w(t.s(380.0)).p(t.s(MENU_PAD)).flex().flex_col().child(track_bounds(bounds));
+        let mut list = crate::ui::float_panel(&t).min_w(t.s(MENU_MIN_W)).max_w(t.s(MENU_MAX_W)).p(t.s(MENU_PAD)).text_size(t.text(MENU_TEXT)).flex().flex_col().child(track_bounds(bounds));
         list = match panel {
             // The panel scrolls itself, so scrolling mustn't close the menu.
             Some(panel) => list.w(t.s(POP_W)).child(panel),
             None => list.on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, _, cx| this.close_menu(cx))),
         };
-        // When some rows have icons, the rest keep an empty slot so labels line up.
-        let icon_slots = rows.iter().any(|r| matches!(r, MenuRow::Item { icon: Some(_), .. }));
+        // rows without icons keep an empty slot so every label lines up.
+        let icon_slots = rows.iter().any(|r| !r.is_quick() && matches!(r, MenuRow::Item { icon: Some(_), .. }));
+        let quick: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.is_quick()).map(|(i, _)| i).collect();
+        // no divider under the quick row: its own rule separates them.
+        let first_shown = rows.iter().position(|r| !r.is_quick() && !matches!(r, MenuRow::Divider));
+        if !quick.is_empty() {
+            let mut bar = div().flex().flex_row().justify_between();
+            for &i in &quick {
+                let Some(mut el) = self.quick_button(i, &rows[i], focused == Some(i) || open_sub == Some(i), cx) else { continue };
+                if let Some(store) = row_bounds.get(i) {
+                    el = el.relative().child(track_bounds(store.clone()));
+                }
+                bar = bar.child(el);
+            }
+            list = list.child(bar);
+            if first_shown.is_some() {
+                list = list.child(menu_rule(&t));
+            }
+        }
         for (i, row) in rows.iter().enumerate() {
+            if row.is_quick() || (!quick.is_empty() && first_shown.is_some_and(|f| i < f)) {
+                continue;
+            }
             match row {
                 MenuRow::Divider => {
-                    list = list.child(div().h(px(1.0)).mx(t.s(8.0)).my(t.s(5.0)).bg(t.line()));
+                    list = list.child(menu_rule(&t));
                 }
                 MenuRow::Heading { label, icon: glyph, busy } => {
                     list = list.child(
@@ -877,13 +1047,13 @@ impl Shell {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(t.s(7.0))
+                            .gap(t.s(MENU_HEADING_GAP))
                             .h(t.s(MENU_HEADING_H))
-                            .px(t.s(11.0))
-                            .text_size(t.text(TEXT_SM))
+                            .px(t.s(MENU_ROW_PAD_X))
+                            .text_size(t.text(MENU_TEXT))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(t.t_section())
-                            .when_some(*glyph, |d, g| d.child(icon(&t, g, 15.0, t.t_section())))
+                            .when_some(*glyph, |d, g| d.child(icon(&t, g, MENU_HEADING_ICON, t.t_section())))
                             .child(div().flex_1().child(label.clone()))
                             .when(*busy, |d| d.child(crate::ui::spinner(&t, ("menu-heading-spin", i), 13.0, t.t_section()))),
                     );
@@ -894,12 +1064,11 @@ impl Shell {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(t.s(11.0))
-                            .min_w(t.s(240.0))
-                            .pt(t.s(8.0))
-                            .pb(t.s(9.0))
-                            .px(t.s(11.0))
-                            .child(div().flex().items_center().justify_center().flex_none().size(t.s(34.0)).rounded_full().bg(t.glass_on()).shadow(glass_edge()).font_weight(FontWeight::SEMIBOLD).child(initial.clone()))
+                            .gap(t.s(MENU_GAP))
+                            .min_w(t.s(MENU_HEADER_W))
+                            .py(t.s(MENU_HEADER_PAD_Y))
+                            .px(t.s(MENU_ROW_PAD_X))
+                            .child(div().flex().items_center().justify_center().flex_none().size(t.s(MENU_AVATAR)).rounded_full().bg(t.glass_on()).shadow(glass_edge()).font_weight(FontWeight::SEMIBOLD).child(initial.clone()))
                             .child(
                                 div()
                                     .flex()
@@ -907,7 +1076,7 @@ impl Shell {
                                     .min_w(px(0.0))
                                     .line_height(relative(1.3))
                                     .child(div().font_weight(FontWeight::SEMIBOLD).truncate().child(name.clone()))
-                                    .child(div().text_size(t.text(TEXT_SM)).text_color(t.t3()).truncate().child(host.clone())),
+                                    .child(div().text_size(t.text(MENU_DETAIL_TEXT)).text_color(t.t3()).truncate().child(host.clone())),
                             ),
                     );
                 }
@@ -985,11 +1154,11 @@ impl Shell {
         let (top_limit, bottom_limit) = (f32::from(self.edge.top) + EDGE, f32::from(viewport.height - self.edge.bottom) - EDGE);
         let (left_limit, right_limit) = (f32::from(self.edge.left) + EDGE, f32::from(viewport.width - self.edge.right) - EDGE);
         let width = f(SUBMENU_W);
-        let find_h = if spec.find.is_some() { f(FILTER_H + FILTER_GAP) } else { 0.0 };
-        let fixed = f(MENU_PAD) * 2.0 + find_h + f(ROW_H) * lead as f32;
+        let find_h = if spec.find.is_some() { f(MENU_FIND_H + MENU_FIND_GAP) } else { 0.0 };
+        let fixed = f(MENU_PAD) * 2.0 + find_h + f(MENU_ROW_H) * lead as f32;
         let max_h = f(SUBMENU_MAX_H).min(bottom_limit - top_limit);
-        let list_natural = f(ROW_H) * matched.max(1) as f32;
-        let list_h = list_natural.min((max_h - fixed).max(f(ROW_H)));
+        let list_natural = f(MENU_ROW_H) * matched.max(1) as f32;
+        let list_h = list_natural.min((max_h - fixed).max(f(MENU_ROW_H)));
         let height = fixed + list_h;
         let right = f32::from(parent.right()) + f(SUBMENU_GAP);
         let x = if right + width <= right_limit { right } else { (f32::from(parent.left()) - f(SUBMENU_GAP) - width).max(left_limit) };
@@ -1006,6 +1175,7 @@ impl Shell {
             .p(t.s(MENU_PAD))
             .flex()
             .flex_col()
+            .text_size(t.text(MENU_TEXT))
             .text_color(t.t1())
             .on_hover(cx.listener(|this, inside: &bool, _, cx| {
                 if let Some(menu) = this.menu.as_mut() {
@@ -1020,7 +1190,8 @@ impl Shell {
             .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation());
         if let Some(placeholder) = spec.find {
             let line = self.text_line(&crate::ui_controls::TextTarget::MenuFind, &query, placeholder, "submenu-find-text", window);
-            panel = panel.child(crate::ui::float_filter(&t, "submenu-find", line).on_click(cx.listener(|this, _, _, cx| {
+            let clear = self.search_clear(crate::ui_controls::TextTarget::MenuFind, "submenu-find-clear", &query, SEARCH_CLEAR_SM, cx);
+            panel = panel.child(crate::ui::float_filter(&t, "submenu-find", line, clear).on_click(cx.listener(|this, _, _, cx| {
                 if let Some(sub) = this.menu.as_mut().and_then(|m| m.sub.as_mut()) {
                     sub.focused = None;
                 }
@@ -1032,7 +1203,7 @@ impl Shell {
         }
         let mut list = div().id("submenu-list").flex().flex_col().h(px(list_h)).overflow_y_scroll().track_scroll(&scroll);
         if matched == 0 {
-            list = list.children(spec.empty.map(|e| div().px(t.s(11.0)).py(t.s(10.0)).text_size(t.text(TEXT_SM)).text_color(t.t2()).child(e)));
+            list = list.children(spec.empty.map(|e| div().px(t.s(MENU_ROW_PAD_X)).py(t.s(MENU_EMPTY_PAD_Y)).text_color(t.t2()).child(e)));
         }
         for (k, row) in shown.iter().enumerate().skip(lead) {
             list = list.children(row_el(self, k, row, cx));
@@ -1060,9 +1231,8 @@ impl Shell {
         let t = self.theme;
         let toast = self.toast.clone()?;
         let inset = t.s(WINDOW_INSET);
-        let left = if layout.sidebar_visible && !layout.sidebar_overlay { layout.sidebar_width + inset } else { inset };
-        let docked = layout.player && layout.mode == PlayerMode::Dock;
-        let right = if docked { layout.dock_width + inset } else { inset };
+        let left = layout.sidebar_room + inset;
+        let right = layout.dock_room + inset;
         let barred = layout.player && layout.mode == PlayerMode::Bar;
         let bottom = if barred { t.s(BAR_H) + inset * 2.0 } else { inset };
         let pad = t.s(TOAST_PAD);
@@ -1091,7 +1261,6 @@ impl Shell {
         Some(div().absolute().left(left).right(right).bottom(bottom + t.s(TOAST_GAP)).px(inset).flex().justify_center().child(surface).into_any_element())
     }
 
-    /// Opens a toolbar's sort or filter menu at the button that was clicked.
     pub fn open_toolbar_menu(&mut self, rows: Vec<MenuRow>, event: &gpui::ClickEvent, cx: &mut Context<Self>) {
         let position = event.position() + point(px(0.0), self.theme.s(14.0));
         self.open_menu(rows, position, true, cx);
@@ -1101,7 +1270,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Builds a text block for pages, usable as a `Block::View`.
+    /// usable as a `Block::View`.
     pub fn plain_block(render: impl Fn(&mut Shell, &crate::shell::Layout, &mut Window, &mut Context<Shell>) -> AnyElement + 'static) -> Block {
         Block::View(Rc::new(render))
     }
@@ -1136,4 +1305,16 @@ pub fn rule_list(t: &crate::theme::Theme, sentence: Option<SharedString>, headin
         .when_some(heading, |d, h| d.child(div().mb(t.s(4.0)).text_size(t.text(TEXT_XS)).text_color(t.t2()).child(h)))
         .children(lines.iter().enumerate().map(|(i, text)| line(text.clone(), i == 0)))
         .when_some(footnote, |d, f| d.child(div().mt(t.s(6.0)).pt(t.s(10.0)).border_t_1().border_color(t.line()).text_size(t.text(TEXT_XS)).line_height(relative(1.4)).text_color(t.t2()).child(f)))
+}
+
+fn menu_rule(t: &crate::theme::Theme) -> gpui::Div {
+    div().h(px(1.0)).mx(t.s(MENU_RULE_INSET)).my(t.s(MENU_RULE_GAP)).bg(t.line())
+}
+
+/// `size` in tokens.
+fn menu_icon(t: &crate::theme::Theme, glyph: MenuIcon, size: f32, color: gpui::Hsla) -> AnyElement {
+    match glyph {
+        MenuIcon::Named(name) => icon(t, name, size, color).into_any_element(),
+        MenuIcon::Downloaded => div().flex_none().size(t.s(size)).child(crate::ui::download_glyph(t, crate::ui::DownloadGlyph::Done, 1.0, size, color)).into_any_element(),
+    }
 }

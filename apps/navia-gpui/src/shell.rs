@@ -31,10 +31,10 @@ use crate::persist::{DockView, PlayerMode, Prefs};
 use crate::selection::Selection;
 use crate::testing::{self, FrameClock, Sample, ScriptAction};
 use crate::theme::size::*;
-use crate::theme::{BASE_SCALE, Theme};
+use crate::theme::{BASE_SCALE, Theme, motion};
 use crate::thumb_cache::ThumbCache;
 
-actions!(navia, [ZoomIn, ZoomOut, ZoomReset, Dismiss, FocusSearch, PlaySelected, OpenSettings, GetInfo]);
+actions!(navia, [ZoomIn, ZoomOut, ZoomReset, Dismiss, FocusSearch, PlaySelected, OpenSettings, GetInfo, ToggleMiniPlayer, CheckForUpdates, Quit]);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -94,8 +94,16 @@ impl SortKey {
 
 pub use crate::pages::Route;
 
-/// Whether the pointer is on the bar's speaker or its slider panel. Leaving both closes the
-/// panel after a moment, so the gap between them can be crossed.
+/// the bar's progress line rising after `BAR_SCRUB_DELAY`; `shown` is how far it's up this frame (0 to 1), eased.
+#[derive(Default)]
+pub struct BarRaise {
+    pub raised: bool,
+    pub over_block: bool,
+    pub generation: u64,
+    pub shown: f32,
+}
+
+/// the pointer is on the bar's speaker or its panel; leaving both closes the panel after a moment so the gap can be crossed.
 #[derive(Default)]
 pub struct BarVolumeHover {
     pub open: bool,
@@ -136,14 +144,15 @@ pub struct Player {
     /// The current song was queued by the listener. It leaves the queue once another plays, so a
     /// saved session keeps this.
     pub current_queued: bool,
-    /// How many songs at the end of the queue Autoplay handed the player that haven't started.
-    /// The queue view shows them under Autoplay, not Up Next.
+    /// songs at the queue's end that Autoplay handed the player and haven't started; shown under Autoplay, not Up Next.
     pub auto_tail: usize,
     /// What the queue plays from, for "Next from: <source>". `None` shows "Up Next".
     pub source: Option<navia_core::queue_order::QueueSource>,
     /// The AirPlay receiver's own volume while it's the output, 0 to 100 like `prefs.volume`. The
     /// slider shows and moves this instead, and `prefs.volume` stays for this computer's devices.
     pub device_volume: Option<f32>,
+    /// the output device's own rate while it's known (not through the Linux sound server)
+    pub device_rate: Option<u32>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -204,12 +213,28 @@ pub struct Layout {
     /// The sidebar's drawn width. The user's choice, within what the window leaves.
     pub sidebar_width: Pixels,
     pub main_width: Pixels,
+    /// `main_width` with the panels at rest, where a slide ends: grids lay out for it, so their cards and artwork
+    /// sizes change once rather than every frame of a slide.
+    pub settled_width: Pixels,
+    /// how far the sidebar, side player and bar are in (0 to 1), sliding over `PANEL_SLIDE`; while one slides out
+    /// it's still drawn.
+    pub sidebar_shown: f32,
+    /// the in-flow sidebar is on, or coming in; what moves between it and the top bar follows this rather than the slide.
+    pub sidebar_in: bool,
+    pub dock_shown: f32,
+    pub bar_shown: f32,
+    /// the room the in-flow sidebar and the side player take from the page, following their slides.
+    pub sidebar_room: Pixels,
+    pub dock_room: Pixels,
+    /// a panel is sliding, so the shell asks for frames.
+    pub panels_moving: bool,
 }
 
 impl Layout {
     pub fn clone_for_width(&self, width: Pixels) -> Self {
         let mut layout = self.clone();
         layout.main_width = width;
+        layout.settled_width = width;
         layout.embedded = true;
         layout
     }
@@ -245,7 +270,11 @@ pub struct Shell {
     pub artists: Arc<Vec<crate::model::Artist>>,
     pub playlists_full: Arc<Vec<crate::model::PlaylistDetails>>,
     pub new_playlist: Option<crate::view_new_playlist::NewPlaylist>,
-    /// AirPlay's dialogs, the lost receiver notice and script previews.
+    /// what a playlist being created gets once the server has made it (description, Public, its cover).
+    pub new_playlist_after: Option<crate::view_new_playlist::AfterCreate>,
+    /// the playlist whose first cover is uploading: its change needs no toast, and its file is removed after.
+    pub cover_upload: Option<crate::view_new_playlist::CoverUpload>,
+    /// AirPlay's dialogs, the lost receiver and script previews (`view_airplay.rs`).
     pub airplay_ui: crate::view_airplay::AirPlayUi,
     pub edit_playlist: Option<crate::view_edit_playlist::EditPlaylist>,
     pub public_pending: crate::view_edit_playlist::PublicPending,
@@ -267,7 +296,7 @@ pub struct Shell {
     pub autoplay_ready: bool,
     /// Autoplay has new seeds to ask the server about once the queue shows.
     pub autoplay_wants_fetch: bool,
-    /// Songs the server answered with no similar songs for, so Start Song Radio can hide.
+    /// songs the server answered with no similar songs for, so Song Radio can hide.
     pub no_song_radio: HashSet<SharedString>,
     /// The source of the next list played, set by whoever starts it, such as a radio. Otherwise the page's.
     pub play_source: Option<navia_core::queue_order::QueueSource>,
@@ -291,6 +320,10 @@ pub struct Shell {
     pub page_data: u64,
     pub shelf_counter: usize,
     pub page_numbers: Rc<Vec<Option<u32>>>,
+    /// for the page tint.
+    pub upcoming_cover: Option<SharedString>,
+    pub page_countdown: bool,
+    pub page_heat: crate::heat::PageHeat,
     pub page_mini_artist: bool,
     /// For You as last built, which its mix cards and the mix page read.
     pub for_you: std::sync::Arc<crate::model::ForYouPage>,
@@ -307,6 +340,8 @@ pub struct Shell {
     pub artists_view: crate::view_artists::ArtistsView,
     pub playlist_detail: crate::view_playlist::PlaylistDetail,
     pub search_query: String,
+    /// Settings' search field.
+    pub settings_query: String,
     pub search_view: crate::view_search::SearchView,
     pub menu: Option<crate::view_menu::MenuState>,
     /// Which account button opened the current menu, if any.
@@ -340,7 +375,9 @@ pub struct Shell {
     pub toast: Option<crate::view_menu::Toast>,
     pub toast_generation: u64,
     pub private_mode: bool,
-    /// Listening Now and following someone.
+    /// this account's offline switch, kept in `Prefs::offline_accounts`.
+    pub offline_switch: bool,
+    /// Listening Now and following someone (`listen_along.rs`).
     pub listen: crate::listen_along::ListenState,
     pub controls: crate::ui_controls::ControlState,
     pub eq: crate::eq_model::EqState,
@@ -363,12 +400,19 @@ pub struct Shell {
     bench_route: Option<Route>,
     pub history: Vec<Route>,
     pub history_pos: usize,
+    /// counts page changes, and which way the last one went (1 forward, -1 Back), for the page's entrance.
+    pub page_entry: (u64, f32),
+    /// songs just queued or added to a playlist, and when, so their rows light and fade back (`ROW_FLASH`).
+    pub row_flash: Option<(Rc<HashSet<u32>>, Instant)>,
+    /// when the open page's content arrived after the page was shown, so its blocks fade in one after another.
+    pub page_land: Option<Instant>,
     pub expanded: bool,
     pub sidebar_drawer: bool,
     pub selection: Selection,
     pub selection_list: ListId,
     pub player: Player,
     pub bar_volume: BarVolumeHover,
+    pub bar_raise: BarRaise,
     pub dragging: Option<Drag>,
     pub seek_bounds: Rc<RefCell<Bounds<Pixels>>>,
     pub volume_bounds: Rc<RefCell<Bounds<Pixels>>>,
@@ -386,6 +430,10 @@ pub struct Shell {
     pub tints: HashMap<SharedString, Srgb>,
     pub playlist_tints: crate::shell_data::PlaylistTints,
     pub lyrics: Vec<LyricLine>,
+    /// the current song's lines as the server sent them, for preparing again when the backing line switch changes.
+    pub lyrics_written: Vec<LyricLine>,
+    /// the names after "Written By:" at the end of the lyrics, when the server credits any.
+    pub lyrics_by: Option<SharedString>,
     pub lyrics_loading: bool,
     pub tint_requested: HashSet<SharedString>,
     /// The Songs page's filters.
@@ -400,8 +448,10 @@ pub struct Shell {
     pub lyrics_user_scrolled: bool,
     /// Something in the lyrics is still easing, so another frame is needed.
     pub lyrics_animating: bool,
+    /// the player's scrolling names, one view each (`marquee`).
+    pub marquees: crate::marquee::Marquees,
     pub queue_list: gpui::ListState,
-    pub(crate) queue_key: (usize, usize, usize, bool, bool),
+    pub(crate) queue_key: (usize, usize, usize, bool, bool, usize),
     pub(crate) lyrics_song: Option<SharedString>,
     pub expanded_bg: Option<(SharedString, u32, u32, Arc<RenderImage>)>,
     /// The expanded backdrop's brightness grid, for the text scrim.
@@ -425,6 +475,7 @@ pub struct Shell {
     pub sidebar_folded: [bool; 3],
     /// The soonest a visible thumbnail can be requested again, and whether a timer waits for it.
     pub next_thumb_retry: Option<Instant>,
+    pub anim: crate::anim_art::AnimCache,
     pub thumb_retry_pending: bool,
     pub sidebar_drag: Option<crate::sidebar_playlists::SidebarDrag>,
     pub sidebar_autoscrolling: bool,
@@ -446,8 +497,7 @@ pub struct Shell {
     pub recommended_list: Option<usize>,
     /// A playlist order shown while its save is in flight, by playlist.
     pub playlist_order_override: HashMap<SharedString, Vec<u32>>,
-    /// The sidebar and main column, drawn by views of their own so a frame that only animates
-    /// the lyrics doesn't rebuild them. See `slots.rs`.
+    /// the sidebar and main column as cached views (see `slots.rs`).
     pub slots: crate::slots::Slots,
     /// False while the system says the window isn't shown, such as minimized or on another desktop.
     /// A covered window still counts as shown on KWin and Windows. Visual-only work waits while
@@ -471,7 +521,9 @@ pub struct Shell {
     /// The desktop blurs behind windows, so Translucency defaults on and its hint follows. The
     /// switch works either way.
     pub blur_detected: bool,
-    /// The desktop can draw the title bar, so Navia's own frame is a choice in Settings.
+    /// the desktop's accent colour, followed live for the System accent choice.
+    pub system_accent: Option<u32>,
+    /// the desktop can draw the title bar (`xdg-decoration`), so Navia's own frame is a choice in Settings.
     pub system_frame_available: bool,
     /// The desktop has layer-shell, so the mini player is an overlay Navia moves.
     pub layer_shell_available: bool,
@@ -496,7 +548,10 @@ pub struct Shell {
     pending_scroll: Option<f32>,
     /// The tray icon, whose commands arrive on the shell's own task.
     pub tray: Option<crate::tray::AppTray>,
-    /// The Open at login setting, as the desktop has it.
+    #[cfg(target_os = "linux")]
+    pub app_menu: Option<crate::app_menu::AppMenu>,
+    pub app_menu_state: Option<crate::app_menu::MenuState>,
+    /// Settings > Open at login, as the desktop has it (`autostart.rs`).
     pub open_at_login: crate::autostart::OpenAtLogin,
     /// The last update check's outcome.
     pub update_status: crate::updates::UpdateStatus,
@@ -525,13 +580,20 @@ impl Shell {
             cx.notify();
         });
         // The window shadow is lighter when the window isn't active.
-        let activation_changed = cx.observe_window_activation(window, |_, _, cx| cx.notify());
+        let activation_changed = cx.observe_window_activation(window, |this, _, cx| {
+            this.marquees_refresh(cx);
+            cx.notify()
+        });
         let visibility_changed = cx.observe_window_visibility(window, |this, visibility, window, cx| this.window_visibility_changed(visibility.is_visible(), window, cx));
         self._window_subs = vec![button_layout_changed, activation_changed, visibility_changed];
         self.button_layout = chrome::current_layout(cx);
         window.focus(&self.focus, cx);
         crate::ui::note_backdrop_blur(window);
         self.main_window = Some(window.window_handle());
+        #[cfg(target_os = "linux")]
+        if let Some(menu) = &self.app_menu {
+            menu.attach(window);
+        }
         #[cfg(target_os = "windows")]
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -570,7 +632,10 @@ impl Shell {
 
     fn build(prefs: Prefs, support: chrome::Support, cx: &mut Context<Self>) -> Self {
         let blur_detected = support.blur;
-        let theme = Theme::new(prefs.accent, prefs.zoom as f32 / 100.0, prefs.translucent_on(blur_detected));
+        let system_accent = crate::system_accent::read();
+        Self::watch_system_accent(cx);
+        let accent = if prefs.accent_system { crate::color::system_accent(system_accent) } else { prefs.accent };
+        let theme = Theme::new(accent, prefs.zoom as f32 / 100.0, prefs.translucent_on(blur_detected));
         let button_layout = chrome::current_layout(cx);
         let focus = cx.focus_handle();
 
@@ -610,8 +675,17 @@ impl Shell {
         })
         .detach();
 
-        // Rows that depend on the local day, like Home's World of and For You's mixes, are rebuilt when
-        // the date changes while the app runs.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this.update(cx, |shell, cx| if shell.page_countdown { cx.notify() }).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+
+        // rows that change with the local day are rebuilt when the date changes while the app runs.
         cx.spawn(async move |this, cx| {
             use navia_core::library::taste::{local_day, now_unix};
             let mut day = local_day(now_unix());
@@ -631,6 +705,8 @@ impl Shell {
 
         let script = std::env::var("NAVIA_SCRIPT").ok().map(|s| testing::parse_script(&s)).unwrap_or_default();
         let tray = crate::tray_glue::start_tray(cx);
+        #[cfg(target_os = "linux")]
+        let app_menu = crate::tray_glue::start_app_menu(cx);
         let bench = std::env::var_os("NAVIA_SCROLL_BENCH").map(|_| Bench {
             phase: 0,
             phase_frame: 0,
@@ -668,6 +744,8 @@ impl Shell {
             artists: Arc::default(),
             playlists_full: Arc::default(),
             new_playlist: None,
+            new_playlist_after: None,
+            cover_upload: None,
             airplay_ui: Default::default(),
             edit_playlist: None,
             public_pending: Default::default(),
@@ -698,6 +776,9 @@ impl Shell {
             page_data: 0,
             shelf_counter: 0,
             page_numbers: Rc::default(),
+            upcoming_cover: None,
+            page_countdown: false,
+            page_heat: Default::default(),
             page_mini_artist: false,
             for_you: Default::default(),
             mix_sort: None,
@@ -711,6 +792,7 @@ impl Shell {
             artists_view: Default::default(),
             playlist_detail: Default::default(),
             search_query: String::new(),
+            settings_query: String::new(),
             search_view: Default::default(),
             menu: None,
             account_menu_open: None,
@@ -733,6 +815,7 @@ impl Shell {
             toast: None,
             toast_generation: 0,
             private_mode: prefs_private,
+            offline_switch: false,
             listen: Default::default(),
             controls: Default::default(),
             eq: crate::eq_model::EqState::load(),
@@ -751,12 +834,16 @@ impl Shell {
             bench_route: None,
             history: vec![Route::Home],
             history_pos: 0,
+            page_entry: (0, 1.0),
+            row_flash: None,
+            page_land: None,
             expanded: false,
             sidebar_drawer: false,
             selection: Selection::default(),
             selection_list: ListId::Songs,
             bar_volume: Default::default(),
-            player: Player { queue: Vec::new(), queue_pos: 0, song_ix: None, position: 42.0, playing: false, repeat: navia_core::audio::player::Repeat::Off, shuffle: false, current: None, status: navia_core::audio::player::PlayerStatus::Stopped, station: None, waiting_for_server: false, queued_run: 0, current_queued: false, auto_tail: 0, source: None, device_volume: None },
+            bar_raise: Default::default(),
+            player: Player { queue: Vec::new(), queue_pos: 0, song_ix: None, position: 42.0, playing: false, repeat: navia_core::audio::player::Repeat::Off, shuffle: false, current: None, status: navia_core::audio::player::PlayerStatus::Stopped, station: None, waiting_for_server: false, queued_run: 0, current_queued: false, auto_tail: 0, source: None, device_volume: None, device_rate: None },
             dragging: None,
             seek_bounds: Rc::new(RefCell::new(Bounds::default())),
             volume_bounds: Rc::new(RefCell::new(Bounds::default())),
@@ -772,6 +859,8 @@ impl Shell {
             tints: HashMap::new(),
             playlist_tints: Default::default(),
             lyrics: Vec::new(),
+            lyrics_written: Vec::new(),
+            lyrics_by: None,
             lyrics_loading: false,
             tint_requested: HashSet::new(),
             song_filters: Default::default(),
@@ -781,8 +870,9 @@ impl Shell {
             lyric_raster,
             lyrics_user_scrolled: false,
             lyrics_animating: false,
+            marquees: Default::default(),
             queue_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(240.0)),
-            queue_key: (usize::MAX, usize::MAX, usize::MAX, false, false),
+            queue_key: (usize::MAX, usize::MAX, usize::MAX, false, false, 0),
             lyrics_song: None,
             expanded_bg: None,
             expanded_peaks: None,
@@ -801,6 +891,7 @@ impl Shell {
             sidebar_shared: Vec::new(),
             sidebar_folded: [false; 3],
             next_thumb_retry: None,
+            anim: Default::default(),
             thumb_retry_pending: false,
             sidebar_drag: None,
             sidebar_autoscrolling: false,
@@ -827,6 +918,7 @@ impl Shell {
             bench,
             csd: false,
             blur_detected,
+            system_accent,
             system_frame_available: support.system_frame,
             layer_shell_available: support.layer_shell,
             main_window: None,
@@ -846,6 +938,9 @@ impl Shell {
             update_status: crate::updates::UpdateStatus::Idle,
             closed_size: None,
             tray_host: (true, None),
+            #[cfg(target_os = "linux")]
+            app_menu,
+            app_menu_state: None,
             script_attached: false,
         }
     }
@@ -853,7 +948,7 @@ impl Shell {
     pub fn on_library(&mut self, library: Arc<dyn Library>, core: Option<Arc<CoreLibrary>>, cx: &mut Context<Self>) {
         let tx = self.art_events.clone();
         if let Some(core) = core {
-            self.art = ArtWorkers::start(library.clone(), tx);
+            self.art = self.art.replace_with(library.clone(), tx);
             self.load_catalog(&library);
             // From the local database, so the sidebar is complete even with the server down.
             self.playlists = library.playlists();
@@ -866,8 +961,8 @@ impl Shell {
             cx.notify();
             return;
         }
-        // Art workers started before the library existed, so restart them with the real one.
-        self.art = ArtWorkers::start(library.clone(), tx);
+        // Art workers were started before the library existed; restart them with the real one.
+        self.art = self.art.replace_with(library.clone(), tx);
         self.songs = library.songs();
         self.total = self.songs.len();
         let songs = self.songs.clone();
@@ -957,7 +1052,7 @@ impl Shell {
         self.history_pos = 0;
         self.expanded = false;
         self.selection = Selection::default();
-        self.player = Player { queue: Vec::new(), queue_pos: 0, song_ix: None, position: 42.0, playing: false, repeat: navia_core::audio::player::Repeat::Off, shuffle: false, current: None, status: navia_core::audio::player::PlayerStatus::Stopped, station: None, waiting_for_server: false, queued_run: 0, current_queued: false, auto_tail: 0, source: None, device_volume: None };
+        self.player = Player { queue: Vec::new(), queue_pos: 0, song_ix: None, position: 42.0, playing: false, repeat: navia_core::audio::player::Repeat::Off, shuffle: false, current: None, status: navia_core::audio::player::PlayerStatus::Stopped, station: None, waiting_for_server: false, queued_run: 0, current_queued: false, auto_tail: 0, source: None, device_volume: None, device_rate: None };
         self.dock_bake = None;
         self.dock_requested = None;
         self.expanded_bg = None;
@@ -969,11 +1064,12 @@ impl Shell {
         self.playlist_tints = Default::default();
         self.tint_requested.clear();
         self.lyrics.clear();
+        self.lyrics_by = None;
         self.lyrics_song = None;
         self.lyrics_loading = false;
         self.song_filters = Default::default();
         self.artist_filters = Default::default();
-        self.queue_key = (usize::MAX, usize::MAX, usize::MAX, false, false);
+        self.queue_key = (usize::MAX, usize::MAX, usize::MAX, false, false, 0);
         self.downloads_view = Default::default();
         self.prefs.save();
         cx.notify();
@@ -1037,12 +1133,12 @@ impl Shell {
 
     /// Whether the server can't be reached, from whichever side noticed first.
     pub fn is_offline(&self) -> bool {
-        self.player.waiting_for_server || self.core.as_ref().is_some_and(|c| c.connected == Some(false))
+        self.player.waiting_for_server || self.core.as_ref().is_some_and(|c| c.connected == Some(false) || self.offline_switch)
     }
 
     /// How opaque a song row's content is. Dimmed offline when it needs the server to play.
     pub fn offline_row_opacity(&self, ix: u32) -> f32 {
-        if self.is_offline() && !self.plays_offline(ix) { 0.4 } else { 1.0 }
+        if self.is_offline() && !self.plays_offline(ix) { crate::theme::size::ROW_UNAVAILABLE_OPACITY } else { 1.0 }
     }
 
     /// Keeps the selection within one list.
@@ -1105,7 +1201,11 @@ impl Shell {
         self.select_in(ListId::Songs);
         self.selection.prepare_context(order_ix, &self.order);
         let selected: Vec<u32> = self.order.iter().copied().filter(|s| self.selection.contains(*s)).collect();
-        self.open_song_menu(selected, position, false, cx);
+        let play = match selected[..] {
+            [_] => Self::play_row_item(move |this, cx| this.play_row(order_ix, cx)),
+            _ => Self::play_songs_row(&selected),
+        };
+        self.open_song_menu(selected, Some(play), position, false, cx);
     }
 
     pub fn next(&mut self, cx: &mut Context<Self>) {
@@ -1154,15 +1254,18 @@ impl Shell {
         if self.lyrics_song.as_ref() != Some(&song.id) {
             self.lyrics_song = Some(song.id.clone());
             self.lyrics.clear();
-            self.lyrics_loading = true;
+            self.lyrics_by = None;
+            self.lyrics_loading = self.library.is_some();
             if let Some(library) = self.library.clone() {
                 let id = song.id.clone();
                 cx.spawn(async move |this, cx| {
                     let song_id = id.clone();
-                    let lines = cx.background_spawn(async move { library.lyrics(&id) }).await;
+                    let (lines, writers) = cx.background_spawn(async move { (library.lyrics(&id), library.lyrics_writers(&id)) }).await;
                     this.update(cx, |shell, cx| {
                         shell.on_lyrics_loaded(&song_id, !lines.is_empty());
-                        shell.lyrics = lines;
+                        shell.lyrics_by = (!writers.is_empty()).then(|| writers.join(", ").into());
+                        shell.lyrics_written = lines.clone();
+                        shell.lyrics = crate::lyrics::prepare(lines, shell.prefs.backing_vocals_line);
                         shell.lyrics_loading = false;
                         cx.notify();
                     })
@@ -1205,6 +1308,15 @@ impl Shell {
                 entry.retry_at = None;
                 entry.loading = true;
                 retrying = true;
+            } else if entry.expires_at.is_some_and(|at| Instant::now() >= at) && !entry.loading {
+                // a placeholder that expired: keep showing it while the server is asked again.
+                entry.expires_at = None;
+                entry.loading = true;
+                let shown = entry.image.clone();
+                if let Some(Job::Thumb { album_id, size }) = self.art.request(Job::Thumb { album_id: album_id.clone(), size }) {
+                    self.thumbs.remove(&(album_id, size));
+                }
+                return shown;
             } else {
                 return entry.image.clone();
             }
@@ -1240,8 +1352,8 @@ impl Shell {
 
     fn apply_art_event(&mut self, event: ArtEvent, cx: &mut Context<Self>) {
         match event {
-            ArtEvent::Thumb { album_id, size, image } => {
-                self.thumbs.set_image(&(album_id, size), image);
+            ArtEvent::Thumb { album_id, size, image, placeholder } => {
+                self.thumbs.set_image(&(album_id, size), image, placeholder);
             }
             ArtEvent::Dock { album_id, bake } => {
                 self.dock_bake = Some((album_id, bake));
@@ -1319,7 +1431,7 @@ impl Shell {
         }
         if layout.mode == PlayerMode::Bar && !self.expanded {
             let t = self.theme;
-            let gw = (f32::from(layout.main_width) * layout.scale) as u32;
+            let gw = (f32::from(layout.main_width + layout.dock_room) * layout.scale) as u32;
             let gh = (f32::from(t.s(150.0)) * layout.scale) as u32;
             let want = (song.album_id.clone(), gw.max(1), gh.max(1));
             let have = self.bar_glow.as_ref().map(|(a, w, h, _)| (a.clone(), *w, *h));
@@ -1350,22 +1462,24 @@ impl Shell {
         let can_dock = tokens_w >= DOCK_MIN_WINDOW;
         let sidebar_fits = tokens_w >= SIDEBAR_MIN_WINDOW;
         let mode = if self.prefs.mode == PlayerMode::Dock && !can_dock { PlayerMode::Bar } else { self.prefs.mode };
-        let sidebar_visible = if sidebar_fits { self.prefs.sidebar_open } else { self.sidebar_drawer };
         let sidebar_overlay = !sidebar_fits;
-        let docked = mode == PlayerMode::Dock && self.player.song_ix.is_some();
+        let player = self.player.song_ix.is_some();
+        let docked = mode == PlayerMode::Dock && player;
         let sidebar_tokens = self.sidebar_tokens(tokens_w, docked);
         let sidebar_w = t.s(sidebar_tokens);
-        let in_flow = sidebar_visible && !sidebar_overlay;
+        let in_flow = sidebar_fits && self.prefs.sidebar_open;
         let dock_w = t.s(self.prefs.dock_width.clamp(DOCK_MIN_W, self.dock_max_tokens(tokens_w, if in_flow { Some(sidebar_tokens) } else { None })));
         let inset = t.s(WINDOW_INSET);
-        let mut main_w = viewport.width;
-        if sidebar_visible && !sidebar_overlay {
-            main_w -= sidebar_w + inset;
-        }
-        let player = self.player.song_ix.is_some();
-        if mode == PlayerMode::Dock && player {
-            main_w -= dock_w + inset;
-        }
+        let slide = |key: &'static str, on: bool| crate::ui::eased(key, on, motion::PANEL_SLIDE, motion::EASE);
+        let (sidebar_shown, sidebar_moving) = slide("panel-sidebar", in_flow);
+        // by mode alone, so a player appearing (a session restored at launch) is just there.
+        let (dock_shown, dock_moving) = slide("panel-dock", mode == PlayerMode::Dock);
+        let (bar_shown, bar_moving) = slide("panel-bar", mode == PlayerMode::Bar);
+        let sidebar_visible = if sidebar_fits { sidebar_shown > 0.0 } else { self.sidebar_drawer };
+        let sidebar_room = if sidebar_fits { (sidebar_w + inset) * sidebar_shown } else { px(0.0) };
+        let dock_room = if player { (dock_w + inset) * dock_shown } else { px(0.0) };
+        let main_w = viewport.width - sidebar_room - dock_room;
+        let settled_w = viewport.width - if in_flow { sidebar_w + inset } else { px(0.0) } - if docked { dock_w + inset } else { px(0.0) };
         Layout {
             viewport,
             scale,
@@ -1378,6 +1492,14 @@ impl Shell {
             dock_width: dock_w,
             sidebar_width: sidebar_w,
             main_width: main_w,
+            settled_width: settled_w,
+            sidebar_shown: if sidebar_fits { sidebar_shown } else { 0.0 },
+            sidebar_in: in_flow,
+            dock_shown: if player { dock_shown } else { 0.0 },
+            bar_shown: if player { bar_shown } else { 0.0 },
+            sidebar_room,
+            dock_room,
+            panels_moving: sidebar_moving || (player && (dock_moving || bar_moving)),
         }
     }
 
@@ -1433,8 +1555,7 @@ impl Shell {
     /// dock doesn't jump when the pointer passes the limit and comes back.
     pub fn set_dock_width(&mut self, tokens: f32, viewport: gpui::Size<Pixels>, scale: f32, cx: &mut Context<Self>) {
         let layout = self.layout(viewport, scale);
-        let in_flow = layout.sidebar_visible && !layout.sidebar_overlay;
-        let sidebar = in_flow.then(|| f32::from(layout.sidebar_width) / self.theme.token_scale());
+        let sidebar = layout.sidebar_in.then(|| f32::from(layout.sidebar_width) / self.theme.token_scale());
         self.prefs.dock_width = tokens.clamp(DOCK_MIN_W, self.dock_max_tokens(layout.tokens_w, sidebar));
         cx.notify();
     }
@@ -1504,7 +1625,12 @@ impl Shell {
 
     /// A song without lyrics shows artwork without changing the saved view.
     pub fn shown_view(&self) -> DockView {
-        if self.prefs.view == DockView::Lyrics && !self.current_song().is_some_and(|s| s.has_lyrics) { DockView::Artwork } else { self.prefs.view }
+        if self.prefs.view == DockView::Lyrics && !self.may_have_lyrics() { DockView::Artwork } else { self.prefs.view }
+    }
+
+    /// the current song has lyrics, or they're still loading: Lyrics stays put until it's known there are none.
+    pub fn may_have_lyrics(&self) -> bool {
+        self.current_song().is_some_and(|s| s.has_lyrics || (self.lyrics_loading && self.lyrics_song.as_ref() == Some(&s.id)))
     }
 
     pub fn set_zoom(&mut self, zoom: u32, cx: &mut Context<Self>) {
@@ -1537,7 +1663,33 @@ impl Shell {
     }
 
     pub fn refresh_theme(&mut self) {
-        self.theme = Theme::new(self.prefs.accent, self.prefs.zoom as f32 / 100.0, self.translucent());
+        self.theme = Theme::new(self.accent_now(), self.prefs.zoom as f32 / 100.0, self.translucent());
+    }
+
+    /// the chosen accent, or the preset closest to the desktop's while System is chosen.
+    pub fn accent_now(&self) -> u32 {
+        if self.prefs.accent_system { crate::color::system_accent(self.system_accent) } else { self.prefs.accent }
+    }
+
+    fn watch_system_accent(cx: &mut Context<Self>) {
+        use futures::StreamExt;
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        crate::system_accent::watch(tx);
+        cx.spawn(async move |this, cx| {
+            while let Some(accent) = rx.next().await {
+                let changed = this.update(cx, |shell, cx| {
+                    if shell.system_accent != accent {
+                        shell.system_accent = accent;
+                        shell.refresh_theme();
+                        cx.notify();
+                    }
+                });
+                if changed.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Whether the window is translucent now, from the choice or else the desktop's blur.
@@ -1579,19 +1731,29 @@ impl Shell {
                 }
                 ScriptAction::DockReset => self.reset_dock_width(cx),
                 ScriptAction::Hidden(hidden) => self.window_visibility_changed(!hidden, window, cx),
+                ScriptAction::Reduce(on) => crate::theme::motion::set_reduced(cx, on),
                 ScriptAction::DockDrag(true) => self.dragging = Some(Drag::DockWidth { grab_offset: px(0.0) }),
                 ScriptAction::DockDrag(false) => self.end_drag(cx),
                 ScriptAction::Report => {
                     let layout = self.layout(self.edge.content_size(window.viewport_size()), window.scale_factor());
+                    let (page, _) = crate::ui::swap("page-entry", &self.page_entry.0, motion::PAGE_FADE);
                     eprintln!(
-                        "navia: report window={:.0} tokens_w={:.0} mode={:?} saved_dock={:.1} dock={:.1} main={:.1} bakes={}",
+                        "navia: report land={:?} blocks={} page={:.3}:{} {:.0} ms window={:.0} tokens_w={:.0} mode={:?} saved_dock={:.1} dock={:.1} main={:.1} bakes={} shown sidebar={:.3} dock={:.3} bar={:.3}",
+                        self.page_land.map(|t| t.elapsed().as_millis()),
+                        self.page.blocks.len(),
+                        page.shown,
+                        self.page_entry.1,
+                        crate::testing::since_start_ms(),
                         f32::from(layout.viewport.width),
                         layout.tokens_w,
                         layout.mode,
                         self.prefs.dock_width,
                         f32::from(layout.dock_width) / self.theme.token_scale(),
                         f32::from(layout.main_width) / self.theme.token_scale(),
-                        self.dock_bake_requests
+                        self.dock_bake_requests,
+                        layout.sidebar_shown,
+                        layout.dock_shown,
+                        layout.bar_shown
                     );
                 }
                 ScriptAction::Maximize => window.zoom_window(),
@@ -1615,7 +1777,26 @@ impl Shell {
                 ScriptAction::Toggle("view-lyrics") => self.set_view(DockView::Lyrics, cx),
                 ScriptAction::Toggle("view-queue") => self.set_view(DockView::Queue, cx),
                 ScriptAction::Toggle("view-artwork") => self.set_view(DockView::Artwork, cx),
+                ScriptAction::Toggle("quality") => self.pin_quality_popover(cx),
+                ScriptAction::Toggle("account") => self.open_account_menu(crate::view_account::AccountPlace::TopBar, cx),
+                ScriptAction::Toggle("refresh") => {
+                    let started = self.core.as_ref().is_some_and(|c| c.lib.refresh_now());
+                    eprintln!("navia: refresh asked, started={started}");
+                }
                 ScriptAction::Toggle(_) => {}
+                ScriptAction::Back => self.go_back(cx),
+                ScriptAction::Like => {
+                    if let Some(song) = self.player.song_ix {
+                        if !self.is_starred(song as u32) {
+                            crate::ui::pop("meta-star");
+                        }
+                        self.toggle_song_star(song as u32, cx);
+                    }
+                }
+                ScriptAction::AddQueue(n) => {
+                    let songs: Vec<u32> = self.order.iter().take(n).copied().collect();
+                    self.add_to_queue(&songs, cx);
+                }
                 ScriptAction::Route(name) => {
                     let r = self.script_route(&name);
                     self.navigate(r, cx);
@@ -1705,8 +1886,9 @@ impl Shell {
         self.frame < 180
     }
 
-    fn evict_thumbs(&mut self, window: &mut Window) {
+    fn evict_thumbs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.thumbs.evict(self.frame, window);
+        self.evict_moving_covers(window, cx);
     }
 }
 
@@ -1717,7 +1899,8 @@ impl Render for Shell {
         crate::testing::frame_begin();
         self.sync_meter_last.set(self.sync_meter_now.replace(false));
         self.advance_bench(window, cx);
-        // A lifted row scrolls near the list's edges and finds the gap from the last layout.
+        self.app_menu_sync(cx);
+        // A lifted row: scroll near the list's edges and find the gap from the last layout.
         self.row_drag_frame();
         if let Some(y) = self.pending_scroll.take() {
             // Block pages scroll their list, and the song table scrolls itself.
@@ -1770,9 +1953,8 @@ impl Render for Shell {
             self.frame += 1;
         }
         self.ensure_backdrops(&layout, cx);
-        self.evict_thumbs(window);
+        self.evict_thumbs(window, cx);
         self.drop_lyric_garbage(window);
-        self.lyrics_animating = false;
         self.scrollbar_animating = false;
         self.thumbs_fading = false;
         focus::begin_frame(self.frame, self.confirm.is_some() || self.new_playlist.is_some() || self.airplay_dialog_open() || self.info.is_some() || self.about.is_some() || self.shares.dialog.is_some(), cx);
@@ -1791,11 +1973,18 @@ impl Render for Shell {
             .text_size(t.text(TEXT_MD))
             .line_height(relative(1.35))
             .track_focus(&self.focus)
+            .child(crate::ui::hover_clears_on_leave())
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.set_zoom(this.prefs.zoom + 5, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.set_zoom(this.prefs.zoom.saturating_sub(5), cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.set_zoom(100, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &GetInfo, _, cx| this.info_shortcut(cx)))
+            .on_action(cx.listener(|this, _: &ToggleMiniPlayer, _, cx| this.toggle_mini_player(cx)))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| {
+                this.open_settings(cx);
+                this.check_for_updates(cx);
+            }))
+            .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| this.dismiss_top(cx)))
             .on_action(cx.listener(|this, _: &PlaySelected, window, cx| {
                 // A control reached by keyboard handles Enter itself, as a click.
@@ -1827,7 +2016,9 @@ impl Render for Shell {
         // The expanded player covers the window, so what's under it isn't built. It can't take the
         // keyboard or show focus rings, and each frame does less.
         let signing_in = self.connect.is_some();
-        let covered = (self.expanded && layout.player) || signing_in;
+        // the expanded player comes in from the player's side and goes back there; what's under it is built until covered.
+        let (entered, enter_ticker) = crate::ui::ease_to("player-enter", self.expanded && layout.player, motion::PLAYER_ENTER, motion::HOVER_EASE);
+        let covered = (self.expanded && layout.player && entered >= 1.0) || signing_in;
         if !covered {
             root = root.child(self.render_page_backdrop(&layout, cx));
             if self.csd {
@@ -1840,17 +2031,24 @@ impl Render for Shell {
             // blur runs.
             let sidebar = (layout.sidebar_visible && !layout.sidebar_overlay).then(|| self.slots.sidebar_view());
             focus::set_section(focus::SECTION_PAGE);
-            root = root.child(self.slots.main_view(self.main_column_margin(&layout)));
-            if layout.mode == PlayerMode::Dock && layout.player {
+            root = root.child(self.slots.main_view(self.main_column_margin(&layout), layout.dock_room));
+            if layout.player {
+                // the player's own slot over the page and the dock's room, then its scrolling names over it.
+                let style = gpui::StyleRefinement::default().absolute().top_0().bottom_0().right_0().left(self.main_column_margin(&layout));
+                root = root.child(self.slots.player_view(style)).children(self.marquee_overlays(crate::marquee::Host::Player));
+            }
+            if layout.dock_shown >= 1.0 {
                 focus::set_section(focus::SECTION_DOCK);
-                root = root.child(self.render_dock(&layout, cx));
                 root = root.child(self.render_dock_grab(&layout, cx));
             }
             root = root.children(sidebar);
-            if layout.sidebar_visible && !layout.sidebar_overlay {
+            if layout.sidebar_shown >= 1.0 && !layout.sidebar_overlay {
                 root = root.child(self.render_sidebar_grab(&layout, cx));
             }
-            // Rows in lists are built after this, so they belong to the page section.
+            if layout.panels_moving {
+                root = root.child(crate::animation::ticker(["panel-sidebar", "panel-dock", "panel-bar"]));
+            }
+            // Rows in lists are built after this, so they count as the page.
             focus::set_section(focus::SECTION_PAGE);
             if layout.sidebar_visible && layout.sidebar_overlay {
                 root = root.child(self.render_sidebar_overlay(&layout, cx));
@@ -1859,8 +2057,12 @@ impl Render for Shell {
         if signing_in {
             focus::set_section(focus::SECTION_PAGE);
             root = root.child(self.render_connect(&layout, cx));
-        } else if self.expanded && layout.player {
-            root = root.child(self.render_expanded(&layout, cx));
+        } else if layout.player && (self.expanded || entered > 0.0) {
+            let away = 1.0 - entered;
+            let snap = |v: Pixels| px((f32::from(v) * away * layout.scale).round() / layout.scale);
+            let from = if layout.mode == PlayerMode::Dock { point(snap(layout.viewport.width), px(0.0)) } else { point(px(0.0), snap(layout.viewport.height)) };
+            self.marquees_follow_offset(from, cx);
+            root = root.child(div().absolute().inset_0().paint_offset(from).child(enter_ticker).child(self.slots.expanded_view()).children(self.marquee_overlays(crate::marquee::Host::Expanded)));
         }
         if let Some(confirm) = self.render_confirm(cx) {
             root = root.child(confirm);
@@ -1881,7 +2083,7 @@ impl Render for Shell {
         if let Some(sheet) = self.render_info(&layout, window, cx) {
             root = root.child(sheet);
         }
-        if let Some(sheet) = self.render_artist_about(&layout, window, cx) {
+        if let Some(sheet) = self.render_about(&layout, window, cx) {
             root = root.child(sheet);
         }
         if let Some(toast) = self.render_toast(&layout, cx) {
@@ -1955,10 +2157,8 @@ impl Render for Shell {
         // The lyrics only need the shell's own elements redrawn.
         if self.window_shown && (self.scrollbar_animating || self.thumbs_fading || self.sidebar_autoscrolling || self.rows_autoscrolling) {
             window.request_animation_frame();
-        } else if self.window_shown && self.lyrics_animating {
-            self.slots.tick(window);
         }
-        window_root.child(self.slots.ticker_view()).child(self.press_watcher(cx)).child(
+        window_root.child(self.press_watcher(cx)).child(
             canvas(|_, _, _| {}, {
                 let clock = self.clock.clone();
                 let this = self.this.clone();
@@ -1997,6 +2197,9 @@ impl Shell {
             return;
         }
         self.window_shown = shown;
+        if let Some(handle) = self.main_window {
+            crate::animation::set_window_shown(handle.window_id(), shown);
+        }
         self.mini_main_shown(shown, cx);
         self.mini_on_minimize(shown, cx);
         if std::env::var_os("NAVIA_FRAME_LOG").is_some() {
@@ -2044,15 +2247,13 @@ impl Shell {
             cx.notify();
             return;
         }
-        if self.close_info(cx) || self.close_artist_about(cx) {
+        if self.close_info(cx) || self.close_about(cx) {
             return;
         }
         if self.connect.is_some() {
             return;
         }
-        if self.new_playlist.take().is_some() {
-            self.controls.text = None;
-            cx.notify();
+        if self.close_new_playlist(cx) {
             return;
         }
         if self.close_airplay_dialog(cx) {
@@ -2091,6 +2292,9 @@ impl Shell {
         // Delete or Backspace takes selected songs out of the queue's Autoplay section.
         let key = event.keystroke.key.as_str();
         if (key == "delete" || key == "backspace") && self.confirm.is_none() && self.focused_target().is_none() && ((self.selection_list == ListId::Queue && self.queue_remove_selected(cx)) || (self.selection_list == ListId::Cached && self.cached_remove_selected(cx))) {
+            return;
+        }
+        if self.focused_target().is_none() && self.cover_row_key(key, cx) {
             return;
         }
         if self.confirm.is_none() && self.controls_key(event, cx) {
@@ -2313,7 +2517,45 @@ impl Shell {
         cx.notify();
     }
 
-    /// Tracks hover over the bar's volume. `panel` says which of the two areas the pointer entered or left.
+    /// the pointer on the bar's line (or just above it): it raises after `BAR_SCRUB_DELAY`, unless it moves on.
+    pub fn bar_line_hover(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.bar_raise.generation += 1;
+        if !on || self.bar_raise.raised {
+            return;
+        }
+        let generation = self.bar_raise.generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs_f32(crate::theme::motion::BAR_SCRUB_DELAY)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.bar_raise.generation == generation && this.bar_raise.over_block {
+                    this.bar_raise.raised = true;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// the pointer over the bar's now-playing block: once it leaves, the line comes down after `REVEAL_GRACE`.
+    pub fn bar_block_hover(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.bar_raise.over_block = on;
+        if on {
+            return;
+        }
+        self.bar_raise.generation += 1;
+        let generation = self.bar_raise.generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs_f32(crate::theme::motion::REVEAL_GRACE)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.bar_raise.generation == generation && this.bar_raise.raised && !matches!(this.dragging, Some(Drag::Seek)) {
+                    this.bar_raise.raised = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn bar_volume_hover(&mut self, panel: bool, on: bool, cx: &mut Context<Self>) {
         // Dragging the slider keeps the panel open even if the pointer strays off it.
         if !on && matches!(self.dragging, Some(Drag::Volume)) {
@@ -2405,7 +2647,7 @@ impl Shell {
                 let tokens = f32::from(position.x - self.edge.left - grab_offset - left) / self.theme.token_scale();
                 self.set_sidebar_width(tokens, viewport, window.scale_factor(), cx);
             }
-            Some(Drag::Scroll { id, grab }) => self.scrollbar_drag(id, grab, position, window, cx),
+            Some(Drag::Scroll { id, grab }) => self.scrollbar_drag(id, grab, position, cx),
             _ => self.on_drag_move(position, cx),
         }
     }
@@ -2427,48 +2669,9 @@ fn frame_shadow(frame: chrome::Frame, surface: gpui::Size<Pixels>, active: bool)
     let (w, h) = (f32::from(surface.width), f32::from(surface.height));
     let (top, right, bottom, left) = (f32::from(frame.top), f32::from(frame.right), f32::from(frame.bottom), f32::from(frame.left));
     let alpha = if active { FRAME_SHADOW_ALPHA } else { FRAME_SHADOW_ALPHA_INACTIVE };
-    let shadow_rect = |clip_x: f32, clip_y: f32, clip_w: f32, clip_h: f32| -> AnyElement {
-        let body = chrome::round_corners(
-            // GPUI drops a shadow whose element doesn't touch the clip, so the caster pokes 1px past the window.
-            div().absolute().left(px(left - clip_x - 1.0)).top(px(top - clip_y - 1.0)).w(px(w - left - right + 2.0)).h(px(h - top - bottom + 2.0)),
-            frame.corners,
-        )
-        .shadow(vec![gpui::BoxShadow { color: gpui::black().opacity(alpha), offset: point(px(0.0), px(0.0)), blur_radius: px(FRAME_SHADOW_BLUR), spread_radius: px(0.0), inset: false }]);
-        div().absolute().left(px(clip_x)).top(px(clip_y)).w(px(clip_w)).h(px(clip_h)).overflow_hidden().child(body).into_any_element()
-    };
-    let mut layer = div().absolute().inset_0();
-    if top > 0.0 {
-        layer = layer.child(shadow_rect(0.0, 0.0, w, top));
-    }
-    if bottom > 0.0 {
-        layer = layer.child(shadow_rect(0.0, h - bottom, w, bottom));
-    }
-    let band_h = h - top - bottom;
-    if left > 0.0 {
-        layer = layer.child(shadow_rect(0.0, top, left, band_h));
-    }
-    if right > 0.0 {
-        layer = layer.child(shadow_rect(w - right, top, right, band_h));
-    }
-    let (tl, tr, bl, br) = (f32::from(frame.corners.top_left), f32::from(frame.corners.top_right), f32::from(frame.corners.bottom_left), f32::from(frame.corners.bottom_right));
-    let (inner_right, inner_bottom) = (w - right, h - bottom);
-    layer = layer.children(corner_rows(tl, |row, reach| shadow_rect(left, top + row, reach, 1.0)));
-    layer = layer.children(corner_rows(tr, |row, reach| shadow_rect(inner_right - reach, top + row, reach, 1.0)));
-    layer = layer.children(corner_rows(bl, |row, reach| shadow_rect(left, inner_bottom - 1.0 - row, reach, 1.0)));
-    layer = layer.children(corner_rows(br, |row, reach| shadow_rect(inner_right - reach, inner_bottom - 1.0 - row, reach, 1.0)));
-    layer.into_any_element()
-}
-
-/// A rounded corner's pixel rows, each clipped just past its arc, so the shadow paints only outside
-/// the window's shape. `place` gets the row and how far it reaches in.
-fn corner_rows(radius: f32, mut place: impl FnMut(f32, f32) -> AnyElement) -> Vec<AnyElement> {
-    (0..radius.ceil() as u32)
-        .filter_map(|row| {
-            let d = radius - (row as f32 + 0.5);
-            let reach = (radius - (radius * radius - d * d).max(0.0).sqrt()).ceil();
-            (reach > 0.0).then(|| place(row as f32, reach))
-        })
-        .collect()
+    chrome::round_corners(div().absolute().left(px(left)).top(px(top)).w(px(w - left - right)).h(px(h - top - bottom)), frame.corners)
+        .shadow(vec![gpui::BoxShadow { color: gpui::black().opacity(alpha), offset: point(px(0.0), px(0.0)), blur_radius: px(FRAME_SHADOW_BLUR), spread_radius: px(0.0), inset: false }])
+        .into_any_element()
 }
 
 /// Invisible grips along the window edge. They reach FRAME_GRIP_OUTSIDE over the shadow margin and

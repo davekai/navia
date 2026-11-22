@@ -1,5 +1,6 @@
 //! Downloads: what's on this device, with real file sizes, per-song remove and Clear All.
 
+use crate::ui::FullTextTip;
 use crate::i18n::{tr, trf, trn};
 use std::rc::Rc;
 
@@ -29,7 +30,7 @@ pub struct DownloadEntry {
     single: bool,
 }
 
-/// What a list page's song row shows ([`Shell::list_song_row`]).
+/// see [`Shell::list_song_row`].
 #[derive(Clone)]
 pub struct ListSong {
     pub rowid: Option<u32>,
@@ -40,7 +41,6 @@ pub struct ListSong {
     pub size: u64,
 }
 
-/// The click on a list song row's title that plays it.
 pub type NameClick = Box<dyn Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App)>;
 
 #[derive(Default)]
@@ -204,12 +204,12 @@ impl Shell {
             .when(main_tokens <= 620.0, |d| d.flex_1())
             .when(main_tokens > 620.0, |d| d.flex_grow(2.0).flex_basis(gpui::relative(0.0)))
             .line_height(gpui::relative(1.3))
-            .child(div().font_weight(FontWeight::MEDIUM).truncate().child(name.clone()))
-            .child(div().text_size(t.text(TEXT_SM)).text_color(t.t2()).truncate().child(sub))
+            .child(div().id("name").font_weight(FontWeight::MEDIUM).truncate().child(name.clone()).full_text_tip(&t, name.clone()))
+            .child(div().id("sub").text_size(t.text(TEXT_SM)).text_color(t.t2()).truncate().child(sub.clone()).full_text_tip(&t, sub))
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| this.navigate(open.clone(), cx)));
         let (kind, id) = (row.kind, row.id.clone());
-        let remove = crate::ui::ink_button(&t, ("collection-remove", ix), "x-regular", 17.0, t.t2().into(), t.hover_ink())
+        let remove = crate::ui::ink_button(&t, ("collection-remove", ix), tr("Remove Download"), "x-regular", 17.0, t.t2().into(), t.hover_ink())
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_collection_download(kind, id.clone(), name.clone(), cx)));
         let line = div()
@@ -260,7 +260,7 @@ impl Shell {
         let song = ListSong { rowid: entry.rowid, title: entry.title.clone(), artist: entry.artist.clone(), album: entry.album.clone(), album_id: entry.album_id.clone(), size: entry.size };
         let play: Option<NameClick> = entry.rowid.is_some().then(|| Box::new(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| this.play_download(ix, cx))) as NameClick);
         let id = entry.id.clone();
-        let remove = crate::ui::ink_button(&t, "remove", "x-regular", 17.0, t.t2().into(), t.hover_ink())
+        let remove = crate::ui::ink_button(&t, "remove", tr("Remove Download"), "x-regular", 17.0, t.t2().into(), t.hover_ink())
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| this.remove_download(id.clone(), cx)))
             .into_any_element();
@@ -273,7 +273,6 @@ impl Shell {
     pub fn list_song_row(&mut self, id: impl Into<gpui::ElementId>, song: &ListSong, selected: bool, on_name: Option<NameClick>, buttons: Vec<AnyElement>, layout: &Layout) -> gpui::Stateful<gpui::Div> {
         let t = self.theme;
         let main_tokens = f32::from(layout.main_width) / t.token_scale();
-        // The song playing now, as in every song list.
         let playing = song.rowid.is_some_and(|r| self.player.song_ix == Some(r as usize));
         let art = self.artwork(Some(&song.album_id), "music-note-regular", THUMB, ArtShape::Rounded(R_SM), layout);
         let name = div()
@@ -284,8 +283,8 @@ impl Shell {
             .when(main_tokens <= 620.0, |d| d.flex_1())
             .when(main_tokens > 620.0, |d| d.flex_grow(2.0).flex_basis(gpui::relative(0.0)))
             .line_height(gpui::relative(1.3))
-            .child(div().font_weight(FontWeight::MEDIUM).truncate().when(playing, |d| d.text_color(t.accent_soft_hsla())).child(song.title.clone()))
-            .child(div().text_size(t.text(TEXT_SM)).text_color(t.t2()).truncate().child(song.artist.clone()))
+            .child(div().id("title").font_weight(FontWeight::MEDIUM).truncate().when(playing, |d| d.text_color(t.accent_soft_hsla())).child(song.title.clone()).full_text_tip(&t, song.title.clone()))
+            .child(div().id("artist").text_size(t.text(TEXT_SM)).text_color(t.t2()).truncate().child(song.artist.clone()).full_text_tip(&t, song.artist.clone()))
             .when_some(on_name, |d, play| d.stop(&t).on_click(move |e, w, cx| play(e, w, cx)));
         let (rest, hover) = crate::view_rows::row_fills(&t, selected, false);
         div()
@@ -301,7 +300,7 @@ impl Shell {
             .hover(move |s| s.bg(hover))
             .child(div().flex_none().child(art))
             .child(name)
-            .when(main_tokens > 620.0, |d| d.child(div().flex_grow(1.3).flex_basis(gpui::relative(0.0)).min_w(px(0.0)).text_size(t.text(TEXT_SM)).text_color(t.t2()).truncate().child(song.album.clone())))
+            .when(main_tokens > 620.0, |d| d.child(div().flex_grow(1.3).flex_basis(gpui::relative(0.0)).min_w(px(0.0)).text_size(t.text(TEXT_SM)).text_color(t.t2()).truncate().id("album").child(song.album.clone()).full_text_tip(&t, song.album.clone())))
             .child(div().flex_none().w(t.s(72.0)).text_right().text_size(t.text(TEXT_SM)).text_color(t.t2()).child(format_size(song.size)))
             .children(buttons)
     }

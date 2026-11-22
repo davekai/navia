@@ -1,5 +1,6 @@
 //! Search results: a top result card, songs, artists and albums.
 
+use crate::ui::FullTextTip;
 use crate::i18n::{tr, trf};
 use gpui::prelude::*;
 use crate::focus::FocusStop;
@@ -153,8 +154,10 @@ impl Shell {
             let cards: Vec<CardItem> = artists.into_iter().map(CardItem::Artist).collect();
             sections.push(self.shelf_block(tr("Artists"), Some(Route::Artists), cards, false, 0));
         }
-        if show(SearchScope::Albums) && !albums.is_empty() {
-            let cards: Vec<CardItem> = albums.into_iter().map(|index| CardItem::Album { index, by_artist: false }).collect();
+        let upcoming = if fav_only { Vec::new() } else { self.upcoming_search_cards(&needle) };
+        if show(SearchScope::Albums) && (!albums.is_empty() || !upcoming.is_empty()) {
+            let mut cards: Vec<CardItem> = albums.into_iter().map(|index| CardItem::Album { index, by_artist: false }).collect();
+            cards.extend(upcoming);
             sections.push(self.shelf_block(tr("Albums"), Some(Route::Albums(crate::pages::AlbumScope::All)), cards, false, 2));
         }
         let page = Shell::sections(m.section_gap, sections);
@@ -203,7 +206,7 @@ impl Shell {
                     .font_weight(FontWeight::SEMIBOLD)
                     .stop(&t).on_click(cx.listener(move |this, _, _, cx| this.navigate(Route::Artist(id.clone()), cx)))
                     .child(photo)
-                    .child(div().truncate().child(artist.name.clone())),
+                    .child(div().id("name").truncate().child(artist.name.clone()).full_text_tip(&t, artist.name.clone())),
             )
             .child(
                 div().flex().flex_row().items_center().gap(t.s(12.0)).child(
@@ -232,14 +235,14 @@ impl Shell {
                     ),
                 )
                 .child(
-                    glass_pill(&t).child(icon_button(&t, "top-more", "dots-three-bold", false).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    glass_pill(&t).child(icon_button(&t, "top-more", tr("More"), "dots-three-bold", false).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                         let radio = this.similar_songs(&id2);
                         let (go, radio_id, go_info) = (id2.clone(), id2.clone(), id2.clone());
                         let mut rows = vec![MenuRow::item(tr("Go to Artist"), "microphone-stage-regular", move |this, cx| this.navigate(Route::Artist(go.clone()), cx))];
                         rows.push(if radio.is_empty() {
-                            MenuRow::disabled(tr("Start Artist Radio"), "radio-regular", tr("Needs similar-artist data from the server"))
+                            MenuRow::disabled(tr("Artist Radio"), "radio-regular", tr("Needs similar-artist data from the server"))
                         } else {
-                            MenuRow::item(tr("Start Artist Radio"), "radio-regular", move |this, cx| this.start_artist_radio(&radio_id, cx))
+                            MenuRow::item(tr("Artist Radio"), "radio-regular", move |this, cx| this.start_artist_radio(&radio_id, cx))
                         });
                         rows.push(this.share_row(navia_core::shares::ShareKind::Artist, go_info.clone()));
                         rows.push(this.info_row(crate::view_info::InfoTarget::Artist(go_info.clone())));

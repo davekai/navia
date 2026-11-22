@@ -128,12 +128,11 @@ impl Shell {
             this.eq.save();
             cx.notify();
         }, cx);
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         let card = div()
             .flex()
             .flex_col()
-            .child(settings_row(&t, tr("Equalizer"), Some(hint.into()), toggle, RowPos::First, main_tokens))
-            .child(settings_row(&t, tr("Output"), Some(tr("Each output remembers its own settings on this page.").into()), picker, RowPos::Last, main_tokens));
+            .child(settings_row(&t, tr("Equalizer"), Some(hint.into()), toggle, RowPos::First))
+            .child(settings_row(&t, tr("Output"), Some(tr("Each output remembers its own settings on this page.").into()), picker, RowPos::Last));
         self.eq_frame(layout, div().flex().flex_col().child(card)).into_any_element()
     }
 
@@ -253,12 +252,12 @@ impl Shell {
             presets = presets.child(div().when(narrow, |d| d.flex_1().min_w(px(0.0))).child(field));
         }
         if let Some(name) = selected {
-            presets = presets.child(round_button(&t, "eq-delete-preset", "trash-regular").stop(&t).on_click(cx.listener(move |this, _, _, cx| {
+            presets = presets.child(round_button(&t, "eq-delete-preset", trf("Delete {name}", &[("name", &name)]), "trash-regular").stop(&t).on_click(cx.listener(move |this, _, _, cx| {
                 this.eq.delete_preset(&name, mode);
                 cx.notify();
             })));
         }
-        presets = presets.child(round_button(&t, "eq-save-preset", "floppy-disk-regular").stop(&t).on_click(cx.listener(|this, _, _, cx| {
+        presets = presets.child(round_button(&t, "eq-save-preset", tr("Save as preset"), "floppy-disk-regular").stop(&t).on_click(cx.listener(|this, _, _, cx| {
             let profile = this.eq.profile_ref();
             let name = if profile.mode == EqMode::Parametric { profile.parametric_preset } else { profile.preset };
             let custom = this.eq.custom.iter().any(|p| p.mode == profile.mode && p.name == name);
@@ -266,7 +265,7 @@ impl Shell {
             this.eq_ui.naming = true;
             this.focus_text(TextTarget::EqPresetName, cx);
         })));
-        presets = presets.child(round_button(&t, "eq-reset", "arrow-counter-clockwise-regular").stop(&t).on_click(cx.listener(|this, _, _, cx| this.eq_reset(cx))));
+        presets = presets.child(round_button(&t, "eq-reset", if parametric { tr("Set every filter to 0 dB") } else { tr("Reset to Flat") }, "arrow-counter-clockwise-regular").stop(&t).on_click(cx.listener(|this, _, _, cx| this.eq_reset(cx))));
         bar.child(presets).into_any_element()
     }
 
@@ -362,7 +361,7 @@ impl Shell {
         let extra = correction.map(correction_curve);
         let parametric = profile.mode == EqMode::Parametric;
         let line_w = t.s(2.5);
-        let area_color = fg.hsla(0.14);
+        let area_color = fg.hsla(crate::theme::EQ_AREA_OPACITY);
         let curve_color = fg.hsla(1.0);
         let extra_color: Hsla = t.t2().into();
         let extra_w = t.s(1.5);
@@ -584,7 +583,7 @@ impl Shell {
             };
             let badge = div().flex().items_center().justify_center().flex_none().size(t.s(24.0)).rounded_full().bg(if active { t.accent_hsla() } else { t.panel_2().into() }).text_size(t.text(TEXT_XS)).font_weight(FontWeight::SEMIBOLD).text_color(if active { t.on_accent.hsla(1.0) } else { t.t2().into() }).child(format!("{}", i + 1));
             let params = div().flex().min_w(px(0.0)).flex_1().when(narrow, |d| d.flex_col().gap(t.s(10.0))).when(!narrow, |d| d.flex_row().gap(t.s(18.0))).child(param(tr("Frequency"), freq_text, freq)).child(param(tr("Gain"), gain_text, gain)).child(param("Q", q_text, q));
-            let remove = crate::ui::ink_button(&t, ("eq-f-remove", i), "x-regular", 16.0, t.t1().into(), t.hover_ink()).w(t.s(ACTION_W)).when(!can_remove, |d| d.opacity(0.35)).when(can_remove, |d| {
+            let remove = crate::ui::ink_button(&t, ("eq-f-remove", i), trf("Remove filter {n}", &[("n", &(i + 1).to_string())]), "x-regular", 16.0, t.t1().into(), t.hover_ink()).w(t.s(ACTION_W)).when(!can_remove, |d| d.opacity(0.35)).when(can_remove, |d| {
                 d.stop(&t).on_click(cx.listener(move |this, _, _, cx| {
                     this.eq.profile().filters.retain(|f| f.id != id);
                     this.eq.profile().parametric_preset.clear();
@@ -626,7 +625,6 @@ impl Shell {
         let profile = self.eq.profile_ref();
         let correction = self.eq_correction(&profile.headphone);
         let peak = peak_level(&profile, correction.as_ref());
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         let preamp_slider = self.render_slider(SliderSpec::new("eq-preamp", profile.preamp, -EQ_RANGE, EQ_RANGE, |this, v, cx| {
             this.eq.profile().preamp = v;
             cx.notify();
@@ -646,8 +644,8 @@ impl Shell {
             .flex()
             .flex_col()
             .child(section_title(&t, tr("Gain")))
-            .child(settings_row(&t, tr("Preamp"), Some(trf("{level} before the equalizer.", &[("level", &db(profile.preamp))]).into()), preamp_slider, RowPos::First, main_tokens))
-            .child(settings_row(&t, tr("Soft limiter"), Some(limiter_hint), limiter, RowPos::Last, main_tokens));
+            .child(settings_row(&t, tr("Preamp"), Some(trf("{level} before the equalizer.", &[("level", &db(profile.preamp))]).into()), preamp_slider, RowPos::First))
+            .child(settings_row(&t, tr("Soft limiter"), Some(limiter_hint), limiter, RowPos::Last));
         self.eq_frame(layout, self.eq_inert(card)).into_any_element()
     }
 
@@ -670,7 +668,7 @@ impl Shell {
         let imported = self.eq.headphones.iter().any(|h| h.name == profile.headphone);
         let mut row = div().flex().flex_row().flex_wrap().justify_end().items_center().gap(t.s(8.0)).child(select).child(load);
         if imported {
-            row = row.child(round_button(&t, "eq-remove-headphone", "trash-regular").stop(&t).on_click(cx.listener(move |this, _, _, cx| {
+            row = row.child(round_button(&t, "eq-remove-headphone", trf("Delete {name}", &[("name", &profile.headphone)]), "trash-regular").stop(&t).on_click(cx.listener(move |this, _, _, cx| {
                 let name = this.eq.profile_ref().headphone;
                 this.eq.headphones.retain(|h| h.name != name);
                 for p in this.eq.profiles.values_mut() {
@@ -689,7 +687,7 @@ impl Shell {
         } else {
             tr("Load an AutoEQ ParametricEQ.txt file. AutoEQ publishes one for most headphones.").into()
         };
-        let card = div().flex().flex_col().child(section_title(&t, tr("Headphone Correction"))).child(settings_row(&t, tr("Headphone model"), Some(hint), row.into_any_element(), RowPos::Single, main_tokens));
+        let card = div().flex().flex_col().child(section_title(&t, tr("Headphone Correction"))).child(settings_row(&t, tr("Headphone model"), Some(hint), row.into_any_element(), RowPos::Single));
         self.eq_frame(layout, self.eq_inert(card)).into_any_element()
     }
 
@@ -732,7 +730,6 @@ impl Shell {
     fn render_eq_stereo(&mut self, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let profile = self.eq.profile_ref();
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         let balance = self.render_slider(SliderSpec::new("eq-balance", profile.balance, -100.0, 100.0, |this, v, cx| {
             this.eq.profile().balance = if v.abs() < 4.0 { 0.0 } else { v };
             cx.notify();
@@ -753,15 +750,15 @@ impl Shell {
             .flex()
             .flex_col()
             .child(section_title(&t, tr("Stereo")))
-            .child(settings_row(&t, tr("Balance"), Some(balance_text(profile.balance).into()), balance, RowPos::First, main_tokens))
-            .child(settings_row(&t, tr("Mono"), Some(tr("Plays both channels as one.").into()), mono, RowPos::Middle, main_tokens))
-            .child(settings_row(&t, tr("Crossfeed"), Some(tr("Blends a little of each channel into the other, for easier listening on headphones.").into()), crossfeed, if profile.crossfeed { RowPos::Middle } else { RowPos::Last }, main_tokens));
+            .child(settings_row(&t, tr("Balance"), Some(balance_text(profile.balance).into()), balance, RowPos::First))
+            .child(settings_row(&t, tr("Mono"), Some(tr("Plays both channels as one.").into()), mono, RowPos::Middle))
+            .child(settings_row(&t, tr("Crossfeed"), Some(tr("Blends a little of each channel into the other, for easier listening on headphones.").into()), crossfeed, if profile.crossfeed { RowPos::Middle } else { RowPos::Last }));
         if profile.crossfeed {
             let amount = self.render_slider(SliderSpec::new("eq-crossfeed-amount", profile.crossfeed_amount, 0.0, 100.0, |this, v, cx| {
                 this.eq.profile().crossfeed_amount = v;
                 cx.notify();
             }).on_end(|this, _| this.eq.save()), cx);
-            card = card.child(settings_row(&t, tr("Crossfeed strength"), Some(format!("{}%", profile.crossfeed_amount.round() as i32).into()), amount, RowPos::Last, main_tokens));
+            card = card.child(settings_row(&t, tr("Crossfeed strength"), Some(format!("{}%", profile.crossfeed_amount.round() as i32).into()), amount, RowPos::Last));
         }
         self.eq_frame(layout, self.eq_inert(card)).into_any_element()
     }

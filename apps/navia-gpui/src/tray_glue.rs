@@ -28,6 +28,24 @@ pub fn start_tray(cx: &mut Context<Shell>) -> Option<AppTray> {
     Some(tray)
 }
 
+/// the global menu and the task its clicks arrive on, dispatched as the item's action in the main window.
+#[cfg(target_os = "linux")]
+pub fn start_app_menu(cx: &mut Context<Shell>) -> Option<crate::app_menu::AppMenu> {
+    let (tx, mut rx) = unbounded();
+    let menu = crate::app_menu::AppMenu::start(tx)?;
+    cx.spawn(async move |this, cx| {
+        while let Some(id) = rx.next().await {
+            let target = this.update(cx, |shell, _| shell.app_menu.as_ref().and_then(|m| m.action(id)).zip(shell.main_window));
+            let Ok(target) = target else { return };
+            if let Some((action, window)) = target {
+                window.update(cx, |_, window, cx| window.dispatch_action(action, cx)).ok();
+            }
+        }
+    })
+    .detach();
+    Some(menu)
+}
+
 impl Shell {
     fn tray_command(&mut self, command: TrayCommand, cx: &mut Context<Self>) {
         match command {

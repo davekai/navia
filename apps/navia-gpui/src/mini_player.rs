@@ -21,7 +21,9 @@ use gpui::{
 use crate::shell::Shell;
 use crate::theme::size::*;
 
-/// Which kind of window the mini player is on this desktop.
+/// how long a minimized main window gets to come back after an activation request before it's opened again
+const RAISE_WAIT: Duration = Duration::from_millis(500);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MiniKind {
     /// A layer-shell overlay that Navia moves itself.
@@ -44,7 +46,6 @@ impl MiniKind {
     }
 }
 
-/// The mini player's state, kept on the shell.
 #[derive(Default)]
 pub struct MiniPlayer {
     pub window: Option<WindowHandle<MiniView>>,
@@ -102,7 +103,14 @@ pub struct MiniView {
 impl Render for MiniView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focus = self.focus.clone();
-        self.shell.update(cx, |shell, cx| shell.render_mini(&focus, window, cx))
+        self.shell.update(cx, |shell, cx| {
+            use crate::marquee::Host;
+            shell.marquees_begin(Host::Mini);
+            let mini = shell.render_mini(&focus, window, cx);
+            shell.marquees_end(Host::Mini, cx);
+            // the scrolling names are drawn over the card, each a view of its own.
+            gpui::div().size_full().child(crate::ui::hover_clears_on_leave()).child(mini).children(shell.marquee_overlays(Host::Mini)).into_any_element()
+        })
     }
 }
 
@@ -387,6 +395,8 @@ impl Shell {
                 window.focus(&focus, cx);
                 let view = cx.new(|cx| {
                     let observe = cx.observe(&view_shell, |_, _, cx| cx.notify());
+                    let shell = view_shell.clone();
+                    cx.observe_window_activation(window, move |_, _, cx| shell.update(cx, |shell, cx| shell.marquees_refresh(cx))).detach();
                     MiniView { shell: view_shell.clone(), focus, _observe: observe }
                 });
                 // Closed from the desktop, such as with Alt+F4, so return to the full window.
@@ -440,6 +450,13 @@ impl Shell {
                 self.show_main_window(cx);
             } else if let Some(main) = main {
                 main.update(cx, |_, window, _| window.activate_window()).ok();
+                // on Wayland a minimized window comes back only for an activation tied to a recent press on one of
+                // Navia's surfaces; from the global menu or the desktop there's none, so the window opens again
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(RAISE_WAIT).await;
+                    this.update(cx, |shell, cx| shell.reopen_if_still_hidden(main, cx)).ok();
+                })
+                .detach();
             }
         }
         if std::env::var_os("NAVIA_MINI_LOG").is_some() {
@@ -451,6 +468,18 @@ impl Shell {
         })
         .detach();
         cx.notify();
+    }
+
+    fn reopen_if_still_hidden(&mut self, main: gpui::AnyWindowHandle, cx: &mut Context<Self>) {
+        if self.window_shown || self.mini.is_open() || self.main_window != Some(main) {
+            return;
+        }
+        if let Ok(size) = main.update(cx, |_, window, _| window.bounds().size) {
+            self.closed_size = Some(size);
+        }
+        main.update(cx, |_, window, _| window.remove_window()).ok();
+        self.main_window = None;
+        self.show_main_window(cx);
     }
 
     fn mini_closed_by_desktop(&mut self, cx: &mut Context<Self>) {

@@ -16,7 +16,7 @@ use crate::core_player::CoreEvent;
 use crate::persist::DockView;
 use crate::shell::Shell;
 
-/// How many of the context's last songs are given to Autoplay as its anchors.
+/// how many of the context's last songs anchor Autoplay.
 const ANCHOR_TAIL: usize = 12;
 
 impl Shell {
@@ -127,7 +127,7 @@ impl Shell {
                 let ids: Vec<&str> = chosen.iter().filter_map(|r| found.iter().find(|(f, _)| f == r).map(|(_, t)| t.id.as_str())).collect();
                 let (fetch, wants, mode) = {
                     let mut s = state.lock().unwrap();
-                    // The library gives the Navia mode its setting, play log and song details.
+                    // the Navia mode's setting, play log and song details.
                     s.attach(lib.db.clone());
                     s.set_context(context, ids.into_iter());
                     let wanted = s.wanted_fetch();
@@ -171,7 +171,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// The queue came into view while Autoplay has seeds it hasn't asked about.
+    /// asks about seeds it hasn't yet.
     pub fn autoplay_view_shown(&mut self, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.autoplay_wants_fetch) {
             self.autoplay_update(None, cx);

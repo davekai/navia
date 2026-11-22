@@ -95,7 +95,7 @@ impl Shell {
                     div()
                         .min_w(px(0.0))
                         .line_height(relative(1.25))
-                        .child(div().font_weight(FontWeight::MEDIUM).truncate().child(tr("Syncing your library")))
+                        .child(div().font_weight(FontWeight::MEDIUM).truncate().child(tr("Syncing library")))
                         .children(meter.as_ref().and_then(sync_detail).map(|d| div().text_size(t.text(TEXT_XS)).text_color(t.t2()).truncate().child(d))),
                 )
                 .child(sync_bar(&t, "sync-card-sweep", meter.and_then(|m| m.fraction())))

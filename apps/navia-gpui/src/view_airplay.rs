@@ -111,6 +111,9 @@ impl Shell {
         if self.airplay_ui.sample.is_some() {
             return;
         }
+        if let Some(airplay) = self.core.as_ref().and_then(|c| c.airplay.as_ref()) {
+            airplay.rescan();
+        }
         self.airplay_ui.searching_until = Some(Instant::now() + SEARCH_SHOWN);
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_SHOWN).await;

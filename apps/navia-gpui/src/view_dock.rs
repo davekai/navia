@@ -1,5 +1,6 @@
 //! The right dock: baked background and artwork, Featured Artists, and transport controls.
 
+use crate::ui::FullTextTip;
 use crate::i18n::{tr, trf};
 use gpui::prelude::*;
 use crate::focus::FocusStop;
@@ -9,6 +10,7 @@ use crate::color::{Srgb, player_fg, player_fg_dim, player_vivid};
 use crate::persist::{DockView, PlayerMode};
 use crate::shell::{Drag, Layout, Shell};
 use crate::theme::size::*;
+use crate::theme::motion;
 use crate::ui::{clock, icon};
 use crate::view_topbar::track_bounds;
 use crate::view_window_buttons::Side;
@@ -23,7 +25,7 @@ pub enum ScrubVariant {
 }
 
 impl Shell {
-    /// The Live state in place of the seek bar, for internet radio.
+    /// for internet radio.
     fn render_live_scrub(&self, variant: ScrubVariant, rest: gpui::Rgba, color: gpui::Hsla) -> AnyElement {
         let t = self.theme;
         let line = || div().h(t.s(4.0)).my(t.s(5.0)).rounded(px(2.0)).bg(rest);
@@ -48,8 +50,8 @@ impl Shell {
         Some(div().flex().flex_row().items_center().gap(t.s(4.0)).text_size(t.text(TEXT_XS)).opacity(0.8).child(icon(&t, "eye-slash-regular", 14.0, t.t_on_art())).child(tr("Private")).into_any_element())
     }
 
-    /// Time and seek bar in one of its `ScrubVariant` forms. `color` fills the played part and `text` is the times.
-    pub fn render_scrubber(&mut self, variant: ScrubVariant, rest: gpui::Rgba, color: gpui::Hsla, text: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
+    /// `color` fills the played part (`--player-fg`); `text` is the times (`--player-fg-dim`, opaque).
+    pub fn render_scrubber(&mut self, variant: ScrubVariant, rest: gpui::Rgba, color: gpui::Hsla, text: gpui::Hsla, feel: crate::ui::Feel, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         if self.player.station.is_some() {
             return self.render_live_scrub(variant, rest, text);
@@ -65,12 +67,18 @@ impl Shell {
         // The thumb, and the thin bar's time chip, fade in on hover and stay while dragging.
         let dragging = matches!(self.dragging, Some(Drag::Seek));
         let hover = crate::ui::ink(if thin { "seek-thin" } else { "seek" }).amount.max(if dragging { 1.0 } else { 0.0 });
-        let (bar_h, radius) = if thin { (t.s(SCRUB_THIN), t.s(SCRUB_THIN / 2.0)) } else { (t.s(4.0), px(2.0)) };
+        let (rest_h, hover_h, shown) = match variant {
+            ScrubVariant::Thin => (SCRUB_THIN, SCRUB_THIN_HOVER, hover),
+            ScrubVariant::Inline => (BAR_SCRUB_REST, BAR_SCRUB_HOVER, self.bar_raise.shown.max(if dragging { 1.0 } else { 0.0 })),
+            ScrubVariant::Stacked => (SCRUB_LINE, SCRUB_LINE_HOVER, hover),
+        };
+        let h = rest_h + (hover_h - rest_h) * shown;
+        let (bar_h, radius) = (t.s(h), t.s(h / 2.0));
         let track = div()
             .id(if thin { "seek-thin" } else { "seek" })
             .group("seek")
             .relative()
-            .h(t.s(14.0))
+            .h(t.s(SCRUB_SLOT))
             .flex()
             .items_center()
             .flex_1()
@@ -91,10 +99,6 @@ impl Shell {
                     .bg(rest)
                     .child(div().absolute().left(px(0.0)).top(px(0.0)).bottom(px(0.0)).w(relative(frac)).rounded(radius).bg(color)),
             )
-            .when(hover > 0.0, |d| {
-                let width = f32::from(self.seek_bounds.borrow().size.width);
-                d.child(crate::ui::scrub_knob(&t, if thin { SCRUB_THIN_KNOB } else { SCRUB_KNOB }, px(frac * width), hover))
-            })
             .when(thin && hover > 0.0, |d| {
                 // The times in a floating chip above the playhead, kept clear of the bar's ends.
                 let width = f32::from(self.seek_bounds.borrow().size.width);
@@ -104,7 +108,7 @@ impl Shell {
                 d.child(
                         div()
                             .absolute()
-                            .bottom(t.s(14.0) - (t.s(14.0) - bar_h) / 2.0 + px(2.0))
+                            .bottom(t.s(SCRUB_SLOT) - (t.s(SCRUB_SLOT) - bar_h) / 2.0 + px(2.0))
                             .left(px(at) - chip_w / 2.0)
                             .w(chip_w)
                             .flex()
@@ -112,7 +116,7 @@ impl Shell {
                             .opacity(hover)
                             .child(
                                 crate::ui::float_chip(&t)
-                                    .child(format!("{} / {}", clock(pos as u32), clock(dur as u32))),
+                                    .child(format!("{} / {}", clock(pos as u32), self.time_end(pos, dur))),
                             ),
                     )
             });
@@ -123,7 +127,7 @@ impl Shell {
                 let middle: AnyElement = if waiting {
                     waiting_label().into_any_element()
                 } else {
-                    div().flex().flex_row().items_center().gap(t.s(10.0)).children(self.private_badge()).children(self.quality_badge(false, text, cx)).into_any_element()
+                    div().flex().flex_row().items_center().gap(t.s(10.0)).children(self.private_badge()).children(self.quality_badge(false, false, text, cx)).into_any_element()
                 };
                 div()
                     .w_full()
@@ -139,42 +143,123 @@ impl Shell {
                             .text_color(text)
                             .child(div().child(clock(pos as u32)))
                             .child(middle)
-                            .child(div().child(clock(dur as u32))),
+                            .child(self.time_toggle("time-end", pos, dur, feel, cx)),
                     )
                     .into_any_element()
             }
-            ScrubVariant::Inline if waiting => div().flex().flex_row().items_center().gap(t.s(12.0)).w_full().child(waiting_label()).child(track).into_any_element(),
-            ScrubVariant::Inline => {
-                let times = |label: SharedString| div().text_size(t.text(TEXT_SM)).text_color(text).child(label);
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(t.s(12.0))
-                    .w_full()
-                    .child(times(clock(pos as u32)))
-                    .child(track)
-                    .child(times(clock(dur as u32)))
-                    .children(self.quality_badge(true, text, cx))
-                    .into_any_element()
-            }
+            // the bar's times appear over the title while hovered (`bar_times`).
+            ScrubVariant::Inline => div().flex().w_full().child(track).into_any_element(),
         }
     }
 
-    /// The speaker icon for the current volume and mute state.
+    /// the length, or what's left (`-1:23`) once the user chose that.
+    pub fn time_end(&self, pos: f32, dur: f32) -> SharedString {
+        if self.prefs.time_remaining { format!("\u{2212}{}", clock((dur as u32).saturating_sub(pos as u32))).into() } else { clock(dur as u32) }
+    }
+
+    /// `reveal` is 0 to 1. the caller places the row.
+    pub fn bar_times(&mut self, reveal: f32, text: gpui::Hsla, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let t = self.theme;
+        if reveal <= 0.0 || self.player.station.is_some() {
+            return None;
+        }
+        let (pos, dur) = match self.current_song() {
+            Some(s) => (self.player.position, s.duration_s.max(1) as f32),
+            None => (0.0, 1.0),
+        };
+        let waiting = self.player.waiting_for_server && self.player.status == navia_core::audio::player::PlayerStatus::Buffering;
+        let middle: Option<AnyElement> = if waiting {
+            Some(div().font_weight(FontWeight::MEDIUM).child(tr("Waiting for server")).into_any_element())
+        } else {
+            self.quality_badge(true, false, text, cx)
+        };
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .text_size(t.text(TEXT_SM))
+                .text_color(text)
+                .opacity(reveal)
+                .child(div().child(clock(pos as u32)))
+                .children(middle)
+                .child(self.time_toggle("bar-time-end", pos, dur, crate::ui::Feel::BAR, cx)),
+        )
+    }
+
+    /// a click switches length and time left, remembered.
+    fn time_toggle(&mut self, id: &'static str, pos: f32, dur: f32, feel: crate::ui::Feel, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let t = self.theme;
+        let label = self.time_end(pos, dur);
+        let ink = crate::ui::ink(id);
+        crate::ui::pressable_in(div().id(id).relative().child(crate::ui::active_pill(&t, ink, feel)), id, feel).stop(&t).on_click(cx.listener(|this, _, _, cx| {
+            this.prefs.time_remaining = !this.prefs.time_remaining;
+            this.prefs.save();
+            cx.notify();
+        })).child(label)
+    }
+
+    /// links, or plain text for a station. `sizes` are in tokens, `line` a line-height factor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn player_names(&mut self, song: &crate::model::Song, keys: (&'static str, &'static str), host: crate::marquee::Host, sizes: (f32, f32), line: f32, colors: (gpui::Hsla, gpui::Hsla), opacity: f32, cx: &mut Context<Self>) -> (AnyElement, AnyElement) {
+        let (title_color, artist_color) = colors;
+        use crate::marquee::Spec;
+        let t = self.theme;
+        let station = self.player.station.is_some();
+        let title_target = (!station && !song.album_id.is_empty()).then(|| crate::song_links::LinkTarget::Album(song.album_id.clone()));
+        let mut artists: Vec<(SharedString, Option<crate::song_links::LinkTarget>)> = Vec::new();
+        let names: Vec<SharedString> = if station || song.artists.len() <= 1 { vec![song.artist.clone()] } else { song.artists.clone() };
+        for (k, name) in names.into_iter().enumerate() {
+            if k > 0 {
+                artists.push((", ".into(), None));
+            }
+            let target = (!station).then(|| self.artist_named(&name).map(|a| crate::song_links::LinkTarget::Artist(a.id.clone()))).flatten();
+            artists.push((name, target));
+        }
+        let spec = |pieces, size: f32, weight, color| Spec { pieces, color, size: t.text(size), weight, line_height: t.text(size) * line };
+        let title = self.marquee(keys.0, host, spec(vec![(song.title.clone(), title_target)], sizes.0, FontWeight::MEDIUM, title_color), opacity, cx);
+        let artists = self.marquee(keys.1, host, spec(artists, sizes.1, FontWeight::NORMAL, artist_color), opacity, cx);
+        (title, artists)
+    }
+
+    /// the player's song as a cross-fade key (`SONG_FADE`): the one it replaces is kept whole to draw while it fades out.
+    pub fn song_swap(&self, id: &'static str, song: &crate::model::Song) -> (crate::ui::Swapping<SongById>, AnyElement) {
+        crate::ui::swap(id, &SongById(song.clone()), motion::SONG_FADE)
+    }
+
+    /// a leaving song's title and artists, plain, for the moment it fades out over the new one's.
+    pub fn leaving_names(&self, song: &crate::model::Song, sizes: (f32, f32), line: f32, colors: (gpui::Hsla, gpui::Hsla), opacity: f32) -> AnyElement {
+        let t = self.theme;
+        let line_of = |text: SharedString, size: f32, weight, color| div().min_w(px(0.0)).truncate().text_size(t.text(size)).line_height(t.text(size) * line).font_weight(weight).text_color(color).child(text);
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .opacity(opacity)
+            .child(line_of(song.title.clone(), sizes.0, FontWeight::MEDIUM, colors.0))
+            .child(line_of(song.artist.clone(), sizes.1, FontWeight::NORMAL, colors.1))
+            .into_any_element()
+    }
+
     pub fn volume_icon(&self) -> &'static str {
         let volume = self.volume_percent();
+        // four steps, so the waves follow the level; the button cross-fades between them
         if self.prefs.muted || volume == 0.0 {
             "speaker-slash-regular"
-        } else if volume < 50.0 {
+        } else if volume < 100.0 / 3.0 {
+            "speaker-none-regular"
+        } else if volume < 200.0 / 3.0 {
             "speaker-low-regular"
         } else {
             "speaker-high-regular"
         }
     }
 
-    /// `color` is the icons and `fill` is the slider's level.
-    pub fn render_volume_row(&mut self, color: gpui::Hsla, fill: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
+    /// `color` is the icons (`--player-fg-dim`), `fill` the slider's level (`--player-fg`).
+    pub fn render_volume_row(&mut self, color: gpui::Hsla, fill: gpui::Hsla, feel: crate::ui::Feel, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let name = self.volume_icon();
         div()
@@ -182,24 +267,22 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(t.s(6.0))
-            .mt(t.s(8.0))
+            .mt(t.s(PLAYER_VOLUME_GAP))
             .mx(t.s(-8.0))
             .child(
-                crate::ui::ink_button(&t, "mute", name, 19.0, color, fill).stop(&t).on_click(cx.listener(|this, _, _, cx| {
+                crate::ui::player_button_fading(&t, "mute", if self.prefs.muted { tr("Unmute") } else { tr("Mute") }, name, 19.0, color, fill, feel).stop(&t).on_click(cx.listener(|this, _, _, cx| {
                     this.toggle_mute(cx);
                 })),
             )
             .child(self.render_volume_slider(fill, t.player_track(), cx))
             // Output sits at the end of the volume row.
             .child(
-                // The AirPlay glyph while a receiver is the output, in the accent once it plays.
+                // in the accent once it plays.
                 {
                     let (glyph, accent) = self.output_glyph();
                     let (rest, hover) = if accent { (t.accent_hsla(), t.accent_hsla()) } else { (color, fill) };
-                    crate::ui::ink_button(&t, "output", glyph, 19.0, rest, hover)
-                }
-                    .stop(&t)
-                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| this.open_output_menu(event.position() - point(px(0.0), this.theme.s(70.0)), cx))),
+                    crate::ui::menu_on_press(crate::ui::player_menu_button(&t, "output", tr("Output"), glyph, 19.0, rest, hover, feel).stop(&t), cx, |this, at, cx| this.open_output_menu(at - point(px(0.0), this.theme.s(70.0)), cx))
+                },
             )
             .into_any_element()
     }
@@ -209,15 +292,15 @@ impl Shell {
         let t = self.theme;
         let frac = if self.prefs.muted { 0.0 } else { self.volume_percent() / 100.0 };
         let hover = crate::ui::ink("volume").amount.max(if matches!(self.dragging, Some(Drag::Volume)) { 1.0 } else { 0.0 });
-        let width = f32::from(self.volume_bounds.borrow().size.width);
-        // On AirPlay the slider drives the receiver's volume, and its tooltip says so.
+        let h = SCRUB_LINE + (SCRUB_LINE_HOVER - SCRUB_LINE) * hover;
+        // on AirPlay it drives the receiver's volume, and says so.
         let receiver_tip = self.active_airplay().map(|o| SharedString::from(crate::i18n::trf("Volume on {device}", &[("device", o.name.as_str())])));
         div()
                     .id("volume")
                     .when_some(receiver_tip, |d, tip| d.tooltip(crate::ui::tip(&t, tip)))
                     .relative()
                     .flex_1()
-                    .h(t.s(14.0))
+                    .h(t.s(SCRUB_SLOT))
                     .flex()
                     .items_center()
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
@@ -235,13 +318,12 @@ impl Shell {
                     .child(
                         div()
                             .relative()
-                            .h(t.s(4.0))
+                            .h(t.s(h))
                             .w_full()
-                            .rounded(px(2.0))
+                            .rounded(t.s(h / 2.0))
                             .bg(rest)
-                            .child(div().absolute().left(px(0.0)).top(px(0.0)).bottom(px(0.0)).w(relative(frac)).rounded(px(2.0)).bg(color)),
+                            .child(div().absolute().left(px(0.0)).top(px(0.0)).bottom(px(0.0)).w(relative(frac)).rounded(t.s(h / 2.0)).bg(color)),
                     )
-                    .when(hover > 0.0, |d| d.child(crate::ui::scrub_knob(&t, SCRUB_KNOB, px(frac * width), hover)))
             .into_any_element()
     }
 }
@@ -259,34 +341,33 @@ pub enum ModeButton {
 }
 
 impl Shell {
-    /// Row of big transport controls, shared by the dock and the expanded player.
-    pub fn render_transport(&mut self, icon_color: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
+    /// shared by the dock and the expanded player.
+    pub fn render_transport(&mut self, icon_color: gpui::Hsla, feel: crate::ui::Feel, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let playing = self.player.playing;
-        let transport_button = |id: &'static str, name: &'static str, size: f32, enabled: bool| crate::ui::transport_button(&t, id, name, size, icon_color, enabled);
+        let transport_button = |id: &'static str, label: &'static str, name: &'static str, size: f32, enabled: bool| crate::ui::transport_button(&t, id, if enabled { tr(label) } else { tr(crate::ui::STATION_NO_SKIP) }, name, size, icon_color, enabled, feel);
         let station = self.player.station.is_some();
         div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
-            .mt(t.s(12.0))
+            .mt(t.s(PLAYER_TRANSPORT_GAP))
             .mx(t.s(-8.0))
-            .child(self.render_mode_button(ModeButton::Shuffle, "shuffle", 24.0, icon_color, cx))
-            .child(transport_button("prev", "rewind-fill", 32.0, !station).when(!station, |d| d.stop(&t).on_click(cx.listener(|this, _, _, cx| this.previous(cx)))).when(station, |d| crate::ui::locked(d).on_click(cx.listener(|this, _, _, cx| this.show_toast(tr(crate::ui::STATION_NO_SKIP), cx)))))
+            .child(self.render_mode_button(ModeButton::Shuffle, "shuffle", 24.0, icon_color, feel, cx))
+            .child(transport_button("prev", "Previous", "rewind-fill", 32.0, !station).when(!station, |d| d.stop(&t).on_click(cx.listener(|this, _, _, cx| this.previous(cx)))).when(station, |d| crate::ui::locked(d).on_click(cx.listener(|this, _, _, cx| this.show_toast(tr(crate::ui::STATION_NO_SKIP), cx)))))
             .child(
-                transport_button("play", if playing { "pause-fill" } else { "play-fill" }, 44.0, true).stop(&t).on_click(cx.listener(|this, _, _, cx| {
+                crate::ui::play_button(&t, "play", playing, 44.0, icon_color, feel).stop(&t).on_click(cx.listener(|this, _, _, cx| {
                     this.toggle_play(cx);
                 })),
             )
-            .child(transport_button("next", "fast-forward-fill", 32.0, !station).when(!station, |d| d.stop(&t).on_click(cx.listener(|this, _, _, cx| this.next(cx)))).when(station, |d| crate::ui::locked(d).on_click(cx.listener(|this, _, _, cx| this.show_toast(tr(crate::ui::STATION_NO_SKIP), cx)))))
-            .child(self.render_mode_button(ModeButton::Repeat, "repeat", 24.0, icon_color, cx))
+            .child(transport_button("next", "Next", "fast-forward-fill", 32.0, !station).when(!station, |d| d.stop(&t).on_click(cx.listener(|this, _, _, cx| this.next(cx)))).when(station, |d| crate::ui::locked(d).on_click(cx.listener(|this, _, _, cx| this.show_toast(tr(crate::ui::STATION_NO_SKIP), cx)))))
+            .child(self.render_mode_button(ModeButton::Repeat, "repeat", 24.0, icon_color, feel, cx))
             .into_any_element()
     }
 
-    /// A mode button with the skip buttons' hover circle, dimmed while off. When on it uses the accent with a dot under
-    /// the glyph, and repeat-one adds a "1" badge. Shuffle toggles and repeat cycles off, all, one.
-    pub fn render_mode_button(&mut self, which: ModeButton, id: &'static str, glyph: f32, color: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
+    /// shuffle toggles, repeat cycles off, all, one; the queue's actions run once.
+    pub fn render_mode_button(&mut self, which: ModeButton, id: &'static str, glyph: f32, color: gpui::Hsla, feel: crate::ui::Feel, cx: &mut Context<Self>) -> AnyElement {
         use navia_core::audio::player::Repeat;
         let t = self.theme;
         let station = self.player.station.is_some();
@@ -316,10 +397,13 @@ impl Shell {
             },
         };
         let box_size = glyph + 12.0;
-        let tint = if on { t.accent_soft_hsla() } else { color };
+        let (shown, ticker) = crate::ui::toggle_ease(id, on);
+        let tint = crate::ui::mix_hsla(color, t.accent_soft_hsla(), shown);
         let ink = crate::ui::ink(id);
+        let live = !(station && modes) && !disabled;
         div()
             .id(id)
+            .child(ticker)
             .tooltip(crate::ui::tip(&t, label))
             .relative()
             .flex_none()
@@ -329,9 +413,10 @@ impl Shell {
             .justify_center()
             .when(station && modes, |d| d.opacity(MODE_DISABLED).on_click(cx.listener(|this, _, _, cx| this.show_toast(tr(crate::ui::STATION_NO_MODES), cx))))
             .when(disabled, |d| d.opacity(MODE_DISABLED))
-            .when(!(station && modes) && !disabled, |d| {
-                d.child(crate::ui::hover_track(id))
-                    .opacity(ink.opacity(if on { 1.0 } else { MODE_REST }))
+            .when(live, |d| {
+                d.child(crate::ui::press_track(id, feel))
+                    .opacity(ink.opacity(MODE_REST + (1.0 - MODE_REST) * shown))
+                    .paint_scale(ink.press_scale_in(feel))
                     .stop(&t)
                     .on_click(cx.listener(move |this, _, _, cx| match which {
                         ModeButton::Shuffle => this.toggle_shuffle(cx),
@@ -341,8 +426,9 @@ impl Shell {
                         ModeButton::ClearList => this.clear_list(cx),
                     }))
             })
+            .when(live, |d| d.child(crate::ui::active_fill(&t, ink, feel, (box_size, box_size), glyph)))
             .child(icon(&t, name, glyph, tint))
-            .when(on, |d| d.child(div().absolute().bottom(px(0.0)).left(t.s(box_size / 2.0 - 2.0)).size(t.s(4.0)).rounded_full().bg(tint)))
+            .when(shown > 0.0, |d| d.child(div().absolute().bottom(px(0.0)).left(t.s(box_size / 2.0 - 2.0)).size(t.s(4.0)).rounded_full().bg(tint.opacity(shown))))
             .when(one, |d| {
                 d.child(
                     div()
@@ -372,11 +458,11 @@ impl Shell {
     pub fn render_view_switcher(&mut self, item_w: f32, ink: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let shown = self.shown_view();
-        let has_lyrics = self.current_song().is_some_and(|s| s.has_lyrics);
+        let has_lyrics = self.may_have_lyrics();
         let items = [
-            (DockView::Lyrics, "nv-lyrics", "nv-lyrics"),
-            (DockView::Artwork, "music-note-regular", "music-note-fill"),
-            (DockView::Queue, "list-bullets-regular", "list-bullets-regular"),
+            (DockView::Lyrics, "Lyrics", "nv-lyrics", "nv-lyrics"),
+            (DockView::Artwork, "Artwork", "music-note-regular", "music-note-fill"),
+            (DockView::Queue, "Queue", "list-bullets-regular", "list-bullets-regular"),
         ];
         let mut pill = div()
             .relative()
@@ -385,14 +471,18 @@ impl Shell {
             .p(t.s(4.0))
             .rounded_full()
             .map(|d| crate::ui::glass_layers(d, &t, t.s(SWITCHER_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.switcher_glass(), t.switcher_glass(), vec![crate::ui::inset_ring(t.switcher_edge())]));
-        for (i, (view, regular, filled)) in items.into_iter().enumerate() {
+        for (i, (view, label, regular, filled)) in items.into_iter().enumerate() {
             let on = shown == view;
             let disabled = view == DockView::Lyrics && !has_lyrics;
-            // Songs dropped on the queue tab go to the end of Next in Queue.
+            let (lit, ticker) = crate::ui::toggle_ease(("dock-view-on", i), on);
+            let ink_state = crate::ui::ink(("dock-view", i));
+            let fill = t.switcher_on();
+            // they join the end of Next in Queue.
             let drop = (view == DockView::Queue).then(|| self.drop_mark("queue-tab", crate::song_drop::SongTarget::QueueEnd, R_MD, 0.0)).flatten();
             pill = pill.child(
                 div()
                     .id(("dock-view", i))
+                    .tooltip(crate::ui::tip(&t, if disabled { tr("No lyrics for this song") } else { tr(label) }))
                     .relative()
                     .children(drop)
                     .w(t.s(item_w))
@@ -401,13 +491,14 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .rounded_full()
-                    .when(on, |d| d.bg(t.switcher_on()))
-                    .opacity(if disabled { 0.3 } else if on { 1.0 } else { crate::ui::ink(("dock-view", i)).opacity(SWITCHER_REST) })
-                    .when(!disabled && !on, |d| d.child(crate::ui::hover_track(("dock-view", i))))
+                    .child(ticker)
+                    .when(lit > 0.0, |d| d.bg(gpui::Rgba { a: fill.a * lit, ..fill }))
+                    .opacity(if disabled { 0.3 } else { let rest = ink_state.opacity(SWITCHER_REST); rest + (1.0 - rest) * lit })
+                    .when(!disabled, |d| d.child(crate::ui::hover_track(("dock-view", i))).paint_scale(ink_state.press_scale()))
                     .when(!disabled, |d| {
                         d.stop(&t).on_click(cx.listener(move |this, _, _, cx| this.set_view(view, cx)))
                     })
-                    .child(icon(&t, if on { filled } else { regular }, 21.0, if on { t.t_em().into() } else { ink })),
+                    .child(icon(&t, if on { filled } else { regular }, 21.0, crate::ui::mix_hsla(ink, t.t_em(), lit))),
             );
         }
         pill.into_any_element()
@@ -428,7 +519,7 @@ impl Shell {
         let scale = layout.scale;
         let mut art_logical = px(geometry.art_h as f32 / scale);
         let mut stack_logical = px((geometry.reflect_top + geometry.reflect_h).max(geometry.art_h) as f32 / scale);
-        // During a drag the last bake is drawn at its own proportions, not stretched to the new box.
+        // during a drag the last bake keeps its proportions instead of stretching.
         if let Some((_, baked)) = bake.as_ref().filter(|_| self.dock_resizing()) {
             let k = geometry.width as f32 / baked.geometry.width.max(1) as f32;
             art_logical = px(baked.geometry.art_h as f32 * k / scale);
@@ -474,18 +565,18 @@ impl Shell {
                     .bg(gpui::linear_gradient(180.0, gpui::linear_color_stop(gpui::rgba(crate::theme::DOCK_HEAD_SHADE), 0.0), gpui::linear_color_stop(gpui::transparent_black(), 1.0))),
             )
             ;
-        let expand = crate::ui::ink_button(&t, "expand", "nv-expand", 22.0, t.t_on_art(), t.t_on_art())
+        let expand = crate::ui::player_button(&t, "expand", tr("Expand player"), "nv-expand", 22.0, t.t_on_art(), t.t_on_art(), crate::ui::Feel::PLAYER)
             .relative()
             .occlude()
             .stop(&t).on_click(cx.listener(|this, _, _, cx| {
                 this.expanded = true;
                 cx.notify();
             }));
-        let mini = crate::ui::ink_button(&t, "dock-mini", "picture-in-picture-regular", 22.0, t.t_on_art(), t.t_on_art())
+        let mini = crate::ui::player_button(&t, "dock-mini", tr("Mini Player"), "picture-in-picture-regular", 22.0, t.t_on_art(), t.t_on_art(), crate::ui::Feel::PLAYER)
             .relative()
             .occlude()
             .stop(&t).on_click(cx.listener(|this, _, _, cx| this.open_mini_player(cx)));
-        let to_bar = crate::ui::ink_button(&t, "to-bar", "nv-bar", 22.0, t.t_on_art(), t.t_on_art())
+        let to_bar = crate::ui::player_button(&t, "to-bar", tr("Move player to the bottom"), "nv-bar", 22.0, t.t_on_art(), t.t_on_art(), crate::ui::Feel::PLAYER)
             .relative()
             .occlude()
             .stop(&t).on_click(cx.listener(|this, _, _, cx| this.set_mode(PlayerMode::Bar, cx)));
@@ -511,13 +602,24 @@ impl Shell {
         let left_tokens = if fits_centered { (dock_tokens - total) / 2.0 } else { left_group + SWITCHER_MARGIN + (room - total).max(0.0) / 2.0 };
         let head = head.child(div().absolute().top(px(0.0)).bottom(px(0.0)).left(t.s(left_tokens)).flex().items_center().child(div().occlude().child(switcher)));
 
-        let body: AnyElement = match self.shown_view() {
-            DockView::Artwork => self.render_dock_artwork(bake.as_ref().map(|(_, b)| b.art_stack.clone()), art_logical, stack_logical, geometry.width as f32 / scale, &song, layout, cx),
-            // Under the expanded player, only one of them may lay out the lyrics and queue.
-            DockView::Lyrics | DockView::Queue if self.expanded => div().into_any_element(),
-            DockView::Lyrics => self.render_lyrics_panel(false, layout.dock_width, t.s(76.0), layout, cx),
-            DockView::Queue => self.render_queue_panel(t.s(76.0), layout.scale, cx),
+        let art_stack = bake.as_ref().map(|(_, b)| b.art_stack.clone());
+        let mut body_of = |this: &mut Self, view: DockView| -> AnyElement {
+            match view {
+                DockView::Artwork => this.render_dock_artwork(art_stack.clone(), art_logical, stack_logical, geometry.width as f32 / scale, &song, layout, cx),
+                // under the expanded player only one of them may lay out the lyrics and queue.
+                DockView::Lyrics | DockView::Queue if this.expanded => div().into_any_element(),
+                DockView::Lyrics => this.render_lyrics_panel(false, layout.dock_width, t.s(76.0), layout, cx),
+                DockView::Queue => this.render_queue_panel(t.s(76.0), layout.scale, cx),
+            }
         };
+        let view = self.shown_view();
+        let (swap, swap_ticker) = crate::ui::swap("dock-view", &view, motion::VIEW_FADE);
+        let rise = t.s(motion::VIEW_RISE);
+        let mut body = div().relative().flex_1().min_h(px(0.0)).child(swap_ticker);
+        if let Some(old) = swap.leaving {
+            body = body.child(crate::ui::swap_layer(body_of(self, old), swap.shown, rise, false));
+        }
+        body = body.child(crate::ui::swap_layer(body_of(self, view), swap.shown, rise, true));
 
         let foot = div()
             .relative()
@@ -526,10 +628,10 @@ impl Shell {
             .px(t.s(32.0))
             .pb(t.s(28.0))
             .when_some(self.render_player_chip(false, dim, fg, cx), |d, offer| d.child(offer))
-            .child(self.render_meta_row(&song, fg, dim, cx))
-            .child(self.render_scrubber(crate::view_dock::ScrubVariant::Stacked, t.player_track(), fg, dim, cx))
-            .child(self.render_transport(fg, cx))
-            .child(self.render_volume_row(dim, fg, cx));
+            .child(self.render_meta_row(&song, fg, dim, crate::ui::Feel::PLAYER, cx))
+            .child(self.render_scrubber(crate::view_dock::ScrubVariant::Stacked, t.player_track(), fg, dim, crate::ui::Feel::PLAYER, cx))
+            .child(self.render_transport(fg, crate::ui::Feel::PLAYER, cx))
+            .child(self.render_volume_row(dim, fg, crate::ui::Feel::PLAYER, cx));
 
         div()
             .id("dock")
@@ -547,7 +649,7 @@ impl Shell {
             // Songs dragged over the dock leave their list. The dock's queue and queue tab accept them.
             .children(self.drop_mark("dock", crate::song_drop::SongTarget::Surface, R_LG, 0.0))
             .child(background)
-            .child(div().relative().flex_1().min_h(px(0.0)).child(body))
+            .child(body)
             .child(foot)
             .child(head)
             .child(
@@ -612,7 +714,7 @@ impl Shell {
                 .items_center()
                 .justify_center()
                 .rounded_full()
-                .map(|d| crate::ui::glass_layers(d, &t, t.s(CONTROL_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass_frost_fill(), t.glass_fill(), crate::ui::glass_edge()))
+                .map(|d| crate::ui::glass_layers(d, &t, t.s(CONTROL_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass(), t.glass_fill(), crate::ui::glass_edge()))
                 .opacity(0.0)
                 .group_hover("featured-row", |s| s.opacity(1.0))
                 .hover(|s| s.bg(t.hover()).opacity(1.0))
@@ -624,6 +726,7 @@ impl Shell {
                     h.set_offset(point((current.x - page * dir).clamp(-max, px(0.0)), current.y));
                     window.refresh();
                 }))
+                .tooltip(crate::ui::tip(&t, if dir < 0.0 { tr("Scroll left") } else { tr("Scroll right") }))
                 .child(icon(&t, if dir < 0.0 { "caret-left-bold" } else { "caret-right-bold" }, 18.0, t.t1()))
         };
         div()
@@ -640,9 +743,18 @@ impl Shell {
     fn render_dock_artwork(&mut self, art: Option<std::sync::Arc<gpui::RenderImage>>, art_h: gpui::Pixels, stack_h: gpui::Pixels, width: f32, song: &crate::model::Song, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let radius = t.s(R_LG);
-        let stack = div().relative().h(art_h).w_full().when_some(art, move |d, image| {
-            d.child(crate::ui::image(image).absolute().left(px(0.0)).top(px(0.0)).w(px(width)).h(stack_h).rounded_t(radius))
-        });
+        // the artwork cross-fades as the next song's arrives; the old one stays in the last bake until then.
+        let shown_album = art.as_ref().map(|_| song.album_id.clone());
+        let (swap, swap_ticker) = crate::ui::swap("dock-art", &shown_album, motion::SONG_FADE);
+        let old_art = swap.leaving.flatten().and_then(|old| self.dock_bake.as_ref().filter(|(id, _)| *id == old).map(|(_, b)| b.art_stack.clone()));
+        let layer = |image: std::sync::Arc<gpui::RenderImage>, opacity: f32| crate::ui::image(image).absolute().left(px(0.0)).top(px(0.0)).w(px(width)).h(stack_h).rounded_t(radius).opacity(opacity);
+        let stack = div()
+            .relative()
+            .h(art_h)
+            .w_full()
+            .child(swap_ticker)
+            .when_some(old_art, |d, image| d.child(layer(image, 1.0 - swap.shown)))
+            .when_some(art, |d, image| d.child(layer(image, swap.shown)));
 
         // A vertical scroll moves the row while it can, then the dock takes over.
         let row_handle = self.featured_scroll.clone();
@@ -698,7 +810,7 @@ impl Shell {
                 .text_center()
                 .line_height(relative(1.25))
                 .child(photo)
-                .child(div().w_full().line_clamp(2).when(known.is_some(), |d| d.group_hover(group, |s| s.underline())).child(artist.clone()));
+                .child(div().id("name").w_full().line_clamp(2).when(known.is_some(), |d| d.group_hover(group, |s| s.underline())).child(artist.clone()).full_text_tip(&t, artist.clone()));
             people = people.child(match known {
                 Some(id) => person.on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
@@ -737,7 +849,7 @@ impl Shell {
             .absolute()
             .inset_0()
             .child(div().id("dock-art-scroll").absolute().inset_0().overflow_y_scroll().track_scroll(&self.dock_art_scroll).child(stack).when(station_playing.is_none(), |d| d.child(div().mt(t.s(-8.0)).child(featured))))
-            .child(self.render_scrollbar("dock-art", crate::ui_scroll::ScrollSource::Handle(self.dock_art_scroll.clone()), t.s(76.0), t.s(8.0), layout.scale, cx))
+            .child(self.render_scrollbar("dock-art", crate::ui_scroll::ScrollSource::Handle(self.dock_art_scroll.clone()), t.s(76.0), t.s(8.0), cx))
             .child(
                 div().absolute().left(px(0.0)).right(px(0.0)).bottom(px(0.0)).h(t.s(28.0)).bg(gpui::linear_gradient(
                     180.0,
@@ -756,48 +868,67 @@ impl Shell {
     }
 
     /// The title, the artists in `dim`, then the heart and More in `fg`.
-    pub fn render_meta_row(&mut self, song: &crate::model::Song, fg: gpui::Hsla, dim: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_meta_row(&mut self, song: &crate::model::Song, fg: gpui::Hsla, dim: gpui::Hsla, feel: crate::ui::Feel, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let song_ix = self.player.song_ix.unwrap_or(0) as u32;
         let starred = self.is_starred(song_ix);
         let station = self.player.station.is_some();
-        // The title links to its album and each artist to their page.
-        let (title, artists): (AnyElement, AnyElement) = if station {
-            (div().truncate().child(song.title.clone()).into_any_element(), div().truncate().text_color(dim).child(song.artist.clone()).into_any_element())
+        // too long, they scroll.
+        let host = self.marquees.current.unwrap_or(crate::marquee::Host::Player);
+        let keys = if host == crate::marquee::Host::Expanded { ("expanded-title", "expanded-artist") } else { ("dock-title", "dock-artist") };
+        // the side player's title cross-fades on a song change; full screen it just changes.
+        let (swap, swap_ticker) = if host == crate::marquee::Host::Expanded {
+            (crate::ui::Swapping { shown: 1.0, leaving: None }, div().into_any_element())
         } else {
-            let target = (!song.album_id.is_empty()).then(|| crate::song_links::LinkTarget::Album(song.album_id.clone()));
-            (self.link(("player-title", 0), song.title.clone(), target, t.t_on_art().into(), cx), self.artist_links(("player-artist", 0), song, dim, cx))
+            self.song_swap("dock-song", song)
         };
+        let (title, artists) = self.player_names(song, keys, host, (TEXT_LG, TEXT_MD), 1.4, (t.t_on_art().into(), dim), swap.shown, cx);
+        let leaving = swap.leaving.map(|old| self.leaving_names(&old.0, (TEXT_LG, TEXT_MD), 1.4, (t.t_on_art().into(), dim), 1.0 - swap.shown));
         div()
             .flex()
             .flex_row()
             .items_center()
-            .mb(t.s(16.0))
+            .mb(t.s(PLAYER_META_GAP))
             .child(
                 div()
                     .id("meta-title")
+                    .relative()
+                    .child(swap_ticker)
+                    .children(leaving)
                     .flex_1()
                     .min_w(px(0.0))
                     .line_height(relative(1.4))
                     // Right-click on the song opens the same menu as More.
                     .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| this.open_player_menu(event.position, false, cx)))
-                    .child(crate::ui::titled(&t, div().flex().min_w(px(0.0)).overflow_hidden().text_size(t.text(TEXT_LG)).font_weight(FontWeight::MEDIUM).text_color(t.t_on_art()).child(title), song.explicit, TEXT_LG))
+                    .child(crate::ui::titled(&t, div().flex().min_w(px(0.0)).overflow_hidden().text_size(t.text(TEXT_LG)).font_weight(FontWeight::MEDIUM).text_color(t.t_on_art()).child(title), song.explicit, TEXT_LG).opacity(swap.shown))
                     .child(div().flex().min_w(px(0.0)).overflow_hidden().child(artists))
                     .children(self.output_badge(false, false, dim)),
             )
             .child(
-                crate::ui::ink_button(&t, "meta-star", if starred { "heart-fill" } else { "heart-regular" }, 20.0, fg, fg)
+                crate::ui::player_button(&t, "meta-star", if station { tr(crate::ui::STATION_NO_STAR) } else { tr("Favorite") }, if starred { "heart-fill" } else { "heart-regular" }, 20.0, fg, fg, feel)
                     .when(!station, |d| {
                         d.stop(&t).on_click(cx.listener(move |this, _, _, cx| {
+                            if !starred {
+                                crate::ui::pop("meta-star");
+                            }
                             this.toggle_song_star(song_ix, cx);
                         }))
                     })
                     .when(station, |d| crate::ui::locked(d).on_click(cx.listener(|this, _, _, cx| this.show_toast(tr(crate::ui::STATION_NO_STAR), cx)))),
             )
             .child(
-                crate::ui::ink_button(&t, "meta-more", "dots-three-bold", 20.0, fg, fg)
-                    .stop(&t).on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| this.open_player_menu(event.position() + point(px(0.0), this.theme.s(14.0)), true, cx))),
+                crate::ui::menu_on_press(crate::ui::player_menu_button(&t, "meta-more", tr("More"), "dots-three-bold", 20.0, fg, fg, feel).stop(&t), cx, |this, at, cx| this.open_player_menu(at + point(px(0.0), this.theme.s(14.0)), true, cx)),
             )
             .into_any_element()
+    }
+}
+
+/// a song compared by id, so a cross-fade runs only when the song itself changes.
+#[derive(Clone)]
+pub struct SongById(pub crate::model::Song);
+
+impl PartialEq for SongById {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
     }
 }

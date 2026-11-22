@@ -73,7 +73,13 @@ impl Shell {
         let list = self.add_list(all);
         let table = self.add_list(shown.clone());
         let actions = Shell::plain_block(move |this, layout, _, cx| this.render_liked_actions(list, has_songs, layout, cx));
-        let mut blocks = vec![Block::Spacer(6.0), actions];
+        let head = Shell::plain_block(|this, layout, _, cx| {
+            let t = this.theme;
+            let about = crate::view_about::AboutText { title: tr("Liked Songs").into(), subtitle: None, art: Some(crate::art::LIKED_COVER.into()), text: tr("Every song you've liked, newest first.").into() };
+            let below = div().child(div().mt(t.s(14.0)).child(this.liked_summary())).child(this.header_more_text("liked-desc", about, cx)).into_any_element();
+            this.render_collection_head(&crate::art::LIKED_COVER.into(), tr("Liked Songs").into(), below, layout, cx)
+        });
+        let mut blocks = vec![head, Block::Spacer(28.0), actions];
         if shown.is_empty() {
             if has_songs {
                 blocks.push(Block::Spacer(32.0));
@@ -126,8 +132,8 @@ impl Shell {
             .w(layout.main_width)
             .child(self.render_play_actions(list, has_songs, cx))
             .child(div().flex_1())
-            .child(glass_pill(&t).child(icon_button(&t, "liked-sort", "arrows-down-up-regular", sort.is_some()).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-                // The list's own order first, then the ascending column sorts.
+            .child(glass_pill(&t).child(icon_button(&t, "liked-sort", tr("Sort"), "arrows-down-up-regular", sort.is_some()).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                // The list's own order first, then the column sorts (ascending).
                 let rows = [(None, tr("Recently Liked")), (Some(SortColumn::Title), tr("Title")), (Some(SortColumn::Artist), tr("Artist")), (Some(SortColumn::Album), tr("Album")), (Some(SortColumn::Time), tr("Length"))]
                     .into_iter()
                     .map(|(o, label)| MenuRow::check(label, sort == o, move |this, cx| {

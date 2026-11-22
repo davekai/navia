@@ -4,27 +4,12 @@ use crate::i18n::{tr, trf};
 use crate::pages::{AlbumScope, Block, CardItem, PageMetrics, Route};
 use crate::shell::{Layout, Shell};
 
-/// Essentials tiles need at least this many songs.
-const ESSENTIALS_MIN: usize = 8;
-/// How far down the top artists to look for tiles, to bound the work.
-const ESSENTIALS_LOOK_AT: usize = 80;
-
 impl Shell {
     pub fn build_home(&mut self, layout: &Layout) -> Vec<Block> {
         let m = PageMetrics::of(layout);
         let taste = self.library.as_ref().map(|l| l.home_taste()).unwrap_or_default();
         let artists = self.artists.clone();
-        let mut essentials = Vec::new();
-        // Only artists this user has actually played, recent favorites first.
-        for i in taste.artists.iter().copied().take(ESSENTIALS_LOOK_AT) {
-            let Some(artist) = artists.get(i as usize) else { continue };
-            if self.top_songs(&artist.id).len() >= ESSENTIALS_MIN {
-                essentials.push(CardItem::Essentials(i));
-                if essentials.len() == 12 {
-                    break;
-                }
-            }
-        }
+        let essentials: Vec<CardItem> = taste.essentials.iter().map(|i| CardItem::Essentials(*i)).collect();
         let world = taste.world_of.and_then(|i| artists.get(i as usize).cloned());
         let albums = self.albums.clone();
         let mut recent: Vec<u32> = (0..albums.len() as u32).collect();
@@ -64,6 +49,8 @@ impl Shell {
             shelf.link_sort = Some(crate::view_albums::AlbumSort::Added);
         }
         sections.push(recent);
+        let upcoming = self.upcoming_home_cards();
+        sections.push(self.shelf_block(tr("Upcoming"), None, upcoming, false, 1));
         sections.push(self.shelf_block(tr("Essentials"), Some(Route::Artists), essentials, false, 1));
         sections.push(self.shelf_block(tr("Most Played"), Some(Route::Albums(AlbumScope::All)), top, false, 2));
         sections.push(self.shelf_block(tr("Back in Rotation"), None, artist_cards(&taste.back_in_rotation), false, 0));

@@ -18,13 +18,48 @@ pub enum DockView {
     Queue,
 }
 
-/// What happens between songs. Smart crossfades like Crossfade, but plays gapless when the next
-/// song continues the album in order.
+/// Navidrome has no pins, so they stay on the device. own playlists start pinned and others' don't; these lists hold the exceptions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SidebarPins {
+    pub pinned: Vec<String>,
+    pub unpinned: Vec<String>,
+}
+
+impl SidebarPins {
+    pub fn is_pinned(&self, id: &str, by_default: bool) -> bool {
+        if self.pinned.iter().any(|p| p == id) {
+            return true;
+        }
+        if self.unpinned.iter().any(|p| p == id) {
+            return false;
+        }
+        by_default
+    }
+
+    pub fn set(&mut self, id: &str, on: bool, by_default: bool) {
+        self.pinned.retain(|p| p != id);
+        self.unpinned.retain(|p| p != id);
+        if on != by_default {
+            if on { &mut self.pinned } else { &mut self.unpinned }.push(id.to_string());
+        }
+    }
+}
+
+/// what happens between songs. Smart crossfades except where the next song continues the album in order (gapless).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BetweenSongs {
     Gapless,
     Crossfade,
     Smart,
+    /// Smart transitions: each join shaped from the songs; the crossfade length is only its fallback.
+    Mix,
+}
+
+impl BetweenSongs {
+    /// album tracks in order join gapless.
+    pub fn smart(self) -> bool {
+        matches!(self, BetweenSongs::Smart | BetweenSongs::Mix)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +70,9 @@ pub struct Prefs {
     /// Interface size in percent, 70 to 130.
     pub zoom: u32,
     pub accent: u32,
+    /// follows the desktop's accent, snapped to the closest preset, instead of `accent`.
+    pub accent_system: bool,
+    pub accent_system_migrated: bool,
     pub volume: f32,
     pub muted: bool,
     /// The user's Translucency choice. `None` follows the desktop, on only where blur behind
@@ -58,6 +96,12 @@ pub struct Prefs {
     pub lanyard_address: String,
     /// Lyrics blur and dim by distance from the current line.
     pub lyric_blur: bool,
+    /// lyric effects.
+    pub lyric_effects: bool,
+    /// off, the current line lights whole, with no rising words.
+    pub lyric_sweep: bool,
+    /// off, bracketed backing vocals stay inline, as written.
+    pub backing_vocals_line: bool,
     pub between_songs: BetweenSongs,
     /// Crossfade length, 1 to 12 seconds.
     pub crossfade_s: u32,
@@ -65,10 +109,14 @@ pub struct Prefs {
     pub output_device: Option<String>,
     /// The sidebar's custom playlist order, by account, as playlist ids. Absent means the default.
     pub sidebar_orders: std::collections::HashMap<String, Vec<String>>,
-    /// The song tables' optional columns in `view_rows::OptCol` order: Artist, Album, Genre,
-    /// Date Added, Plays. Chosen from a table header's context menu.
+    /// sidebar pins by account; only changes from the default are kept.
+    pub sidebar_pins: std::collections::HashMap<String, SidebarPins>,
+    /// the song tables' optional columns in `view_rows::OptCol` order.
     pub columns: [bool; 5],
-    /// Autoplay. On by default.
+    /// the album tables' columns in `view_rows::AlbumCol` order, kept apart from `columns`.
+    /// heat starts on (shown only while offered) and a pick flips just that column, so it stays on unless hidden itself.
+    pub album_columns: [bool; 3],
+    /// Settings > Playback > Autoplay, on by default.
     pub autoplay: bool,
     /// Shuffle style, Fewer Repeats by default or Standard.
     pub shuffle_style: navia_core::queue_order::ShuffleStyle,
@@ -78,6 +126,8 @@ pub struct Prefs {
     /// Scrobbling choices by account (`Library::account_key`). A missing entry means on. Private
     /// mode overrides it. The legacy `scrobble` field is ignored because it never reflected a choice.
     pub scrobble_choices: std::collections::HashMap<String, bool>,
+    /// accounts with the offline switch on.
+    pub offline_accounts: std::collections::BTreeSet<String>,
     /// Discord status. Off until the user turns it on. Private mode overrides it.
     pub discord_status: bool,
     pub discord_art: DiscordArt,
@@ -106,6 +156,8 @@ pub struct Prefs {
     /// Albums and Artists show the split view instead of the grid.
     pub album_split: bool,
     pub artist_split: bool,
+    /// the time under the seek bar shows what's left (`-1:23`) rather than the length.
+    pub time_remaining: bool,
 }
 
 /// Where Discord's album art comes from.
@@ -119,7 +171,7 @@ pub enum DiscordArt {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { mode: PlayerMode::Dock, view: DockView::Artwork, sidebar_open: true, zoom: 100, accent: 0x5a93f5, volume: 80.0, muted: false, translucent: None, system_title_bar: false, dock_width: crate::theme::size::DOCK_W, sidebar_width: crate::theme::size::SIDEBAR_W, private_mode: false, share_listening: false, listeners_control: false, spotify_friends: Vec::new(), lanyard_address: String::new(), lyric_blur: true, between_songs: BetweenSongs::Gapless, crossfade_s: 6, output_device: None, sidebar_orders: Default::default(), columns: [true, true, false, false, false], autoplay: true, shuffle_style: Default::default(), playlist_sorts: Default::default(), scrobble_choices: Default::default(), discord_status: false, discord_art: DiscordArt::MatchPublic, discord_public_address: String::new(), discord_covers_from: Default::default(), library_sync: true, language: None, mini_size: None, mini_at: None, mini_hint_seen: false, mini_on_minimize: false, close_to_tray: true, check_updates: true, album_split: false, artist_split: false }
+        Self { mode: PlayerMode::Dock, view: DockView::Artwork, sidebar_open: true, zoom: 100, accent: crate::color::DEFAULT_ACCENT, accent_system: false, accent_system_migrated: false, volume: 80.0, muted: false, translucent: None, system_title_bar: false, dock_width: crate::theme::size::DOCK_W, sidebar_width: crate::theme::size::SIDEBAR_W, private_mode: false, share_listening: false, listeners_control: false, spotify_friends: Vec::new(), lanyard_address: String::new(), lyric_blur: true, lyric_effects: true, lyric_sweep: true, backing_vocals_line: true, between_songs: BetweenSongs::Gapless, crossfade_s: 6, output_device: None, sidebar_orders: Default::default(), sidebar_pins: Default::default(), columns: [true, true, false, false, false], album_columns: [true, false, true], autoplay: true, shuffle_style: Default::default(), playlist_sorts: Default::default(), scrobble_choices: Default::default(), offline_accounts: Default::default(), discord_status: false, discord_art: DiscordArt::MatchPublic, discord_public_address: String::new(), discord_covers_from: Default::default(), library_sync: true, language: None, mini_size: None, mini_at: None, mini_hint_seen: false, mini_on_minimize: false, close_to_tray: true, check_updates: true, album_split: false, artist_split: false, time_remaining: false }
     }
 }
 
@@ -177,6 +229,16 @@ impl Prefs {
         self.translucent.unwrap_or(blur_detected)
     }
 
+    /// one-release migration: every install moves to the System accent once, then later choices stick. true when it ran.
+    pub fn migrate_to_system_accent(&mut self) -> bool {
+        if self.accent_system_migrated {
+            return false;
+        }
+        self.accent_system = true;
+        self.accent_system_migrated = true;
+        true
+    }
+
     pub fn load() -> Self {
         let mut prefs = Self::default();
         let Some(path) = path() else { return prefs };
@@ -203,6 +265,10 @@ impl Prefs {
                 prefs.accent = c;
             }
         }
+        if let Some(on) = value.get("accent_system").and_then(Value::as_bool) {
+            prefs.accent_system = on;
+        }
+        prefs.accent_system_migrated = value.get("accent_system_migrated").and_then(Value::as_bool).unwrap_or(false);
         if let Some(v) = value.get("volume").and_then(Value::as_f64) {
             prefs.volume = v as f32;
         }
@@ -230,6 +296,10 @@ impl Prefs {
         if let Some(w) = value.get("sidebar_width").and_then(Value::as_f64) {
             prefs.sidebar_width = (w as f32).clamp(crate::theme::size::SIDEBAR_W_MIN, crate::theme::size::SIDEBAR_W_MAX);
         }
+        if let Some(list) = value.get("album_columns").and_then(Value::as_array) {
+            let names: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
+            prefs.album_columns = crate::view_rows::AlbumCol::ALL.map(|c| names.contains(&c.key()));
+        }
         if let Some(list) = value.get("columns").and_then(Value::as_array) {
             let names: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
             prefs.columns = crate::view_rows::OptCol::ALL.map(|c| names.contains(&c.key()));
@@ -244,6 +314,10 @@ impl Prefs {
         if let Some(map) = value.get("playlist_sorts").and_then(Value::as_object) {
             prefs.playlist_sorts = map.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect();
         }
+        if let Some(map) = value.get("sidebar_pins").and_then(Value::as_object) {
+            let ids = |v: &Value, key: &str| v.get(key).and_then(Value::as_array).map(|ids| ids.iter().filter_map(|i| i.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            prefs.sidebar_pins = map.iter().map(|(k, v)| (k.clone(), SidebarPins { pinned: ids(v, "pinned"), unpinned: ids(v, "unpinned") })).collect();
+        }
         if let Some(map) = value.get("sidebar_orders").and_then(Value::as_object) {
             prefs.sidebar_orders = map.iter().map(|(k, v)| (k.clone(), v.as_array().map(|ids| ids.iter().filter_map(|i| i.as_str().map(str::to_string)).collect()).unwrap_or_default())).collect();
         }
@@ -251,11 +325,21 @@ impl Prefs {
         if let Some(b) = value.get("lyric_blur").and_then(Value::as_bool) {
             prefs.lyric_blur = b;
         }
+        if let Some(b) = value.get("lyric_effects").and_then(Value::as_bool) {
+            prefs.lyric_effects = b;
+        }
+        if let Some(b) = value.get("lyric_sweep").and_then(Value::as_bool) {
+            prefs.lyric_sweep = b;
+        }
+        if let Some(b) = value.get("backing_vocals_line").and_then(Value::as_bool) {
+            prefs.backing_vocals_line = b;
+        }
         prefs.language = value.get("language").and_then(Value::as_str).filter(|l| *l != "system").map(str::to_string);
         if let Some(s) = value.get("between_songs").and_then(Value::as_str) {
             prefs.between_songs = match s {
                 "crossfade" => BetweenSongs::Crossfade,
                 "smart" => BetweenSongs::Smart,
+                "mix" => BetweenSongs::Mix,
                 _ => BetweenSongs::Gapless,
             };
         }
@@ -265,6 +349,9 @@ impl Prefs {
         prefs.output_device = value.get("output_device").and_then(Value::as_str).map(str::to_string);
         if let Some(map) = value.get("scrobble_choices").and_then(Value::as_object) {
             prefs.scrobble_choices = map.iter().filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b))).collect();
+        }
+        if let Some(list) = value.get("offline_accounts").and_then(Value::as_array) {
+            prefs.offline_accounts = list.iter().filter_map(Value::as_str).map(str::to_string).collect();
         }
         if let Some(b) = value.get("discord_status").and_then(Value::as_bool) {
             prefs.discord_status = b;
@@ -294,6 +381,7 @@ impl Prefs {
         prefs.mini_on_minimize = value.get("mini_on_minimize").and_then(Value::as_bool).unwrap_or(false);
         prefs.close_to_tray = value.get("close_to_tray").and_then(Value::as_bool).unwrap_or(true);
         prefs.check_updates = value.get("check_updates").and_then(Value::as_bool).unwrap_or(true);
+        prefs.time_remaining = value.get("time_remaining").and_then(Value::as_bool).unwrap_or(false);
         prefs.album_split = value.get("album_layout").and_then(Value::as_str) == Some("split");
         prefs.artist_split = value.get("artist_layout").and_then(Value::as_str) == Some("split");
         // Drop the legacy "generated_covers" key from the file.
@@ -323,6 +411,8 @@ impl Prefs {
             "sidebar": self.sidebar_open,
             "zoom": self.zoom,
             "accent": format!("#{:06X}", self.accent),
+            "accent_system": self.accent_system,
+            "accent_system_migrated": self.accent_system_migrated,
             "volume": self.volume,
             "muted": self.muted,
             "translucency_choice": self.translucent,
@@ -335,15 +425,20 @@ impl Prefs {
             "dock_width": self.dock_width,
             "sidebar_width": self.sidebar_width,
             "lyric_blur": self.lyric_blur,
+            "lyric_effects": self.lyric_effects,
+            "lyric_sweep": self.lyric_sweep,
+            "backing_vocals_line": self.backing_vocals_line,
             "language": self.language,
             "between_songs": match self.between_songs {
                 BetweenSongs::Gapless => "gapless",
                 BetweenSongs::Crossfade => "crossfade",
                 BetweenSongs::Smart => "smart",
+                BetweenSongs::Mix => "mix",
             },
             "crossfade_s": self.crossfade_s,
             "output_device": self.output_device,
             "scrobble_choices": self.scrobble_choices,
+            "offline_accounts": self.offline_accounts,
             "discord_status": self.discord_status,
             "discord_art": if self.discord_art == DiscordArt::Default { "default" } else { "public" },
             "discord_public_address": self.discord_public_address,
@@ -354,7 +449,9 @@ impl Prefs {
             },
             "library_sync": self.library_sync,
             "sidebar_orders": self.sidebar_orders,
+            "sidebar_pins": self.sidebar_pins.iter().map(|(k, p)| (k.clone(), serde_json::json!({ "pinned": p.pinned, "unpinned": p.unpinned }))).collect::<serde_json::Map<String, Value>>(),
             "columns": crate::view_rows::OptCol::ALL.iter().filter(|c| self.columns[**c as usize]).map(|c| c.key()).collect::<Vec<_>>(),
+            "album_columns": crate::view_rows::AlbumCol::ALL.iter().filter(|c| self.album_columns[**c as usize]).map(|c| c.key()).collect::<Vec<_>>(),
             "autoplay": self.autoplay,
             "shuffle_style": if self.shuffle_style == navia_core::queue_order::ShuffleStyle::Standard { "standard" } else { "fewer" },
             "playlist_sorts": self.playlist_sorts,
@@ -365,8 +462,29 @@ impl Prefs {
             "close_to_tray": self.close_to_tray,
             "check_updates": self.check_updates,
             "album_layout": if self.album_split { "split" } else { "grid" },
+            "time_remaining": self.time_remaining,
             "artist_layout": if self.artist_split { "split" } else { "grid" },
         });
         let _ = std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap_or_default());
+    }
+}
+
+#[cfg(test)]
+mod system_accent_migration_tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_colour_moves_to_system_once() {
+        let mut prefs = Prefs { accent: 0xf2685c, ..Prefs::default() };
+        assert!(prefs.migrate_to_system_accent());
+        assert!(prefs.accent_system && prefs.accent_system_migrated);
+        assert_eq!(prefs.accent, 0xf2685c);
+    }
+
+    #[test]
+    fn a_choice_after_the_migration_sticks() {
+        let mut prefs = Prefs { accent: 0x8b7cf6, accent_system: false, accent_system_migrated: true, ..Prefs::default() };
+        assert!(!prefs.migrate_to_system_accent());
+        assert!(!prefs.accent_system);
     }
 }

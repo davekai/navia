@@ -26,21 +26,28 @@ pub enum ScriptAction {
     RowMenu(usize),
     Maximize,
     Fullscreen,
-    /// A button layout with `+` standing in for commas, since commas separate script steps.
+    /// `+` stands in for commas, since commas separate script steps.
     Buttons(String),
     Enter,
     /// A page action for screenshots, like `page=shelfscroll+0+600`. See `Shell::page_script`.
     Page(String),
-    /// Sets the dock width in tokens through the same clamp as a drag.
+    /// in tokens, through the same clamp as a drag.
     DockWidth(f32),
     DockReset,
-    /// Marks a dock drag as started or ended, without a pointer.
+    /// without a pointer.
     DockDrag(bool),
     Report,
     /// Minimizes (`hidden=1`) or shows (`hidden=0`) the window through the platform's visibility path.
     Hidden(bool),
-    /// Drives the real player, like `core=pause` or `core=seek+90`. See `Shell::core_script`.
+    /// as the desktop setting would.
+    Reduce(bool),
+    /// `core=pause`, `core=seek+90`; see `Shell::core_script`.
     Core(String),
+    Back,
+    /// favorites the playing song as its heart in the side player would.
+    Like,
+    /// adds the first N songs of the Songs list to the queue.
+    AddQueue(usize),
 }
 
 pub fn parse_script(text: &str) -> Vec<(u64, ScriptAction)> {
@@ -56,7 +63,8 @@ pub fn parse_script(text: &str) -> Vec<(u64, ScriptAction)> {
             "scroll" => ScriptAction::Scroll(value.parse().unwrap_or(0.0)),
             "compact" => ScriptAction::Compact(value != "0"),
             "play" => ScriptAction::Play(value.parse().unwrap_or(0)),
-            "query" => ScriptAction::Query(value.to_string()),
+            // `+` stands in for spaces, as commas separate steps and the launcher splits on spaces
+            "query" => ScriptAction::Query(value.replace('+', " ")),
             "translucent" => ScriptAction::Translucent(value != "0"),
             "ownframe" => ScriptAction::OwnFrame(value != "0"),
             // click=3, click=5+ctrl, click=7+shift, click=3x2 for a double click.
@@ -73,12 +81,16 @@ pub fn parse_script(text: &str) -> Vec<(u64, ScriptAction)> {
             "dockdrag" => ScriptAction::DockDrag(value != "0"),
             "report" => ScriptAction::Report,
             "hidden" => ScriptAction::Hidden(value != "0"),
+            "reduce" => ScriptAction::Reduce(value != "0"),
             "core" => ScriptAction::Core(value.to_string()),
             "maximize" => ScriptAction::Maximize,
             "fullscreen" => ScriptAction::Fullscreen,
             "buttons" => ScriptAction::Buttons(value.replace('+', ",")),
             "sidebar" => ScriptAction::Toggle("sidebar"),
             "sortmenu" => ScriptAction::Toggle("sortmenu"),
+            "quality" => ScriptAction::Toggle("quality"),
+            "account" => ScriptAction::Toggle("account"),
+            "refresh" => ScriptAction::Toggle("refresh"),
             "view" => ScriptAction::Toggle(match value {
                 "lyrics" => "view-lyrics",
                 "queue" => "view-queue",
@@ -87,6 +99,9 @@ pub fn parse_script(text: &str) -> Vec<(u64, ScriptAction)> {
             "quit" => ScriptAction::Quit,
             "close" => ScriptAction::Close,
             "route" => ScriptAction::Route(value.to_string()),
+            "back" => ScriptAction::Back,
+            "like" => ScriptAction::Like,
+            "addqueue" => ScriptAction::AddQueue(value.parse().unwrap_or(1)),
             _ => continue,
         };
         out.push((t, action));
@@ -140,6 +155,12 @@ static FIRST_PAINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// Call first thing in main, for time-to-first-paint under `NAVIA_TIMING`.
 pub fn mark_process_start() {
     PROCESS_START.get_or_init(Instant::now);
+}
+
+/// `NAVIA_SLOW_MOTION=<factor>`: eased motion takes that many times longer, for captures mid-way.
+pub fn slow_motion() -> f32 {
+    static SLOW: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SLOW.get_or_init(|| std::env::var("NAVIA_SLOW_MOTION").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
 }
 
 /// Milliseconds since `mark_process_start`.
@@ -211,7 +232,7 @@ pub fn print_table(report: &[(String, Vec<Sample>)]) {
     }
 }
 
-/// Resident memory by what it maps, and the allocator's own view, for memory investigations.
+/// resident memory by mapping, and the allocator's view.
 pub fn print_memory_breakdown() {
     #[cfg(target_os = "windows")]
     print_windows_memory();

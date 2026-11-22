@@ -1,5 +1,6 @@
 //! Album, artist, playlist and tile cards, the shelves that hold them, and grid rows.
 
+use crate::ui::FullTextTip;
 use crate::i18n::{tr, trf, trn};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -11,8 +12,8 @@ use gpui::{AnyElement, BoxShadow, Context, FontWeight, RenderImage, ScrollHandle
 
 use crate::color::Srgb;
 use crate::pages::{Block, CardItem, PageMetrics, Route, Shelf};
-use crate::persist::PlayerMode;
 use crate::shell::{Layout, Shell};
+use crate::theme::motion;
 use crate::theme::size::*;
 use crate::ui::{glass_edge, icon};
 
@@ -31,6 +32,16 @@ impl Shell {
         self.artwork_el(image, kind, size, shape)
     }
 
+    /// large artwork (a page's header): the still cover, replaced by its frames when it moves.
+    pub fn hero_artwork(&mut self, id: &SharedString, kind: &'static str, size: f32, radius: f32, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        let device = (f32::from(t.s(size)) * layout.scale).round() as u32;
+        match self.moving_cover(id, device, "hero", Some(t.s(radius)), cx) {
+            Some(view) => div().size(t.s(size)).flex_none().child(view).into_any_element(),
+            None => self.artwork(Some(id), kind, size, ArtShape::Rounded(radius), layout),
+        }
+    }
+
     pub fn artwork_el(&self, image: Option<(Arc<RenderImage>, f32)>, kind: &'static str, size: f32, shape: ArtShape) -> AnyElement {
         let t = self.theme;
         let dim = t.s(size);
@@ -38,7 +49,7 @@ impl Shell {
             ArtShape::Circle => d.rounded_full(),
             ArtShape::Rounded(r) => d.rounded(t.s(r)),
         };
-        let placeholder = || round(div().size(dim).flex_none().bg(gpui::rgb(crate::theme::PANEL_2)).flex().items_center().justify_center()).child(icon(&t, kind, size * 0.4, t.t3()));
+        let placeholder = || round(div().size(dim).flex_none().bg(gpui::rgb(crate::theme::PANEL_2)).flex().items_center().justify_center()).child(icon(&t, kind, size * ART_GLYPH, t.t3()));
         match image {
             Some((image, fade)) => {
                 let el = crate::ui::image(image).size(dim);
@@ -62,7 +73,6 @@ impl Shell {
     fn card_shell(&self, id: (&'static str, usize), width: f32, group: SharedString, under: Option<AnyElement>, children: impl IntoElement) -> gpui::Stateful<gpui::Div> {
         let t = self.theme;
         crate::ui::press_dim(div().id(id))
-            .group(group)
             .relative()
             .flex()
             .flex_col()
@@ -71,12 +81,12 @@ impl Shell {
             .line_height(relative(1.3))
             .children(under)
             .child(children)
+            .child(crate::ui::card_track(&group))
     }
 
-    /// The artwork of a card, lifting a little on hover.
-    fn lift(&self, group: SharedString, art: AnyElement) -> AnyElement {
-        let lift = -self.theme.s(CARD_LIFT);
-        div().relative().group_hover(group, move |s| s.top(lift)).child(art).into_any_element()
+    /// the artwork of a card; it stays still on hover.
+    fn lift(&self, _group: SharedString, art: AnyElement) -> AnyElement {
+        art
     }
 
     pub fn render_card(&mut self, item: &CardItem, width: f32, ix: usize, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
@@ -86,6 +96,8 @@ impl Shell {
             CardItem::Album { index, by_artist } => {
                 let Some(album) = self.albums.get(*index as usize).cloned() else { return div().into_any_element() };
                 let art = self.artwork(Some(&album.id), "music-notes-fill", width, ArtShape::Rounded(R_MD), layout);
+                let today = navia_core::library::taste::local_day(navia_core::library::taste::now_unix());
+                let art = if album.is_new_release(today) { labelled_art(&t, art, tr("New||release")) } else { art };
                 let art = self.lift(group.clone(), art);
                 // Artist names are links. A click anywhere else opens the album.
                 let download = self.download_mark(navia_core::library::collections::CollectionKind::Album, &album.id).map(|m| div().flex_none().mr(t.s(DOWNLOAD_MARK_GAP)).child(m));
@@ -101,7 +113,7 @@ impl Shell {
                 };
                 let route = Route::Album(album.id.clone());
                 self.card_shell(("card", ix), width, group, None, art)
-                    .child(crate::ui::titled(&t, div().truncate().font_weight(FontWeight::MEDIUM).child(album.name.clone()), album.explicit, TEXT_MD).mt(t.s(CARD_TEXT_GAP)))
+                    .child(crate::ui::titled(&t, div().id("name").truncate().font_weight(FontWeight::MEDIUM).child(album.name.clone()).full_text_tip(&t, album.name.clone()), album.explicit, TEXT_MD).mt(t.s(CARD_TEXT_GAP)))
                     .child(sub)
                     .stop(&t).on_click(cx.listener(move |this, _, _, cx| this.navigate(route.clone(), cx)))
                     .into_any_element()
@@ -113,7 +125,7 @@ impl Shell {
                 let route = Route::Artist(artist.id.clone());
                 self.card_shell(("card", ix), width, group, None, art)
                     .items_center()
-                    .child(div().mt(t.s(CARD_TEXT_GAP)).w_full().text_center().truncate().font_weight(FontWeight::MEDIUM).child(artist.name.clone()))
+                    .child(div().id("name").mt(t.s(CARD_TEXT_GAP)).w_full().text_center().truncate().font_weight(FontWeight::MEDIUM).child(artist.name.clone()).full_text_tip(&t, artist.name.clone()))
                     .stop(&t).on_click(cx.listener(move |this, _, _, cx| this.navigate(route.clone(), cx)))
                     .into_any_element()
             }
@@ -123,12 +135,14 @@ impl Shell {
                 let art = self.artwork(Some(&cover_id), "playlist-regular", width, ArtShape::Rounded(R_MD), layout);
                 let art = self.lift(group.clone(), art);
                 let route = Route::Playlist(p.id.clone());
-                // Songs dropped on one of your own playlists' cards are added to it.
+                let menu_id = p.id.clone();
+                // Songs carried onto your own regular playlist's card are added to it.
                 let drop = self.drop_mark(format!("card:{}", p.id), self.playlist_drop(&p.id, &p.name), R_MD, DROP_PAD_CARD);
                 self.card_shell(("card", ix), width, group, drop, art)
-                    .child(div().mt(t.s(CARD_TEXT_GAP)).truncate().font_weight(FontWeight::MEDIUM).child(p.name.clone()))
+                    .child(div().id("name").mt(t.s(CARD_TEXT_GAP)).truncate().font_weight(FontWeight::MEDIUM).child(p.name.clone()).full_text_tip(&t, p.name.clone()))
                     .child(div().flex().flex_row().items_center().min_w(px(0.0)).text_color(t.t2()).children(self.download_mark(navia_core::library::collections::CollectionKind::Playlist, &p.id).map(|m| div().flex_none().mr(t.s(DOWNLOAD_MARK_GAP)).child(m))).child(div().min_w(px(0.0)).truncate().child(playlist_subtitle(&p))))
                     .stop(&t).on_click(cx.listener(move |this, _, _, cx| this.navigate(route.clone(), cx)))
+                    .on_mouse_down(gpui::MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_playlist_menu(menu_id.clone(), event.position, cx)))
                     .into_any_element()
             }
             CardItem::Essentials(index) | CardItem::SongRadio(index) => {
@@ -146,8 +160,8 @@ impl Shell {
                     (SharedString::from(trf("{name} Radio", &[("name", &artist.name)])), SharedString::from(tr("Similar artists")))
                 };
                 self.card_shell(("card", ix), width, group, None, art)
-                    .child(div().mt(t.s(CARD_TEXT_GAP)).truncate().font_weight(FontWeight::MEDIUM).child(title))
-                    .child(div().text_color(t.t2()).truncate().child(sub))
+                    .child(div().id("name").mt(t.s(CARD_TEXT_GAP)).truncate().font_weight(FontWeight::MEDIUM).child(title.clone()).full_text_tip(&t, title))
+                    .child(div().id("sub").text_color(t.t2()).truncate().child(sub.clone()).full_text_tip(&t, sub))
                     .stop(&t).on_click(cx.listener(move |this, _, _, cx| {
                         if essentials {
                             this.play_artist_top(&artist_id, cx);
@@ -160,6 +174,20 @@ impl Shell {
             CardItem::GenreFan(list, index) => self.render_genre_tile(*list, *index, width, group, ix, layout, cx),
             CardItem::Mix(index) => self.render_mix_card(*index, width, group, ix, layout, cx),
             CardItem::ArtistStation { seed, neighbours } => self.render_artist_station_card(*seed, neighbours, width, group, ix, layout, cx),
+            CardItem::Upcoming { album, tag } => {
+                self.page_countdown = true;
+                let left = crate::view_upcoming::TimeLeft::of(album);
+                let label = if *tag { left.tag() } else { left.short() };
+                let art = self.artwork(Some(&album.cover), "music-notes-fill", width, ArtShape::Rounded(R_MD), layout);
+                let art = self.lift(group.clone(), labelled_art(&t, art, label));
+                let route = Route::Upcoming(album.id);
+                let sub = crate::view_upcoming::release_line(album, &left, true);
+                self.card_shell(("card", ix), width, group, None, art)
+                    .child(crate::ui::titled(&t, div().id("name").truncate().font_weight(FontWeight::MEDIUM).child(album.title.clone()).full_text_tip(&t, album.title.clone()), album.explicit, TEXT_MD).mt(t.s(CARD_TEXT_GAP)))
+                    .child(div().id("sub").text_color(t.t2()).truncate().child(sub))
+                    .stop(&t).on_click(cx.listener(move |this, _, _, cx| this.navigate(route.clone(), cx)))
+                    .into_any_element()
+            }
         }
     }
 
@@ -177,60 +205,89 @@ impl Shell {
             },
             None => None,
         };
-        // The ring uses the tile's own top color.
-        let ring = tint.map_or(t.panel_2().into(), |c| crate::color::tile_fill(c).0.hsla(1.0));
-        let face = width * STATION_FACE;
-        let side = width * STATION_SIDE_FACE;
-        let centre_y = width * STATION_FACES_Y;
-        // A neighbor photo's left edge, `shift` tile widths left (-1) or right (1) of the seed.
-        let place = |dir: f32, shift: f32| width / 2.0 + dir * width * shift - side / 2.0;
-        let mut faces = div().absolute().inset_0();
-        for (k, n) in named.iter().take(2).enumerate() {
-            let dir = if k == 0 { -1.0 } else { 1.0 };
-            let art = self.artwork(n.image.as_ref(), "user-fill", side, ArtShape::Circle, layout);
-            let (rest, spread) = (place(dir, STATION_SIDE_SHIFT), place(dir, STATION_SIDE_SHIFT_HOVER));
-            faces = faces.child(div().absolute().top(t.s(centre_y - side / 2.0)).left(t.s(rest)).group_hover(group.clone(), move |s| s.left(t.s(spread))).child(art));
+        let (hover, ticker) = crate::ui::card_hover(&group, motion::MED);
+        let inset = t.s(width * STATION_INSET) * hover;
+        let radius = t.s(R_MD) + (t.s(width * STATION_INSET) - t.s(R_MD)) * hover;
+        let framed = |d: gpui::Stateful<gpui::Div>| d.absolute().top(inset).bottom(inset).left(inset).right(inset).rounded(radius);
+        let device = (f32::from(t.s(width)) * layout.scale).round() as u32;
+        let image = artist.image.as_ref().filter(|i| !i.is_empty()).and_then(|i| self.thumb_faded(i, device));
+        let placeholder = div().id("station-blank").size_full().rounded(radius).bg(gpui::rgb(crate::theme::PANEL_2)).flex().items_center().justify_center().child(icon(&t, "user-fill", width * ART_GLYPH, t.t3()));
+        let mut photo = framed(div().id("station-photo")).child(placeholder);
+        if let Some((image, fade)) = image {
+            photo = photo.child(crate::ui::image(image).id("station-image").absolute().inset_0().size_full().rounded(radius).opacity(fade));
         }
-        let seed_art = self.artwork(artist.image.as_ref(), "user-fill", face, ArtShape::Circle, layout);
-        let ring_shadow = BoxShadow { color: ring, offset: point(px(0.0), px(0.0)), blur_radius: px(0.0), spread_radius: t.s(width * STATION_RING), inset: false };
-        faces = faces.child(
-            div()
-                .absolute()
-                .top(t.s(centre_y - face / 2.0))
-                .left(t.s((width - face) / 2.0))
+        // `--station-shade-ink`: the tile's own top colour, mixed toward black, fading out up the tile.
+        let ink = tint.map_or(Srgb::hex(crate::theme::PANEL_2), |c| crate::color::tile_fill(c).0).mix(Srgb::hex(0x000000), STATION_SHADE);
+        let shade = framed(div().id("station-shade")).bg(gpui::linear_gradient(0.0, gpui::linear_color_stop(ink.hsla(1.0), 0.0), gpui::linear_color_stop(ink.hsla(0.0), STATION_SHADE_END)));
+        let mark_shade = framed(div().id("station-mark-shade")).bg(gpui::linear_gradient(180.0, gpui::linear_color_stop(t.scrim(), 0.0), gpui::linear_color_stop(gpui::Rgba { a: 0.0, ..t.scrim() }, STATION_MARK_SHADE_END)));
+        let face = width * STATION_FACE;
+        let grown = face * STATION_FACE_HOVER;
+        // a filled circle one ring wider than the face: a zero-blur shadow drew far thicker than its spread.
+        let ring = t.s(width * STATION_RING);
+        // each face grows from its bottom-left corner; a later one also shifts right by its place times the spread.
+        let mut faces = div().absolute().left(t.s(width * STATION_PAD)).bottom(t.s(width * STATION_FACES_BOTTOM)).h(t.s(face));
+        for (k, n) in named.iter().take(3).enumerate() {
+            let rest = k as f32 * (face + width * STATION_FACE_GAP);
+            let spread = rest + k as f32 * width * STATION_FACE_SPREAD;
+            let device = (f32::from(t.s(grown)) * layout.scale).round() as u32;
+            let image = n.image.as_ref().filter(|i| !i.is_empty()).and_then(|i| self.thumb_faded(i, device));
+            let size = t.s(face + (grown - face) * hover);
+            let mut el = div()
+                .relative()
+                .size(size)
                 .rounded_full()
-                .shadow(vec![ring_shadow, crate::ui::shadow_art(&t)])
-                .child(seed_art),
-        );
-        let pad = width * STATION_PAD;
-        let room = t.s(width - pad * 2.0);
-        let fits = crate::ui::text_width_app(cx, &artist.name, t.s(width * STATION_NAME), FontWeight::BOLD) <= room;
-        let name_size = if fits { STATION_NAME } else { STATION_NAME_LONG };
+                .bg(gpui::rgb(crate::theme::PANEL_2))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(&t, "user-fill", face * ART_GLYPH, t.t3()));
+            if let Some((image, fade)) = image {
+                el = el.child(crate::ui::image(image).absolute().inset_0().size_full().rounded_full().opacity(fade));
+            }
+            faces = faces.child(
+                div()
+                    .id(("station-face", k))
+                    .absolute()
+                    .bottom(-ring)
+                    .left(t.s(rest + (spread - rest) * hover) - ring)
+                    .p(ring)
+                    .rounded_full()
+                    .bg(t.station_ring_ink())
+                    .child(el),
+            );
+        }
+        let pad = t.s(width * STATION_PAD);
         let name = div()
             .absolute()
-            .left(t.s(pad))
-            .right(t.s(pad))
-            .bottom(t.s(pad))
-            .text_size(t.s(width * name_size))
+            .left(pad)
+            .right(pad)
+            .bottom(t.s(width * STATION_NAME_BOTTOM))
+            .text_size(t.s(width * STATION_NAME))
             .font_weight(FontWeight::BOLD)
             .line_height(relative(1.05))
             .text_color(t.t_em())
             .truncate()
-            .child(artist.name.clone());
+            .id("station-name")
+            .child(artist.name.clone())
+            .full_text_tip(&t, artist.name.clone());
         let tile = div()
             .relative()
             .size(t.s(width))
             .rounded(t.s(R_MD))
             .overflow_hidden()
             .bg(crate::ui::tile_fill_bg(&t, tint))
-            .child(faces)
-            .child(crate::ui::cover_label(&t, tr("Radio"), crate::ui::LabelAt::Top))
+            .child(ticker)
+            .child(photo)
+            .child(shade)
+            .child(mark_shade)
+            .child(crate::ui::cover_label(&t, tr("Radio"), crate::ui::LabelAt::Top, crate::ui::LabelStyle::Mark { glyph: "broadcast-regular", width }))
+            .when(!named.is_empty(), |d| d.child(faces))
             .child(name);
         let tile = self.lift(group.clone(), tile.into_any_element());
         let line = station_line(&named);
         let artist_id = artist.id.clone();
         self.card_shell(("card", ix), width, group, None, tile)
-            .when(!line.is_empty(), |d| d.child(div().mt(t.s(CARD_TEXT_GAP)).text_color(t.t2()).line_clamp(STATION_LINES as usize).text_ellipsis().child(line)))
+            .when(!line.is_empty(), |d| d.child(div().id("sub").mt(t.s(CARD_TEXT_GAP)).text_color(t.t2()).line_clamp(STATION_LINES as usize).text_ellipsis().child(line.clone()).full_text_tip(&t, line)))
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| this.start_artist_radio(&artist_id, cx)))
             .into_any_element()
@@ -241,7 +298,7 @@ impl Shell {
         let t = self.theme;
         let device = (f32::from(t.s(width)) * layout.scale).round() as u32;
         let image = photo.filter(|p| !p.is_empty()).and_then(|p| self.thumb_faded(p, device));
-        let band_color = tint.mix(Srgb::hex(0xc9c9c9), 0.32);
+        let band_color = tint.mix(t.essentials_paper(), 0.32);
         let _ = name;
         div()
             .relative()
@@ -267,7 +324,7 @@ impl Shell {
                     .text_size(t.s(width * 0.136))
                     .font_weight(FontWeight::SEMIBOLD)
                     .line_height(relative(1.0))
-                    .text_color(gpui::rgb(0x111111))
+                    .text_color(t.essentials_ink())
                     .child(band),
             )
             .into_any_element()
@@ -325,11 +382,9 @@ impl Shell {
         let m = PageMetrics::of(layout);
         let (card, gap, height) = Self::shelf_card(shelf, &m);
         let main_tokens = f32::from(layout.main_width) / t.token_scale();
-        let docked = layout.player && layout.mode == PlayerMode::Dock;
-        // The row stops just before the dock and fades out.
-        let (fade, fade_gap) = if docked { (130.0_f32, 4.0_f32) } else { (0.0, 0.0) };
-        // The row extends under the sidebar so cards scrolled off the left are there for the sidebar blur. The resting
-        // layout doesn't move.
+        // the row stops just before the dock and fades out.
+        let (fade, fade_gap) = (SHELF_FADE * layout.dock_shown, SHELF_GAP * layout.dock_shown);
+        // the row reaches under the sidebar so a card scrolled off the left is really there for the sidebar to frost.
         let under_px = self.sidebar_under(layout);
         let under = f32::from(under_px) / t.token_scale();
         let left_pad = under + m.gutter;
@@ -375,7 +430,7 @@ impl Shell {
                 .items_center()
                 .justify_center()
                 .rounded_full()
-                .map(|d| crate::ui::glass_layers(d, &t, t.s(CONTROL_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass_frost_fill(), t.glass_fill(), glass_edge()))
+                .map(|d| crate::ui::glass_layers(d, &t, t.s(CONTROL_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass(), t.glass_fill(), glass_edge()))
                 .opacity(0.0)
                 .group_hover(SharedString::from(group.clone()), |s| s.opacity(1.0))
                 // Hovering the arrow blocks the row's group hover, so the arrow stays visible.
@@ -388,12 +443,11 @@ impl Shell {
                     h.set_offset(point((current.x - page * dir).clamp(-max, px(0.0)), current.y));
                     this.invalidate_nothing(cx);
                 }))
+                .tooltip(crate::ui::tip(&t, if dir < 0.0 { tr("Scroll left") } else { tr("Scroll right") }))
                 .child(icon(&this.theme, name, 18.0, t.t1()))
         };
-        let mut row = div().relative().w(layout.main_width + under_px).child(scroller);
-        if docked {
-            row = row.child(self.shelf_fade(fade, fade_gap, height));
-        }
+        // the clip stays at 0 too, so the row keeps its shape while the dock slides.
+        let mut row = div().relative().w(layout.main_width + under_px).child(crate::ui::fade_right(scroller.into_any_element(), t.s(fade), t.s(fade_gap), SHELF_FADE_STOPS));
         if more_left {
             let a = arrow(self, "caret-left-bold", -1.0, cx).left(t.s(10.0 + under));
             row = row.child(a);
@@ -435,34 +489,14 @@ impl Shell {
         (card, gap, card + Shell::card_text_lines(shelf.sub_lines > 0 || !matches!(shelf.items.first(), Some(CardItem::Artist(_))), shelf.sub_lines.max(1)))
     }
 
-    /// The fade at a row's right edge toward the dock, in four stops.
-    fn shelf_fade(&self, fade: f32, gap: f32, height: f32) -> AnyElement {
-        let t = self.theme;
-        let page = gpui::rgb(crate::theme::BG);
-        let alpha = |a: f32| gpui::Rgba { a, ..page };
-        let seg = |w: f32, from: f32, to: f32| div().h_full().w(t.s(w)).flex_none().bg(gpui::linear_gradient(90.0, gpui::linear_color_stop(alpha(from), 0.0), gpui::linear_color_stop(alpha(to), 1.0)));
-        div()
-            .absolute()
-            .top(px(0.0))
-            .right(px(0.0))
-            .h(t.s(height))
-            .w(t.s(fade + gap))
-            .flex()
-            .flex_row()
-            .child(seg(fade * 0.38, 0.0, 0.38))
-            .child(seg(fade * 0.34, 0.38, 0.78))
-            .child(seg(fade * 0.28, 0.78, 1.0))
-            .child(div().h_full().w(t.s(gap)).flex_none().bg(alpha(1.0)))
-            .into_any_element()
-    }
-
-    /// A row of a card grid. Its height follows the tallest card.
+    /// a row of a card grid: cards stretched to fill the width; height follows the tallest card.
     pub fn render_grid_row(&mut self, items: &Rc<Vec<CardItem>>, start: usize, count: usize, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let m = PageMetrics::of(layout);
+        let (_, card) = crate::pages::grid_fit(self.grid_width(layout), m.grid_card, m.card_gap);
         let mut row = div().flex().flex_row().gap(t.s(m.card_gap)).pl(t.s(m.gutter)).pb(t.s(34.0)).w(layout.main_width);
         for i in start..(start + count).min(items.len()) {
-            row = row.child(self.render_card(&items[i], m.grid_card, i, layout, cx));
+            row = row.child(self.render_card(&items[i], card, i, layout, cx));
         }
         row.into_any_element()
     }
@@ -473,8 +507,8 @@ impl Shell {
         use crate::shell::LibraryState::*;
         let (icon_name, title, hint): (&'static str, SharedString, SharedString) = match self.library_state {
             Ready => (icon_name, title.into(), hint.into()),
-            Opening => ("music-notes-regular", tr("Opening your library").into(), SharedString::default()),
-            Syncing => ("music-notes-regular", tr("Syncing your library").into(), tr("Music shows up here as soon as it arrives.").into()),
+            Opening => ("music-notes-regular", tr("Opening library").into(), SharedString::default()),
+            Syncing => ("music-notes-regular", tr("Syncing library").into(), tr("Music shows up here as soon as it arrives.").into()),
             NoServer => ("music-notes-regular", tr("No server connected").into(), tr("Navia plays music from a Navidrome server.").into()),
             Unreachable => ("warning-fill", tr("Can't reach the server").into(), tr("Check the address and your connection. The music shows up once Navia can connect.").into()),
             SyncFailed => ("warning-fill", tr("Couldn't finish syncing").into(), tr("Part of your library may be missing. Navia will try again.").into()),
@@ -594,4 +628,8 @@ fn station_line(neighbours: &[crate::model::Artist]) -> String {
     }
     let names = neighbours.iter().take(3).map(|a| a.name.as_ref()).collect::<Vec<_>>().join(", ");
     if neighbours.len() > 3 { trf("With {names} and more", &[("names", &names)]) } else { trf("With {names}", &[("names", &names)]) }
+}
+
+fn labelled_art(t: &crate::theme::Theme, art: AnyElement, label: impl Into<SharedString>) -> AnyElement {
+    div().relative().child(art).child(crate::ui::cover_label(t, label, crate::ui::LabelAt::Bottom, crate::ui::LabelStyle::Chip).font_features(crate::ui::tabular_figures())).into_any_element()
 }

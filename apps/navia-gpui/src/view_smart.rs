@@ -41,7 +41,7 @@ pub struct SmartEditor {
     opened: Option<(String, serde_json::Value)>,
     /// A save is in flight.
     saving: bool,
-    /// Why the last save failed, shown under the name until the next edit or save.
+    /// shown under the name until the next edit or save.
     pub error: Option<String>,
     /// Filters that Save as Smart Playlist couldn't carry over because the server has no field for them.
     dropped: Option<String>,
@@ -234,8 +234,7 @@ impl Shell {
         // The page is rebuilt from the server's copy next time it opens.
         self.reset_smart_editor();
         if save_as {
-            self.new_playlist = None;
-            self.controls.text = None;
+            self.close_new_playlist(cx);
             self.navigate(Route::Playlist(id.into()), cx);
         } else {
             self.smart_leave(cx);
@@ -265,16 +264,16 @@ impl Shell {
         };
         let Some(existing) = page else { return div().into_any_element() };
         let others = self.smart_is_others();
-        let cancel = glass_action(&t, "smart-cancel").px(t.s(18.0)).occlude().child(tr("Cancel")).stop(&t).on_click(cx.listener(|this, _, _, cx| this.smart_leave(cx)));
+        let cancel = glass_action(&t, "smart-cancel").occlude().child(tr("Cancel")).stop(&t).on_click(cx.listener(|this, _, _, cx| this.smart_leave(cx)));
         let save_as_enabled = self.smart_rules_blocked().is_none();
         let save_as = existing.then(|| {
-            let button = if others { primary_action(&t, "smart-save-as", save_as_enabled).px(t.s(22.0)) } else { glass_action(&t, "smart-save-as").px(t.s(18.0)).when(!save_as_enabled, |d| d.opacity(DISABLED_OPACITY)) };
+            let button = if others { primary_action(&t, "smart-save-as", save_as_enabled) } else { glass_action(&t, "smart-save-as").when(!save_as_enabled, |d| d.opacity(DISABLED_OPACITY)) };
             button.occlude().child(tr("Save As\u{2026}")).stop(&t).on_click(cx.listener(|this, _, _, cx| this.smart_save_as(cx)))
         });
         let save = (!others).then(|| {
             let enabled = self.smart_blocked().is_none();
             let label = if self.smart.saving { tr("Saving\u{2026}") } else { tr("Save") };
-            primary_action(&t, "smart-save", enabled).px(t.s(22.0)).occlude().child(label).stop(&t).on_click(cx.listener(|this, _, _, cx| this.smart_save(cx)))
+            primary_action(&t, "smart-save", enabled).occlude().child(label).stop(&t).on_click(cx.listener(|this, _, _, cx| this.smart_save(cx)))
         });
         div().flex().flex_row().items_center().gap(t.s(10.0)).child(cancel).children(save_as).children(save).into_any_element()
     }
@@ -298,7 +297,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Applies an edit to the rules and runs the preview again.
+    /// runs the preview again.
     fn smart_edit(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut EditorState)) {
         edit(&mut self.smart.state);
         self.smart_changed(cx);
@@ -316,7 +315,7 @@ impl Shell {
         self.smart_edit(cx, |st| st.set_value_text(row, side, &value));
     }
 
-    /// Starts the preview once typing has paused. Newer runs supersede older ones.
+    /// once typing has paused; newer runs supersede older ones.
     fn smart_run_if_dirty(&mut self, cx: &mut Context<Self>) {
         if !self.smart.dirty {
             return;
@@ -380,7 +379,7 @@ impl Shell {
         div().w(layout.main_width).px(t.s(m.gutter)).child(content).into_any_element()
     }
 
-    /// The name, the live one-line summary, and for someone else's playlist a note that saving makes a copy.
+    /// for someone else's playlist, a note that saving makes a copy.
     fn render_smart_name(&mut self, layout: &Layout, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         self.smart_run_if_dirty(cx);
@@ -474,7 +473,7 @@ impl Shell {
         let t = self.theme;
         let select = self.select_pill_sized(&format!("group-match-{key}"), if any { "any" } else { "all" }, match_sentences(), tr("Match"), PillWidth::Fit, move |this, value, cx| this.smart_edit(cx, |st| st.set_any(Some(key), value.as_ref() == "any")), cx);
         let can_nest = depth + 1 < MAX_GROUP_DEPTH;
-        let add = round_button(&t, ("group-add", key), "plus-regular").stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+        let add = round_button(&t, ("group-add", key), tr("Add to group"), "plus-regular").stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
             let mut rows = vec![MenuRow::item(tr("Add Rule"), "plus-regular", move |this, cx| this.smart_edit(cx, |st| {
                 st.add_rule(Some(key));
             }))];
@@ -485,7 +484,7 @@ impl Shell {
             }
             this.open_toolbar_menu(rows, event, cx);
         }));
-        let remove = round_button(&t, ("group-remove", key), "x-regular").stop(&t).on_click(cx.listener(move |this, _, _, cx| this.smart_edit(cx, |st| st.remove(key))));
+        let remove = round_button(&t, ("group-remove", key), tr("Remove group"), "x-regular").stop(&t).on_click(cx.listener(move |this, _, _, cx| this.smart_edit(cx, |st| st.remove(key))));
         let group = SharedString::from(format!("smart-head-{key}"));
         div()
             .id(("smart-head", key))
@@ -520,7 +519,7 @@ impl Shell {
     fn render_rule_row(&mut self, row: &Row, narrow: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let key = row.key();
-        let remove = round_button(&t, ("rule-remove", key), "x-regular").stop(&t).on_click(cx.listener(move |this, _, _, cx| this.smart_edit(cx, |st| st.remove(key))));
+        let remove = round_button(&t, ("rule-remove", key), tr("Remove rule"), "x-regular").stop(&t).on_click(cx.listener(move |this, _, _, cx| this.smart_edit(cx, |st| st.remove(key))));
         match row {
             Row::Kept { text, reason, .. } => div()
                 .flex()
@@ -666,7 +665,7 @@ impl Shell {
                 row = row.child(segmented_glass(&t, if i == 0 { "smart-dir-0" } else { "smart-dir-n" }, s.desc, &options, cx, move |this, desc, cx| this.smart_edit(cx, |st| st.set_sort_desc(i, desc))));
             }
             if st.sorts.len() > 1 {
-                row = row.child(round_button(&t, ("sort-remove", s.key), "x-regular").stop(&t).on_click(cx.listener(move |this, _, _, cx| this.smart_edit(cx, |st| st.remove_sort(i)))));
+                row = row.child(round_button(&t, ("sort-remove", s.key), tr("Remove sort field"), "x-regular").stop(&t).on_click(cx.listener(move |this, _, _, cx| this.smart_edit(cx, |st| st.remove_sort(i)))));
             }
             sorts = sorts.child(row);
         }
@@ -761,7 +760,7 @@ impl Shell {
         div().w(layout.main_width).px(t.s(gutter)).text_color(t.t2()).child(text).into_any_element()
     }
 
-    /// The last top-level group, for script steps that add inside it.
+    /// for script steps that add inside it.
     fn smart_last_group(&self) -> Option<u64> {
         self.smart.state.rows.iter().rev().find_map(|r| matches!(r, Row::Group { .. }).then(|| r.key()))
     }

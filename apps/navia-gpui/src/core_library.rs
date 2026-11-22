@@ -29,10 +29,9 @@ use navia_core::reporting::PlayReporter;
 use tokio::runtime::Runtime;
 
 use crate::core_player::CoreEvent;
-use crate::model::{Account, Album, AlbumTrack, Artist, ArtistInfo, Discography, ForYouPage, ReleaseSection, Genre, GenrePage, HomeTaste, Library, MixInfo, LyricLine, MoreBy, PlaylistCover, PlaylistDetails, PlaylistSummary, RadioStation, Song};
+use crate::model::{Account, Album, Upcoming, UpcomingTrack, UpcomingView, AlbumTrack, Artist, ArtistInfo, Discography, ForYouPage, ReleaseSection, Genre, GenrePage, HomeTaste, Library, MixInfo, LyricLine, MoreBy, PlaylistCover, PlaylistDetails, PlaylistSummary, RadioStation, Song};
 use crate::shell::SortKey;
 
-/// What the app starts with.
 pub enum Startup {
     Library(Arc<dyn Library>, Option<Arc<CoreLibrary>>),
     SignIn(crate::account::SignInPrompt),
@@ -78,7 +77,6 @@ impl Drop for OwnedRuntime {
 /// How often the library, playlists and play counts are refreshed in the background.
 const REFRESH_EVERY: Duration = Duration::from_secs(20 * 60);
 
-/// The server login in use.
 pub struct Connection {
     pub url: String,
     pub user: String,
@@ -101,7 +99,8 @@ pub fn read_only_run() -> bool {
 fn history_sync_options(watch: &Arc<navia_core::library::sync::SyncWatch>) -> SyncOptions {
     let test_override = std::env::var_os("NAVIA_TEST_PLAY_HISTORY").is_some_and(|v| v == "1");
     let totals_override = std::env::var_os("NAVIA_TEST_SERVER_TOTALS").is_some_and(|v| v == "1");
-    SyncOptions { play_history: !read_only_run() || test_override, synced_smart: !read_only_run(), watch: Some(watch.clone()), server_totals: !read_only_run() || totals_override, ..Default::default() }
+    let native = !read_only_run() || totals_override;
+    SyncOptions { play_history: !read_only_run() || test_override, synced_smart: !read_only_run(), watch: Some(watch.clone()), server_totals: native, song_updates: native, ..Default::default() }
 }
 
 impl Connection {
@@ -143,12 +142,10 @@ pub struct CoreLibrary {
     pub reporter: Arc<PlayReporter>,
     /// False for a read-only run, which sends no stars or plays whatever the settings say.
     pub writes_allowed: bool,
-    /// The login came from the environment, not from signing in.
     pub from_env: bool,
     /// Whether to refresh the library periodically.
     background_sync: AtomicBool,
     login_rejected: AtomicBool,
-    /// Tasks to stop on sign-out.
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     pub downloads: Arc<DownloadManager>,
     events: Arc<Mutex<Option<UnboundedSender<CoreEvent>>>>,
@@ -167,14 +164,20 @@ pub struct CoreLibrary {
     opened_playlists: Mutex<HashSet<String>>,
     /// Admin status from `getUser`. `None` until it answers.
     admin: Mutex<Option<bool>>,
-    /// The OpenSubsonic extensions in use, once `getOpenSubsonicExtensions` answers.
+    /// once `getOpenSubsonicExtensions` answers.
     features: OnceLock<ServerFeatures>,
     /// The play queue saved on the server.
     pub queue_sync: QueueSync,
     first_sync_done: AtomicBool,
     retry: AtomicBool,
-    /// The running sync's progress. Each change sends `CoreEvent::SyncProgress`.
+    /// a page's refresh is under way.
+    refreshing: AtomicBool,
+    /// each change sends `CoreEvent::SyncProgress`.
     pub sync_watch: Arc<navia_core::library::sync::SyncWatch>,
+    /// art keys whose last answer was the server's no-cover placeholder.
+    placeholder_covers: Mutex<HashSet<String>>,
+    /// covers whose failure was already logged, so a broken one is reported once per run.
+    failed_covers: Mutex<HashSet<String>>,
 }
 
 impl CoreLibrary {
@@ -234,11 +237,14 @@ impl CoreLibrary {
             image_support: Mutex::new(None),
             remote: Arc::default(),
             opened_playlists: Mutex::new(HashSet::new()),
+            placeholder_covers: Mutex::default(),
+            failed_covers: Mutex::default(),
             admin: Mutex::new(None),
             features: OnceLock::new(),
             queue_sync,
             first_sync_done: AtomicBool::new(false),
             retry: AtomicBool::new(false),
+            refreshing: AtomicBool::new(false),
             sync_watch,
         });
         // Built here, off the UI thread, so the first frames don't wait for it.
@@ -258,7 +264,6 @@ impl CoreLibrary {
         self.song_count() == 0
     }
 
-    /// Connects, syncs and starts periodic refreshes, all without blocking the caller.
     pub fn start_background(self: &Arc<Self>, events: UnboundedSender<CoreEvent>) {
         *self.events.lock().unwrap() = Some(events.clone());
         let this = self.clone();
@@ -275,17 +280,7 @@ impl CoreLibrary {
             this.share_downloads.store(user.and_then(|u| u.download_role).unwrap_or(false), Ordering::Relaxed);
             this.can_share.store(this.client.shares().await.is_ok(), Ordering::Relaxed);
             *this.image_support.lock().unwrap() = this.client.playlist_image_support().await.ok();
-            *this.genres.lock().unwrap() = Arc::new(
-                this.client.genres().await.unwrap_or_default().into_iter().filter(|g| g.song_count.unwrap_or(0) > 0)
-                    .map(|g| Genre { name: g.value.into(), song_count: g.song_count.unwrap_or(0) as u32 }).collect::<Vec<_>>(),
-            );
-            let mut sorted = (**this.genres.lock().unwrap()).clone();
-            sorted.sort_by_key(|g| std::cmp::Reverse(g.song_count));
-            *this.genres.lock().unwrap() = Arc::new(sorted);
-            *this.stations.lock().unwrap() = Arc::new(
-                this.client.internet_radio_stations().await.unwrap_or_default().into_iter()
-                    .map(|s| RadioStation { id: s.id.into(), name: s.name.into(), url: s.stream_url.unwrap_or_default().into() }).collect(),
-            );
+            this.load_server_lists().await;
             if let Some(features) = ServerFeatures::detect(&this.client).await {
                 let _ = this.features.set(features);
                 this.reporter.set_live_reports(features.playback_report);
@@ -320,7 +315,88 @@ impl CoreLibrary {
             let _ = events.unbounded_send(CoreEvent::SyncDone);
             this.first_sync_done.store(true, Ordering::Relaxed);
             this.apply_background_sync();
+            this.start_daily_mixes();
         });
+        self.tasks.lock().unwrap().push(task.abort_handle());
+    }
+
+    /// the server's genres and internet radio stations; a list the server doesn't answer stays as it was.
+    async fn load_server_lists(&self) -> bool {
+        let mut changed = false;
+        if let Ok(genres) = self.client.genres().await {
+            let mut genres: Vec<Genre> = genres.into_iter().filter(|g| g.song_count.unwrap_or(0) > 0).map(|g| Genre { name: g.value.into(), song_count: g.song_count.unwrap_or(0) as u32 }).collect();
+            genres.sort_by_key(|g| std::cmp::Reverse(g.song_count));
+            let mut slot = self.genres.lock().unwrap();
+            changed |= **slot != genres;
+            *slot = Arc::new(genres);
+        }
+        if let Ok(stations) = self.client.internet_radio_stations().await {
+            let stations: Vec<RadioStation> = stations.into_iter().map(|s| RadioStation { id: s.id.into(), name: s.name.into(), url: s.stream_url.unwrap_or_default().into() }).collect();
+            let mut slot = self.stations.lock().unwrap();
+            changed |= **slot != stations;
+            *slot = Arc::new(stations);
+        }
+        changed
+    }
+
+    /// a page's refresh: asks the server what changed since the last look and brings in only that (the library
+    /// after a scan, playlists, stars, play counts), and reads the genres and radio stations again. the rows on
+    /// screen stay until `SyncDone` brings the new ones; `Refreshed` follows either way. false while one runs.
+    pub fn refresh_now(self: &Arc<Self>) -> bool {
+        if self.refreshing.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let this = self.clone();
+        self.rt.spawn(async move {
+            let started = Instant::now();
+            let syncer = Syncer::new(this.client.clone(), this.db.clone(), history_sync_options(&this.sync_watch));
+            let progress = this.events.lock().unwrap().clone();
+            let on_progress = move |_: navia_core::library::sync::SyncProgress| {
+                if let Some(tx) = progress.as_ref() {
+                    let _ = tx.unbounded_send(CoreEvent::SyncProgress);
+                }
+            };
+            let (changes, lists) = tokio::join!(syncer.check_for_changes(&on_progress), this.load_server_lists());
+            let changed = match changes {
+                Ok(c) => {
+                    eprintln!("navia: page refresh in {:.1} s: {c:?}, lists changed {lists}", started.elapsed().as_secs_f32());
+                    c.any()
+                }
+                Err(e) => {
+                    eprintln!("navia: refresh failed: {e}");
+                    false
+                }
+            };
+            if changed || lists {
+                this.rebuild_catalog();
+                this.send(CoreEvent::SyncDone);
+            }
+            this.refreshing.store(false, Ordering::SeqCst);
+            this.send(CoreEvent::Refreshed);
+        });
+        true
+    }
+
+    /// whether a page's refresh runs, or with `sync` also any library sync.
+    pub fn is_refreshing(&self, sync: bool) -> bool {
+        self.refreshing.load(Ordering::SeqCst) || sync && self.sync_watch.current().is_some()
+    }
+
+    /// today's mixes, made in the background once a day after the launch sync, so For You has
+    /// them before it's opened; For You reloads as each lands. runs that mustn't reach external
+    /// lookups only read what's stored.
+    fn start_daily_mixes(self: &Arc<Self>) {
+        if !external_allowed() {
+            return;
+        }
+        let (remote, events) = (self.remote.clone(), self.events.clone());
+        let changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            remote.lock().unwrap().for_you_rev += 1;
+            if let Some(tx) = events.lock().unwrap().as_ref() {
+                let _ = tx.unbounded_send(CoreEvent::RemoteReady);
+            }
+        });
+        let task = self.rt.spawn(navia_core::library::for_you::keep_mixes_daily(self.client.clone(), self.db.clone(), changed));
         self.tasks.lock().unwrap().push(task.abort_handle());
     }
 
@@ -342,7 +418,7 @@ impl CoreLibrary {
         self.apply_background_sync();
     }
 
-    /// Creates a regular playlist. A read-only run is refused by the client, so nothing is sent.
+    /// a read-only run is refused by the client.
     pub fn create_playlist(self: &Arc<Self>, name: String) {
         let (this, client, db) = (self.clone(), self.client.clone(), self.db.clone());
         self.rt.spawn(async move {
@@ -355,7 +431,6 @@ impl CoreLibrary {
         });
     }
 
-    /// Changes a playlist's name, description or Public setting on the server and in the library.
     pub fn update_playlist_details(self: &Arc<Self>, id: String, details: navia_core::client::PlaylistDetails) {
         let (this, db, client) = (self.clone(), self.db.clone(), self.playlist_client(&id));
         self.rt.spawn(async move {
@@ -367,8 +442,22 @@ impl CoreLibrary {
         });
     }
 
-    /// Saves a playlist's new order, with the stored songs at `positions` moved before `before`. The
-    /// playlist is fetched first, and the save is refused if it changed on the server.
+    pub fn delete_playlist(self: &Arc<Self>, id: String) {
+        let (this, db, client) = (self.clone(), self.db.clone(), self.playlist_client(&id));
+        self.rt.spawn(async move {
+            let result = Syncer::new(client, db, SyncOptions::default()).delete_playlist(&id).await.map_err(|e| match e {
+                navia_core::Error::WritesDisabled { .. } => tr("Test and read-only runs can't change playlists.").to_string(),
+                e => trf("The server didn't delete the playlist: {error}", &[("error", &e.to_string())]),
+            });
+            // its download stops and its songs leave the device unless another download holds them.
+            if result.is_ok() && let Err(e) = this.downloads.collection_download_off(navia_core::library::collections::CollectionKind::Playlist, &id, false) {
+                eprintln!("navia: couldn't turn off a deleted playlist's download: {e}");
+            }
+            this.send(CoreEvent::PlaylistDeleted { id, result });
+        });
+    }
+
+    /// the save is refused if the playlist changed on the server since.
     pub fn save_playlist_move(self: &Arc<Self>, id: String, positions: Vec<usize>, before: usize) {
         let (this, db, client) = (self.clone(), self.db.clone(), self.playlist_client(&id));
         self.rt.spawn(async move {
@@ -422,7 +511,7 @@ impl CoreLibrary {
         });
     }
 
-    /// Creates a regular playlist holding these songs. A read-only run is refused by the client.
+    /// a read-only run is refused by the client.
     pub fn create_playlist_with(self: &Arc<Self>, name: String, rowids: Vec<u32>) {
         let ids: Vec<String> = self.queue_ids(&rowids).into_iter().map(|(_, id, _)| id).collect();
         let (this, client, db, form) = (self.clone(), self.client.clone(), self.db.clone(), self.form_post());
@@ -523,7 +612,6 @@ impl CoreLibrary {
         }
     }
 
-    /// Whether this server lets the signed-in user upload and remove playlist images.
     pub fn can_change_playlist_images(&self) -> bool {
         let admin = *self.admin.lock().unwrap();
         self.image_support.lock().unwrap().as_ref().is_some_and(|s| s.allowed_for(admin))
@@ -632,9 +720,9 @@ impl CoreLibrary {
         self.rt.block_on(self.reporter.set_sharing(on));
     }
 
-    /// Sets the control and following marks in the reports' client name, only while sharing.
-    pub fn set_listen_marks(&self, control: bool, following: bool) {
-        self.rt.block_on(self.reporter.set_listen_marks(control, following));
+    /// the reports' client name carries the marks, only while sharing.
+    pub fn set_listen_marks(&self, control: bool, following: bool, queued: bool) {
+        self.rt.block_on(self.reporter.set_listen_marks(control, following, queued));
     }
 
     /// `getNowPlaying`, parsed, with live states where the server has `playbackReport`. Blocks, so
@@ -668,7 +756,7 @@ impl CoreLibrary {
         self.client.credentials().username()
     }
 
-    /// Blocks the background start until a ping works, retrying with a growing delay.
+    /// retries with a growing delay.
     async fn wait_for_server(&self, events: &UnboundedSender<CoreEvent>) {
         let mut delay = Duration::from_secs(2);
         loop {
@@ -702,7 +790,6 @@ impl CoreLibrary {
         }
     }
 
-    /// Notices the server going away or coming back while the app is idle.
     async fn watch_connection(self: Arc<Self>, events: UnboundedSender<CoreEvent>) {
         let mut up = true;
         loop {
@@ -722,8 +809,17 @@ impl CoreLibrary {
         self.retry.store(true, Ordering::Relaxed);
     }
 
-    /// The Songs list's row ids, narrowed by the search text and filters. Run off the UI thread,
-    /// since a large library takes a few milliseconds.
+    /// the offline switch. on, every server request fails at once as if it couldn't be reached,
+    /// so the connection check reports offline without sending anything; off, it checks now.
+    pub fn set_offline(&self, on: bool) {
+        self.client.set_offline(on);
+        if on {
+            self.downloads.set_online(false);
+        }
+        self.retry_connection();
+    }
+
+    /// off the UI thread: a large library takes some ms.
     pub fn order(&self, sort: SortKey, query: &str, filters: &navia_core::song_filters::FilterState) -> Vec<u32> {
         let filter = (!query.trim().is_empty()).then_some(query);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
@@ -780,10 +876,19 @@ impl CoreLibrary {
 
     /// Saves the choice for this account. `None` forgets it, so the app asks again.
     pub fn set_deezer_recommendations(&self, on: Option<bool>) -> navia_core::Result<()> {
+        {
+            let mut remote = self.remote.lock().unwrap();
+            remote.heat.clear();
+            remote.upcoming.generation += 1;
+        }
         navia_core::deezer::set_setting(&self.db, on)
     }
 
-    /// This account's Autoplay mode. Navia unless chosen otherwise.
+    /// an album's Deezer ranks by song row, from the library's song ids.
+    fn heat_rows(db: &CoreDb, album_id: &str, ranks: &HashMap<String, u64>) -> HashMap<u32, u64> {
+        db.album_rows(album_id).unwrap_or_default().into_iter().filter_map(|(rowid, s)| ranks.get(&s.id).map(|r| (rowid, *r))).collect()
+    }
+
     pub fn autoplay_mode(&self) -> navia_core::engine::AutoplayMode {
         navia_core::engine::mode(&self.db)
     }
@@ -828,7 +933,7 @@ impl CoreLibrary {
         self.rowids_in_order(&ids)
     }
 
-    /// Library rows for songs, in order, leaving out songs the library doesn't have.
+    /// skips songs the library doesn't have.
     pub fn rowids_in_order(&self, ids: &[String]) -> Vec<u32> {
         ids.iter().filter_map(|id| self.db.song_rowids(std::slice::from_ref(id)).ok()?.into_iter().next()).collect()
     }
@@ -848,7 +953,9 @@ impl CoreLibrary {
             let mut remote = self.remote.lock().unwrap();
             remote.forget_taste();
             remote.more_by.clear();
-            // The library may have new albums, so ask again on the next visit and show the old answer meanwhile.
+            remote.heat.clear();
+            remote.upcoming.generation += 1;
+            // The library may have new albums; ask again on the next visit, showing the old answer meanwhile.
             let answered = std::mem::take(&mut remote.discography);
             remote.discography_stale.extend(answered);
         }
@@ -869,6 +976,7 @@ impl CoreLibrary {
                     *artist_plays.entry(id.clone()).or_default() += plays;
                     artist_albums.entry(id.clone()).or_default().push(i as u32);
                 }
+                let release_day = navia_core::upcoming::release_day(&a);
                 Album {
                     id: a.id.into(),
                     // Shown without the version Navidrome appends to the name.
@@ -887,6 +995,7 @@ impl CoreLibrary {
                     starred: a.starred.is_some(),
                     explicit: navia_core::client::is_explicit(a.explicit_status.as_deref()),
                     disc_titles: a.disc_titles.iter().filter(|d| d.disc > 0 && !d.title.trim().is_empty()).map(|d| (d.disc as u32, SharedString::from(d.title.clone()))).collect(),
+                    release_day,
                 }
             })
             .collect();
@@ -901,7 +1010,7 @@ impl CoreLibrary {
                 a.edition_on_card = a.edition.is_some() && seen.get(&(a.artist.to_lowercase(), a.name.to_lowercase())).copied().unwrap_or(0) > 1;
             }
         }
-        // Newest album first, as the trait promises.
+        // newest first, as the trait promises.
         for list in artist_albums.values_mut() {
             list.sort_by_key(|i| std::cmp::Reverse(albums[*i as usize].year));
         }
@@ -1060,7 +1169,29 @@ impl CoreLibrary {
         shown
     }
 
-    /// "Your Top Songs", the most played songs from about the last six months.
+    /// Today's Essentials as artist ids (`navia_core::library::essentials`): the top artists' top
+    /// songs, asked a few at once and kept for the day, so a relaunch shows them at once. runs that
+    /// mustn't reach external lookups use what's stored.
+    fn essentials(&self, day: i64) -> Vec<String> {
+        let (shown, generation) = {
+            let remote = self.remote.lock().unwrap();
+            match remote.essentials.as_ref().map(|answer| remote.taste_answer(answer, day)) {
+                Some(TasteAnswer::Current(found)) => return found.clone(),
+                Some(TasteAnswer::Stale(found)) => (found.clone(), remote.taste_generation),
+                _ => (Vec::new(), remote.taste_generation),
+            }
+        };
+        let (client, db, remote, by_id) = (self.client.clone(), self.db.clone(), self.remote.clone(), self.top_by_id());
+        let ask = external_allowed();
+        self.fetch_remote(format!("essentials:{day}:{generation}"), move || async move {
+            let found = if ask { navia_core::library::essentials::refresh_essentials(&client, &db, by_id, day).await } else { db.essentials(day) };
+            let found = found.unwrap_or_default().into_iter().map(|e| e.artist_id).collect();
+            remote.lock().unwrap().land_taste(generation, |r| r.essentials = Some(TasteMemo { day, generation, found }));
+        });
+        shown
+    }
+
+    /// "Your Top Songs": what was played in about the last six months, most played first.
     pub fn top_recent_rows(&self, limit: usize) -> Vec<u32> {
         self.db.top_song_rowids(limit as u32).unwrap_or_default()
     }
@@ -1080,7 +1211,6 @@ impl CoreLibrary {
         navia_core::audio_quality::FileFacts::from_song(&song)
     }
 
-    /// Rows for these row ids, in the order given.
     pub fn rows(&self, rowids: &[u32]) -> Vec<(u32, Song)> {
         self.db.songs_by_rowid(rowids).unwrap_or_default().into_iter().map(|(r, s)| (r, to_song(s))).collect()
     }
@@ -1092,7 +1222,6 @@ impl CoreLibrary {
         self.db.recency_by_rowid(rowids, heard, now).unwrap_or_else(|_| vec![0.0; rowids.len()])
     }
 
-    /// Song ids and durations for queue building, in the order given.
     pub fn queue_ids(&self, rowids: &[u32]) -> Vec<(u32, String, Option<u64>)> {
         // The database returns each song once, but a queue can hold the same song twice.
         let found: HashMap<u32, (String, Option<u64>)> = self.db.songs_by_rowid(rowids).unwrap_or_default().into_iter().map(|(r, s)| (r, (s.id, s.duration.map(|d| d as u64 * 1000)))).collect();
@@ -1103,7 +1232,7 @@ impl CoreLibrary {
         self.db.starred_song_rowids().unwrap_or_default()
     }
 
-    /// MusicBrainz ids for an album, for Discord art. Skips the lookup when not needed.
+    /// for Discord art; skips the lookup when not needed.
     pub fn album_mbid(&self, album_id: &str) -> Option<String> {
         self.db.album(album_id).ok().flatten().and_then(|a| a.music_brainz_id)
     }
@@ -1116,9 +1245,30 @@ impl CoreLibrary {
 
     /// Cover art for the OS media controls, as a file on disk.
     pub fn cover_file(&self, album_id: &str) -> Option<String> {
-        let cover = self.cover_id(album_id);
-        let found = self.rt.block_on(self.artwork.cover(&cover, Some(512))).ok()?;
+        let found = self.cover(album_id, Some(512))?;
         Some(format!("file://{}", found.path.display()))
+    }
+
+    /// the cover from the core's cache or the server, noting placeholders and logging a failure once.
+    fn cover(&self, id: &str, size: Option<u32>) -> Option<navia_core::artwork::CoverArt> {
+        let cover = self.cover_id(id);
+        match self.rt.block_on(self.artwork.cover(&cover, size)) {
+            Ok(found) => {
+                let mut placeholders = self.placeholder_covers.lock().unwrap();
+                if found.placeholder {
+                    placeholders.insert(id.to_string());
+                } else {
+                    placeholders.remove(id);
+                }
+                Some(found)
+            }
+            Err(e) => {
+                if self.failed_covers.lock().unwrap().insert(cover.clone()) {
+                    eprintln!("navia: cover {cover} failed: {e}");
+                }
+                None
+            }
+        }
     }
 
     fn cover_id(&self, id: &str) -> String {
@@ -1129,9 +1279,19 @@ impl CoreLibrary {
     }
 
     fn cover_bytes(&self, id: &str, size: Option<u32>) -> Option<Vec<u8>> {
-        let cover = self.cover_id(id);
-        let found = self.rt.block_on(self.artwork.cover(&cover, size)).ok()?;
-        std::fs::read(found.path).ok()
+        if let Some(image) = id.strip_prefix(UPCOMING_COVER) {
+            return self.rt.block_on(navia_core::upcoming::cover(&self.db, navia_core::deezer::Deezer::shared(), image, size.unwrap_or(UPCOMING_COVER_MAX)));
+        }
+        let found = self.cover(id, size)?;
+        match std::fs::read(&found.path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                if self.failed_covers.lock().unwrap().insert(found.path.display().to_string()) {
+                    eprintln!("navia: cover file {} unreadable: {e}", found.path.display());
+                }
+                None
+            }
+        }
     }
 }
 
@@ -1181,8 +1341,27 @@ fn image_message(problem: &PlaylistImageError, removed: bool) -> String {
     }
 }
 
-/// Scripted runs stay off Navidrome's external lookups unless asked, because a stale item makes
-/// the server refresh its stored info, which is a write. `NAVIA_TEST_EXTERNAL=1` allows them.
+/// a stale item makes Navidrome refresh its stored info (a write), so scripted runs skip external lookups
+/// unless `NAVIA_TEST_EXTERNAL=1`.
+/// never stored (Deezer's terms).
+pub const UPCOMING_COVER: &str = "dz:";
+/// for the page's tint, which asks without a size.
+const UPCOMING_COVER_MAX: u32 = 500;
+
+fn upcoming(album: navia_core::upcoming::UpcomingAlbum) -> Upcoming {
+    Upcoming {
+        id: album.id,
+        release_moment: navia_core::upcoming::release_moment(&album.release_date).unwrap_or_default(),
+        title: album.title.into(),
+        artist: album.artist.into(),
+        artist_id: album.artist_id.into(),
+        cover: format!("{UPCOMING_COVER}{}", album.cover).into(),
+        release_date: album.release_date.into(),
+        total: album.total,
+        explicit: album.explicit,
+    }
+}
+
 fn external_allowed() -> bool {
     let driven = std::env::var_os("NAVIA_SCRIPT").is_some() || std::env::var_os("NAVIA_SCROLL_BENCH").is_some();
     !driven || std::env::var_os("NAVIA_TEST_EXTERNAL").is_some_and(|v| v == "1")
@@ -1204,7 +1383,7 @@ fn plain_text(html: &str) -> String {
     out.trim().to_string()
 }
 
-/// The core's For You with albums as catalog indexes.
+/// Albums as catalog indexes.
 fn for_you_page(db: &CoreDb, catalog: &Catalog, page: navia_core::library::for_you::ForYou) -> ForYouPage {
     let albums = |rows: &[u32]| -> Vec<u32> { db.albums_by_rowid(rows).unwrap_or_default().into_iter().filter_map(|(_, a)| catalog.album_index.get(&a.id).copied()).collect() };
     let mixes = page
@@ -1239,22 +1418,22 @@ fn for_you_page(db: &CoreDb, catalog: &Catalog, page: navia_core::library::for_y
         forgotten: page.forgotten,
         on_this_day: albums(&page.on_this_day),
         not_played_recently: albums(&page.not_played_recently),
+        loading: page.building || (page.needs_refresh && external_allowed()),
     }
 }
 
-/// Everything the browse pages list, built once per sync.
+/// built once per sync.
 struct Catalog {
     albums: Arc<Vec<Album>>,
     artists: Arc<Vec<Artist>>,
     artist_albums: HashMap<String, Vec<u32>>,
     /// Recent-taste scores as of this build, which Home follows.
     taste: Option<Arc<Taste>>,
-    /// Indexes into `artists` and `albums` by id.
     artist_index: HashMap<String, u32>,
     album_index: HashMap<String, u32>,
     /// Back in Rotation as artist indexes, since the taste holds row ids.
     rotation: Vec<u32>,
-    /// The Genres page, built with the rest so it never runs on the UI thread.
+    /// built here so it never runs on the UI thread.
     genre_page: Arc<GenrePage>,
 }
 
@@ -1264,10 +1443,12 @@ struct Remote {
     top: HashMap<String, Vec<u32>>,
     similar: HashMap<String, Vec<u32>>,
     info: HashMap<String, ArtistInfo>,
-    /// The artist page's Similar Artists as artist ids, in order.
     similar_artists: HashMap<String, Vec<String>>,
     /// "More by" per album id, from the library. Cleared with the catalog.
     more_by: HashMap<String, Option<navia_core::library::discography::MoreBy>>,
+    /// album id to Deezer rank by song row (`navia_core::album_heat`); cleared with the catalog and the Deezer switch.
+    heat: HashMap<String, HashMap<u32, u64>>,
+    upcoming: UpcomingAnswers,
     rules: HashMap<String, String>,
     /// Artists' albums by release type, as album ids. `discography_stale` holds the answers from
     /// before the last catalog rebuild, shown until new ones land.
@@ -1280,8 +1461,21 @@ struct Remote {
     stations: Option<TasteMemo<Vec<(String, Vec<String>)>>>,
     /// Bumped by every catalog rebuild, so answers worked out before it are stale.
     taste_generation: u64,
-    /// For You as local day, the catalog it was mapped with, and the page.
-    for_you: Option<(i64, usize, Arc<ForYouPage>)>,
+    /// For You as (local day, the catalog it was mapped with, `for_you_rev`, the page).
+    for_you: Option<(i64, usize, u64, Arc<ForYouPage>)>,
+    /// moves each time something new for For You is stored (a mix landed).
+    for_you_rev: u64,
+    /// Today's Essentials as artist ids (`navia_core::library::essentials`).
+    essentials: Option<TasteMemo<Vec<String>>>,
+}
+
+/// an answer from an older generation (a rebuild, the Deezer switch) shows while it's asked again.
+#[derive(Default)]
+struct UpcomingAnswers {
+    generation: u64,
+    artists: HashMap<String, (u64, Vec<Upcoming>)>,
+    home: Option<(u64, Vec<Upcoming>)>,
+    pages: HashMap<u64, (u64, UpcomingView)>,
 }
 
 /// A Home row worked out in the background from the play history, with the day and catalog
@@ -1428,6 +1622,20 @@ impl Library for CoreLibrary {
         self.cover_bytes(id, Some(cover_size(px)))
     }
 
+    fn artwork_is_placeholder(&self, id: &str) -> bool {
+        self.placeholder_covers.lock().unwrap().contains(id)
+    }
+
+    fn animated_cover(&self, key: &str, px: u32) -> Option<navia_core::artwork::AnimatedArt> {
+        // other `prefix:` keys are art Navia draws itself (Liked Songs, mixes, genre fans, avatars).
+        let cover = match key.strip_prefix("pl:") {
+            Some(id) => self.db.playlist_header(id).ok().flatten()?.cover_art.filter(|c| !c.is_empty())?,
+            None if key.contains(':') => return None,
+            None => self.cover_id(key),
+        };
+        self.rt.block_on(self.artwork.animated_artwork(&cover, cover_size(px))).ok().flatten()
+    }
+
     fn playlist_cover(&self, id: &str, px: u32) -> PlaylistCover {
         let Some(playlist) = self.db.playlist_header(id).ok().flatten() else { return PlaylistCover::Empty };
         // Uses only the cover id from the playlist list and `getCoverArt`. Never `getPlaylist`, which
@@ -1543,6 +1751,7 @@ impl Library for CoreLibrary {
                 .iter()
                 .filter_map(|(seed, list)| Some((artist(seed)?, list.iter().filter_map(|id| artist(id)).collect())))
                 .collect(),
+            essentials: self.essentials(day).iter().filter_map(|id| artist(id)).collect(),
         }
     }
 
@@ -1557,19 +1766,19 @@ impl Library for CoreLibrary {
         let catalog = self.catalog();
         let day = taste::local_day(taste::now_unix());
         let stamp = Arc::as_ptr(&catalog) as usize;
-        let last = self.remote.lock().unwrap().for_you.clone();
-        if let Some((d, s, page)) = &last
+        let (last, rev) = {
+            let remote = self.remote.lock().unwrap();
+            (remote.for_you.clone(), remote.for_you_rev)
+        };
+        if let Some((d, s, r, page)) = &last
             && *d == day
             && *s == stamp
+            && *r == rev
         {
             return page.clone();
         }
-        let (client, db, remote) = (self.client.clone(), self.db.clone(), self.remote.clone());
-        let ask = external_allowed();
-        self.fetch_remote(format!("for_you:{day}:{stamp}"), move || async move {
-            if ask && let Err(e) = navia_core::library::for_you::refresh_for_you(&client, &db, day).await {
-                eprintln!("navia: For You: {e}");
-            }
+        let (db, remote) = (self.db.clone(), self.remote.clone());
+        self.fetch_remote(format!("for_you:{day}:{stamp}:{rev}"), move || async move {
             let page = match db.for_you(day) {
                 Ok(page) => for_you_page(&db, &catalog, page),
                 Err(e) => {
@@ -1577,13 +1786,19 @@ impl Library for CoreLibrary {
                     ForYouPage::default()
                 }
             };
-            remote.lock().unwrap().for_you = Some((day, stamp, Arc::new(page)));
+            remote.lock().unwrap().for_you = Some((day, stamp, rev, Arc::new(page)));
         });
-        last.map(|(_, _, page)| page).unwrap_or_default()
+        last.map(|(_, _, _, page)| page).unwrap_or_else(|| Arc::new(ForYouPage { loading: true, ..Default::default() }))
     }
 
     fn playlist_entry_count(&self, playlist_id: &str) -> usize {
         self.db.playlist(playlist_id).ok().flatten().map_or(0, |p| p.entry.len())
+    }
+
+    fn stored_playlist_songs(&self, playlist_id: &str) -> Vec<u32> {
+        let Some(playlist) = self.db.playlist(playlist_id).ok().flatten() else { return Vec::new() };
+        let ids: Vec<String> = playlist.entry.into_iter().map(|s| s.id).collect();
+        self.db.song_rowids(&ids).unwrap_or_default()
     }
 
     fn playlist_songs(&self, playlist_id: &str) -> Vec<u32> {
@@ -1613,9 +1828,7 @@ impl Library for CoreLibrary {
                 }
             });
         }
-        let Some(playlist) = self.db.playlist(playlist_id).ok().flatten() else { return Vec::new() };
-        let ids: Vec<String> = playlist.entry.into_iter().map(|s| s.id).collect();
-        self.db.song_rowids(&ids).unwrap_or_default()
+        self.stored_playlist_songs(playlist_id)
     }
 
     fn album_description(&self, album_id: &str) -> SharedString {
@@ -1643,10 +1856,9 @@ impl Library for CoreLibrary {
         }
         let (client, db, remote, id, by_id) = (self.client.clone(), self.db.clone(), self.remote.clone(), artist_id.to_string(), self.top_by_id());
         self.fetch_remote(format!("top:{artist_id}"), move || async move {
-            let top = client.artist_top_songs(&id, &name, by_id, 50).await.unwrap_or_default();
-            let mut seen = HashSet::new();
-            let ids: Vec<String> = top.into_iter().map(|s| s.id).filter(|i| seen.insert(i.clone())).collect();
-            let rows = db.song_rowids(&ids).unwrap_or_default();
+            let day = taste::local_day(taste::now_unix());
+            let ids = navia_core::library::essentials::top_songs(&client, &db, &id, &name, by_id, day).await.unwrap_or_default();
+            let rows = db.top_song_rows(&ids).unwrap_or_default();
             remote.lock().unwrap().top.insert(id, rows);
         });
         Vec::new()
@@ -1722,6 +1934,65 @@ impl Library for CoreLibrary {
         ArtistInfo { biography: SharedString::default(), similar: Vec::new() }
     }
 
+    fn upcoming_for_artist(&self, artist_id: &str) -> Vec<Upcoming> {
+        let (found, generation) = {
+            let remote = self.remote.lock().unwrap();
+            (remote.upcoming.artists.get(artist_id).cloned(), remote.upcoming.generation)
+        };
+        if found.as_ref().is_none_or(|(g, _)| *g != generation) {
+            let (client, db, remote, id, ask, barcode) = (self.client.clone(), self.db.clone(), self.remote.clone(), artist_id.to_string(), external_allowed(), !read_only_run());
+            self.fetch_remote(format!("upcoming-artist:{artist_id}"), move || async move {
+                let found = navia_core::upcoming::for_artist(barcode.then_some(&client), &db, navia_core::deezer::Deezer::shared(), &id, ask).await;
+                remote.lock().unwrap().upcoming.artists.insert(id, (generation, found.into_iter().map(upcoming).collect()));
+            });
+        }
+        found.map(|(_, list)| list).unwrap_or_default()
+    }
+
+    fn upcoming_home(&self) -> Vec<Upcoming> {
+        let (found, generation) = {
+            let remote = self.remote.lock().unwrap();
+            (remote.upcoming.home.clone(), remote.upcoming.generation)
+        };
+        if found.as_ref().is_none_or(|(g, _)| *g != generation) {
+            let (client, db, remote, ask, barcode) = (self.client.clone(), self.db.clone(), self.remote.clone(), external_allowed(), !read_only_run());
+            self.fetch_remote("upcoming-home".to_string(), move || async move {
+                let found = navia_core::upcoming::for_top_artists(barcode.then_some(&client), &db, navia_core::deezer::Deezer::shared(), ask).await;
+                remote.lock().unwrap().upcoming.home = Some((generation, found.into_iter().map(upcoming).collect()));
+            });
+        }
+        found.map(|(_, list)| list).unwrap_or_default()
+    }
+
+    fn upcoming_matching(&self, query: &str) -> Vec<Upcoming> {
+        navia_core::upcoming::kept_matching(&self.db, query).into_iter().map(upcoming).collect()
+    }
+
+    fn upcoming_page(&self, id: u64) -> UpcomingView {
+        let (found, generation) = {
+            let remote = self.remote.lock().unwrap();
+            (remote.upcoming.pages.get(&id).cloned(), remote.upcoming.generation)
+        };
+        if found.as_ref().is_none_or(|(g, _)| *g != generation) {
+            let (client, db, remote, ask, barcode) = (self.client.clone(), self.db.clone(), self.remote.clone(), external_allowed(), !read_only_run());
+            self.fetch_remote(format!("upcoming-page:{id}"), move || async move {
+                let view = match navia_core::upcoming::page(barcode.then_some(&client), &db, navia_core::deezer::Deezer::shared(), id, ask).await {
+                    Some(navia_core::upcoming::UpcomingPage::Upcoming { album, tracks }) => {
+                        let tracks = tracks
+                            .into_iter()
+                            .map(|p| UpcomingTrack { title: p.track.title.into(), artist: p.track.artist.into(), duration_s: p.track.duration_s as u32, explicit: p.track.explicit, song: p.song.map(|(rowid, _)| rowid) })
+                            .collect();
+                        UpcomingView::Upcoming(upcoming(album), tracks)
+                    }
+                    Some(navia_core::upcoming::UpcomingPage::OnServer(album_id)) => UpcomingView::OnServer(album_id.into()),
+                    None => UpcomingView::Missing,
+                };
+                remote.lock().unwrap().upcoming.pages.insert(id, (generation, view));
+            });
+        }
+        found.map_or(UpcomingView::Loading, |(_, view)| view)
+    }
+
     fn similar_artists(&self, artist_id: &str) -> Vec<u32> {
         let found = self.remote.lock().unwrap().similar_artists.get(artist_id).cloned();
         let Some(ids) = found else {
@@ -1749,11 +2020,44 @@ impl Library for CoreLibrary {
         (!albums.is_empty()).then_some(MoreBy { artist, albums, section: found.section })
     }
 
-    /// From the lyrics cache while fresh, else the server, else whatever is cached when offline.
+    fn album_heat(&self, album_id: &str) -> HashMap<u32, u64> {
+        if let Some(found) = self.remote.lock().unwrap().heat.get(album_id) {
+            return found.clone();
+        }
+        // what's kept shows at once, while a fresh answer is asked for when it's over a week old.
+        let kept = navia_core::album_heat::kept_album_heat(&self.db, album_id).map(|r| Self::heat_rows(&self.db, album_id, &r)).unwrap_or_default();
+        if !external_allowed() {
+            self.remote.lock().unwrap().heat.insert(album_id.to_string(), kept.clone());
+            return kept;
+        }
+        let (db, remote, id) = (self.db.clone(), self.remote.clone(), album_id.to_string());
+        self.fetch_remote(format!("heat:{album_id}"), move || async move {
+            let found = navia_core::album_heat::album_heat(&db, navia_core::deezer::Deezer::shared(), &id).await;
+            let rows = Self::heat_rows(&db, &id, &found);
+            remote.lock().unwrap().heat.insert(id, rows);
+        });
+        kept
+    }
+
+    fn reask_missing_heat(&self, album_id: &str) {
+        let mut remote = self.remote.lock().unwrap();
+        if remote.heat.get(album_id).is_some_and(HashMap::is_empty) {
+            remote.heat.remove(album_id);
+        }
+    }
+
+    fn lyrics_writers(&self, song_id: &str) -> Vec<String> {
+        let Ok(Some(info)) = self.db.song_info(song_id) else { return Vec::new() };
+        let names = |role: &str| info.credits.iter().filter(|c| c.role == role).flat_map(|c| c.names.iter().map(|n| n.name.clone())).collect::<Vec<_>>();
+        let lyricists = names("lyricist");
+        if lyricists.is_empty() { names("composer") } else { lyricists }
+    }
+
+    /// fresh cache, else the server, else whatever is cached.
     fn lyrics(&self, song_id: &str) -> Vec<LyricLine> {
         let Some(found) = self.rt.block_on(navia_core::lyrics::lyrics_for(&self.client, Some(&self.lyrics), song_id, None, self.features.get().copied())) else { return Vec::new() };
         let synced = found.synced;
-        found.lines.into_iter().map(|l| LyricLine { start_ms: l.start_ms.unwrap_or(0), text: l.text.clone().into(), synced, timed: (!l.words.is_empty()).then(|| Arc::new(l)) }).collect()
+        found.lines.into_iter().map(|l| LyricLine { start_ms: l.start_ms.unwrap_or(0), text: l.text.clone().into(), synced, timed: (!l.words.is_empty()).then(|| Arc::new(l)), backing: None, backing_first: false }).collect()
     }
 }
 
@@ -1774,7 +2078,6 @@ impl navia_integrations::art::ServerLookup for CoreLibrary {
     }
 }
 
-/// The core's song order for a Songs sort.
 pub fn song_order_of(sort: SortKey) -> SongOrder {
     match sort {
         SortKey::MostPlayed => SongOrder::MostPlayed,

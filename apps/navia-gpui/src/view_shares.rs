@@ -35,7 +35,7 @@ pub enum Expiry {
     First,
     /// One of `EXPIRY_PRESETS`.
     Preset(usize),
-    /// A day typed as YYYY-MM-DD.
+    /// YYYY-MM-DD.
     Custom,
 }
 
@@ -79,7 +79,7 @@ fn typed_day(text: &str) -> Option<u64> {
     navia_core::shares::end_of_day_ms(y, m, d, navia_core::library::taste::utc_offset(now))
 }
 
-/// Today plus `days`, as YYYY-MM-DD, for the custom date's starting value.
+/// YYYY-MM-DD, for the custom date's starting value.
 fn day_text(days: u64) -> String {
     let secs = ((now_ms() + days * DAY_MS) / 1000) as i64;
     let local = secs + navia_core::library::taste::utc_offset(secs);
@@ -97,7 +97,7 @@ impl ShareDialog {
         }
     }
 
-    /// A custom date that's missing, unreadable or not after today.
+    /// missing, unreadable or not after today.
     fn invalid(&self) -> bool {
         self.expiry == Expiry::Custom && self.expires().is_none_or(|ms| ms < now_ms())
     }
@@ -125,14 +125,13 @@ impl Shell {
         MenuRow::item(label, "share-network-regular", move |this, cx| this.open_share(target.clone(), subject.clone(), cx))
     }
 
-    /// Share… for an album, a playlist or an artist.
     pub fn share_row(&self, kind: ShareKind, id: SharedString) -> MenuRow {
         let target = ShareTarget { kind, ids: vec![id.to_string()] };
         let subject = self.share_subject(&target, &[]);
         self.share_row_as(tr("Share\u{2026}"), target, subject)
     }
 
-    /// Share… for one song, or "Share {n} Songs…" for several.
+    /// "Share {n} Songs…" for several.
     pub fn share_songs_row(&self, songs: &[u32]) -> MenuRow {
         let ids: Vec<String> = songs.iter().filter_map(|s| self.song_peek(*s)).map(|s| s.id.to_string()).collect();
         let label: SharedString = if songs.len() > 1 { trf("Share {n} Songs\u{2026}", &[("n", &crate::i18n::fmt_int(songs.len() as i64))]).into() } else { tr("Share\u{2026}").into() };
@@ -239,7 +238,7 @@ impl Shell {
         }
     }
 
-    /// Create Link, or Save while editing.
+    /// or Save while editing.
     pub fn share_submit(&mut self, cx: &mut Context<Self>) {
         let Some(core) = self.core.as_ref() else { return };
         let Some(dialog) = self.shares.dialog.as_mut() else { return };
@@ -357,7 +356,6 @@ impl Shell {
         format!("{ends} {what}")
     }
 
-    /// Share… and Edit Link.
     pub fn render_share_dialog(&mut self, layout: &Layout, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = self.theme;
         let dialog = self.shares.dialog.as_ref()?;
@@ -461,7 +459,7 @@ impl Shell {
         )
     }
 
-    /// The Share Links page: the user's own links, newest first.
+    /// newest first.
     pub fn build_shares(&mut self, _layout: &Layout) -> Vec<Block> {
         if self.shares.links.is_none() && self.shares.error.is_none() {
             self.refresh_shares();
@@ -529,17 +527,14 @@ impl Shell {
         let id = link.id.clone();
         let key = |part: &str| gpui::ElementId::Name(format!("share-{part}-{id}").into());
         let (copy_link, edit_link, title) = (link.clone(), link.clone(), subject.title.clone());
-        let copy = crate::ui::icon_button(&t, key("copy"), "copy-regular", false)
+        let copy = crate::ui::icon_button(&t, key("copy"), if ended { tr("This link has expired") } else { tr("Copy Link") }, "copy-regular", false)
             .when(ended, |d| d.opacity(0.35))
             .when(!ended, |d| d.stop(&t).on_click(cx.listener(move |this, _, _, cx| this.copy_share_link(&copy_link, cx))));
-        let copy = copy.tooltip(crate::ui::tip(&t, if ended { tr("This link has expired") } else { tr("Copy Link") }));
-        let edit = crate::ui::icon_button(&t, key("edit"), "pencil-simple-regular", false)
-            .tooltip(crate::ui::tip(&t, tr("Edit")))
+        let edit = crate::ui::icon_button(&t, key("edit"), tr("Edit"), "pencil-simple-regular", false)
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| this.open_share_edit(edit_link.clone(), cx)));
         let delete_id = link.id.clone();
-        let delete = crate::ui::icon_button(&t, key("delete"), "trash-regular", false)
-            .tooltip(crate::ui::tip(&t, tr("Delete")))
+        let delete = crate::ui::icon_button(&t, key("delete"), tr("Delete"), "trash-regular", false)
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.confirm = Some(crate::view_connect::Confirm::DeleteShare { id: delete_id.clone(), title: title.clone() });

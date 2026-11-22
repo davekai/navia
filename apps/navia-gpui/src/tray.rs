@@ -24,7 +24,7 @@ pub struct TrayState {
     pub has_song: bool,
 }
 
-/// The menu's items in order. `None` is a separator.
+/// `None` is a separator.
 pub fn menu_items(state: TrayState) -> [Option<(TrayCommand, &'static str, bool)>; 6] {
     [
         Some((TrayCommand::PlayPause, if state.playing { tr("Pause") } else { tr("Play") }, state.has_song)),
@@ -45,7 +45,7 @@ mod imp {
     struct Item {
         state: TrayState,
         tx: UnboundedSender<TrayCommand>,
-        /// Where the symbolic icon was written, for hosts that look the name up there.
+        /// for hosts that look the name up there.
         theme_path: String,
         /// Picks the pixmap fallback. The white mark on a dark panel, the black one on a light panel.
         dark_panel: bool,
@@ -58,7 +58,7 @@ mod imp {
     /// dropped, which would load the app icon instead.
     const ICON_NAME: &str = "com.davekai.Navia.tray-symbolic";
     const SYMBOLIC: &[u8] = include_bytes!("../assets/tray/com.davekai.Navia.tray-symbolic.svg");
-    /// A minimal theme index, so KDE's icon loader accepts the folder as a theme.
+    /// so KDE's icon loader accepts the folder as a theme.
     const INDEX_THEME: &[u8] = b"[Icon Theme]\nName=hicolor\nDirectories=scalable/apps\n\n[scalable/apps]\nSize=64\nMinSize=8\nMaxSize=512\nType=Scalable\n";
 
     /// Writes the symbolic icon loose in a folder for GTK and in a hicolor layout for KDE.
@@ -113,7 +113,7 @@ mod imp {
         }
     }
 
-    /// The bare mark at tray sizes, as ARGB32 in network byte order.
+    /// ARGB32 in network byte order.
     fn icons(pngs: [&[u8]; 4]) -> Vec<ksni::Icon> {
         pngs.iter()
             .filter_map(|png| image::load_from_memory(png).ok())
@@ -149,8 +149,7 @@ mod imp {
             ]);
             // Panels are dark unless the desktop prefers light.
             let item = Item { state: TrayState::default(), tx, theme_path: write_theme_path(), dark_panel: true, white, black };
-            // A Flatpak can't own the item's usual name (org.kde.StatusNotifierItem-<pid>-<n>), so it
-            // registers under its connection's own name instead.
+            // a Flatpak can't own the item's usual name, so it registers under its connection's own name.
             match item.assume_sni_available(true).disable_dbus_name(crate::persist::in_flatpak()).spawn() {
                 Ok(handle) => {
                     // The desktop's color scheme picks the pixmap, followed live. 1 prefers dark, 2 light.

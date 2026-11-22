@@ -3,16 +3,17 @@
 //! can't resolve stays plain.
 
 use gpui::prelude::*;
-use crate::ui::LinkCursor;
+use crate::ui::{FullTextTip, LinkCursor};
 use gpui::{AnyElement, Context, Hsla, MouseButton, SharedString, div, px};
 
 use crate::model::Song;
 use crate::pages::Route;
 use crate::shell::Shell;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LinkTarget {
     Artist(SharedString),
+    ArtistTop(SharedString),
     Album(SharedString),
     Genre(SharedString),
     Playlist(SharedString),
@@ -28,6 +29,7 @@ impl From<&navia_core::queue_order::SourceLink> for LinkTarget {
             L::Album(id) => Self::Album(id.clone().into()),
             L::Playlist(id) => Self::Playlist(id.clone().into()),
             L::Artist(id) => Self::Artist(id.clone().into()),
+            L::ArtistTop(id) => Self::ArtistTop(id.clone().into()),
             L::Genre(name) => Self::Genre(name.clone().into()),
             L::Mix(id) => Self::Mix(id.clone().into()),
             L::Liked => Self::Liked,
@@ -37,14 +39,19 @@ impl From<&navia_core::queue_order::SourceLink> for LinkTarget {
 }
 
 impl Shell {
-    /// One link, sized to its text so only the text reacts. `key` must be unique in the frame.
+    /// sized to its text so only the text reacts; cut short, its full text is its tip. `key` must be unique in the frame.
     pub fn link(&mut self, key: (&'static str, usize), text: SharedString, target: Option<LinkTarget>, color: Hsla, cx: &mut Context<Self>) -> AnyElement {
-        // Padding above and below, canceled by margins, gives a short name a larger hit area
-        // without moving the text.
-        let pad = self.theme.s(3.0);
-        let base = div().min_w(px(0.0)).truncate().text_color(color).py(pad).my(-pad).child(text);
+        self.link_with(key, text, target, color, true, cx)
+    }
+
+    /// `tip`: off for a name inside a list, whose tip is the whole list.
+    fn link_with(&mut self, key: (&'static str, usize), text: SharedString, target: Option<LinkTarget>, color: Hsla, tip: bool, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        // room above and below, taken back with margins, so a short name is easy to hit without moving.
+        let pad = t.s(3.0);
+        let base = div().id(key).min_w(px(0.0)).truncate().text_color(color).py(pad).my(-pad).child(text.clone()).when(tip, |d| d.full_text_tip(&t, text));
         let Some(target) = target else { return base.into_any_element() };
-        base.id(key)
+        base
             .link_cursor()
             .hover(|s| s.underline())
             // The row underneath must not take this press as the start of a drag.
@@ -62,31 +69,37 @@ impl Shell {
                 }
                 cx.stop_propagation();
                 this.link_pressed = None;
-                match target.clone() {
-                    LinkTarget::Artist(id) => this.navigate(Route::Artist(id), cx),
-                    LinkTarget::Album(id) => this.navigate(Route::Album(id), cx),
-                    LinkTarget::Genre(name) => this.open_genre(name, cx),
-                    LinkTarget::Playlist(id) => this.navigate(Route::Playlist(id), cx),
-                    LinkTarget::Mix(id) => this.navigate(Route::Mix(id), cx),
-                    LinkTarget::Liked => this.navigate(Route::Liked, cx),
-                    LinkTarget::Songs => this.open_all_songs(cx),
-                }
-                // From the mini player, the full window comes back on that page.
-                this.mini_follow_link(cx);
+                this.follow_link(target.clone(), cx);
             }))
             .into_any_element()
     }
 
-    /// The song's artists, each a link when the library knows them, separated by commas.
+    /// from the mini player, the full window comes back on that page.
+    pub fn follow_link(&mut self, target: LinkTarget, cx: &mut Context<Self>) {
+        match target {
+            LinkTarget::Artist(id) => self.navigate(Route::Artist(id), cx),
+            LinkTarget::ArtistTop(id) => self.navigate(Route::ArtistTop(id), cx),
+            LinkTarget::Album(id) => self.navigate(Route::Album(id), cx),
+            LinkTarget::Genre(name) => self.open_genre(name, cx),
+            LinkTarget::Playlist(id) => self.navigate(Route::Playlist(id), cx),
+            LinkTarget::Mix(id) => self.navigate(Route::Mix(id), cx),
+            LinkTarget::Liked => self.navigate(Route::Liked, cx),
+            LinkTarget::Songs => self.open_all_songs(cx),
+        }
+        self.mini_follow_link(cx);
+    }
+
+    /// comma-separated; each a link when the library knows them.
     pub fn artist_links(&mut self, key: (&'static str, usize), song: &Song, color: Hsla, cx: &mut Context<Self>) -> AnyElement {
         let names: Vec<SharedString> = if song.artists.len() > 1 { song.artists.clone() } else { vec![song.artist.clone()] };
-        let mut row = div().flex().flex_row().min_w(px(0.0)).overflow_hidden().whitespace_nowrap();
+        let full = SharedString::from(names.iter().map(|n| n.as_ref()).collect::<Vec<_>>().join(", "));
+        let mut row = div().id(list_key(key)).flex().flex_row().min_w(px(0.0)).overflow_hidden().whitespace_nowrap().full_text_tip(&self.theme, full);
         let count = names.len();
         for (k, name) in names.into_iter().enumerate() {
             let target = self.artist_named(&name).map(|a| LinkTarget::Artist(a.id.clone()));
             let last = k + 1 == count;
-            // Only the last name truncates, so the line reads as one text cut at its end.
-            let link = self.link((key.0, key.1 * 16 + k.min(15)), name, target, color, cx);
+            // only the last name shortens, so the line reads as one text cut at its end.
+            let link = self.link_with((key.0, key.1 * 16 + k.min(15)), name, target, color, false, cx);
             row = if last { row.child(link) } else { row.child(div().flex_none().child(link)) };
             if !last {
                 row = row.child(div().flex_none().mr(px(4.0)).text_color(color).child(","));
@@ -98,10 +111,10 @@ impl Shell {
     /// A credit line like "A, B & C", with each known artist as its own link and the separators
     /// as plain text. A credit the library knows as one artist is one link.
     pub fn artist_name_links(&mut self, key: (&'static str, usize), credit: &SharedString, color: Hsla, cx: &mut Context<Self>) -> AnyElement {
-        let mut row = div().flex().flex_row().min_w(px(0.0)).overflow_hidden().whitespace_nowrap().text_color(color);
+        let mut row = div().id(list_key(key)).flex().flex_row().min_w(px(0.0)).overflow_hidden().whitespace_nowrap().text_color(color).full_text_tip(&self.theme, credit.clone());
         if let Some(a) = self.artist_named(credit) {
             let id = a.id.clone();
-            return row.child(self.link(key, credit.clone(), Some(LinkTarget::Artist(id)), color, cx)).into_any_element();
+            return row.child(self.link_with(key, credit.clone(), Some(LinkTarget::Artist(id)), color, false, cx)).into_any_element();
         }
         let mut k = 0;
         for (piece, is_name) in split_credit(credit) {
@@ -110,7 +123,7 @@ impl Shell {
                 continue;
             }
             let target = self.artist_named(&SharedString::from(piece.clone())).map(|a| LinkTarget::Artist(a.id.clone()));
-            row = row.child(self.link((key.0, key.1 * 16 + k.min(15)), piece.into(), target, color, cx));
+            row = row.child(self.link_with((key.0, key.1 * 16 + k.min(15)), piece.into(), target, color, false, cx));
             k += 1;
         }
         row.into_any_element()
@@ -127,7 +140,12 @@ impl Shell {
     }
 }
 
-/// Splits an artist credit into names and the separators between them, in order.
+/// a list's own id beside its links' `(key.0, key.1 * 16 + k)`.
+fn list_key(key: (&'static str, usize)) -> gpui::ElementId {
+    gpui::ElementId::Name(format!("{}-list-{}", key.0, key.1).into())
+}
+
+/// in order.
 pub fn split_credit(credit: &str) -> Vec<(String, bool)> {
     const SEPARATORS: [&str; 6] = [", ", " & ", " feat. ", " ft. ", " featuring ", " x "];
     let mut out = Vec::new();

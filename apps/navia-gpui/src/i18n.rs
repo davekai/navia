@@ -295,8 +295,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// A day of the year with the full month, like "November 11", "11 novembre", "11 de noviembre"
-/// or "11. November". `days` counts from 1970-01-01.
+/// a day of the year with the full month, like "November 11" or "11 novembre". `days` counts from 1970-01-01.
 pub fn fmt_day_month(days: i64) -> String {
     let (_, m, d) = civil_from_days(days);
     let lang = LANGUAGES[ACTIVE.load(Ordering::Relaxed) as usize];
@@ -374,7 +373,6 @@ pub fn apply(choice: Option<&str>) {
     ACTIVE.store(index as u8, Ordering::Relaxed);
 }
 
-/// The language in use.
 pub fn current() -> &'static str {
     LANGUAGES[ACTIVE.load(Ordering::Relaxed) as usize]
 }

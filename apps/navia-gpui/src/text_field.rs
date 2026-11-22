@@ -16,6 +16,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::focus::FocusStop;
+use crate::i18n::tr;
 use crate::shell::Shell;
 use crate::ui_controls::{PointerDrag, TextTarget, track_bounds};
 
@@ -218,7 +219,6 @@ impl Shell {
         }
     }
 
-    /// Gives a field the keyboard.
     pub fn focus_field(&mut self, target: TextTarget, cx: &mut Context<Self>) {
         match target {
             TextTarget::Page => {
@@ -409,7 +409,36 @@ impl Shell {
         cx.notify();
     }
 
-    /// A field's text, caret and selection. Keeps the caret in view when the text is long.
+    /// the ✕ at a search field's end, only while it has text. it empties the field as typing would, and the field keeps the keyboard.
+    pub fn search_clear(&mut self, target: TextTarget, id: &'static str, value: &str, size: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if value.is_empty() {
+            return None;
+        }
+        let t = self.theme;
+        let ink = crate::ui::ink(id);
+        let button = div()
+            .id(id)
+            .flex_none()
+            .size(t.s(size))
+            .child(crate::ui::hover_track(id))
+            .opacity(ink.opacity(1.0))
+            .child(crate::ui::icon(&t, "x-circle-fill", size, ink.color(t.t3(), t.t1())))
+            .tooltip(crate::ui::tip(&t, tr("Clear Search")))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.clear_field(target.clone(), cx);
+            }));
+        Some(button.into_any_element())
+    }
+
+    pub fn clear_field(&mut self, target: TextTarget, cx: &mut Context<Self>) {
+        self.focus_field(target.clone(), cx);
+        let len = self.text_value(&target).len();
+        self.field_replace(&target, 0..len, "", EditKind::Other, cx);
+    }
+
+    /// The text of a field, its caret and selection. Keeps the caret in view when the text is long.
     pub fn field_line(&mut self, target: &TextTarget, value: &str, placeholder: &'static str, key: &str, size_px: Pixels) -> AnyElement {
         self.edit_sync();
         let t = self.theme;

@@ -1,7 +1,7 @@
 //! The glass sidebar. Content passing behind it, on shelf pages or in the narrow-window drawer, gets a real backdrop
 //! blur. Elsewhere it's just the fill.
 
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 use gpui::prelude::*;
 use crate::focus::FocusStop;
 use gpui::{AnyElement, Context, FontWeight, div, px};
@@ -13,10 +13,11 @@ use crate::theme::size::*;
 use crate::ui::{icon, icon_button};
 use crate::view_window_buttons::Side;
 
-fn top_items() -> [(&'static str, &'static str, Route); 4] {
+fn top_items() -> [(&'static str, &'static str, Route); 5] {
     [
         ("magnifying-glass-regular", tr("Search"), Route::Browse),
         ("house-regular", tr("Home"), Route::Home),
+        ("star-four-regular", tr("For You"), Route::Discover(DiscoverTab::ForYou)),
         ("squares-four-regular", tr("New"), Route::Discover(DiscoverTab::New)),
         ("broadcast-regular", tr("Radio"), Route::Discover(DiscoverTab::Radio)),
     ]
@@ -45,7 +46,7 @@ impl Shell {
             .items_center()
             .gap(t.s(12.0))
             .h(t.s(45.0))
-            .px(t.s(14.0))
+            .px(t.s(SIDEBAR_ITEM_PAD_X))
             .rounded(t.s(R_MD))
             .when(active, |d| d.bg(t.hover()))
             .when(!active, |d| d.hover(|s| s.bg(t.row())))
@@ -54,7 +55,7 @@ impl Shell {
                 this.sidebar_drawer = false;
             }))
             .child(icon(&t, name, 22.0, ink))
-            .child(div().truncate().text_color(ink).child(label))
+            .child(div().truncate().text_color(ink).when(active, |d| d.font_weight(SIDEBAR_ACTIVE_WEIGHT)).child(label))
             .into_any_element()
     }
 
@@ -66,12 +67,12 @@ impl Shell {
             .flex_row()
             .justify_between()
             .items_center()
-            .pt(t.s(18.0))
+            .pt(t.s(SIDEBAR_HEADING_TOP))
             .pr(t.s(12.0))
-            .pb(t.s(7.0))
-            .pl(t.s(14.0))
+            .pb(t.s(SIDEBAR_HEADING_PAD_Y))
+            .pl(t.s(SIDEBAR_ITEM_PAD_X))
             .text_size(t.text(TEXT_SM))
-            .text_color(t.t_section())
+            .text_color(t.t_nav_section())
             .font_weight(FontWeight::SEMIBOLD)
             .child(title)
     }
@@ -80,25 +81,22 @@ impl Shell {
     fn heading(&mut self, group: usize, title: &'static str, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let open = !self.sidebar_folded[group];
+        let label = trf(if open { "Collapse {section}" } else { "Expand {section}" }, &[("section", title)]);
+        let row_group = gpui::SharedString::from(format!("sidebar-fold-{group}"));
         self.heading_line(title)
-            .child(
-                div()
-                    .id(("sidebar-fold", group))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(t.s(5.0))
-                    .text_size(t.text(TEXT_XS))
-                    .text_color(t.t3())
-                    .font_weight(FontWeight::NORMAL)
-                    .hover(|s| s.text_color(t.t1()))
-                    .stop(&t)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.sidebar_folded[group] = !this.sidebar_folded[group];
-                        cx.notify();
-                    }))
-                    .child(icon(&t, if open { "caret-down-bold" } else { "caret-right-bold" }, 11.0, t.t3())),
-            )
+            .id(("sidebar-fold", group))
+            .group(row_group.clone())
+            .mt(t.s(SIDEBAR_HEADING_TOP - SIDEBAR_HEADING_PAD_Y))
+            .pt(t.s(SIDEBAR_HEADING_PAD_Y))
+            .rounded(t.s(R_MD))
+            .hover(|s| s.bg(t.row()))
+            .tooltip(crate::ui::tip(&t, label))
+            .stop(&t)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.sidebar_folded[group] = !this.sidebar_folded[group];
+                cx.notify();
+            }))
+            .child(icon(&t, if open { "caret-down-bold" } else { "caret-right-bold" }, 11.0, t.t_nav_section()).group_hover(row_group, move |s| s.text_color(t.t1())))
             .into_any_element()
     }
 
@@ -182,7 +180,7 @@ impl Shell {
                 }
                 left
             })
-            .child(icon_button(&t, "hide-sidebar", "sidebar-simple-regular", false).occlude().stop(&t).on_click(cx.listener(move |this, _, _, cx| this.toggle_sidebar(tokens_w, cx))));
+            .child(icon_button(&t, "hide-sidebar", tr("Hide sidebar"), "sidebar-simple-regular", false).occlude().stop(&t).on_click(cx.listener(move |this, _, _, cx| this.toggle_sidebar(tokens_w, cx))));
 
         let offline = (self.core.is_some() && self.is_offline()).then(|| {
             div()
@@ -196,10 +194,11 @@ impl Shell {
                 .py(t.s(10.0))
                 .rounded(t.s(R_MD))
                 .bg(t.row())
-                .child(icon(&t, "cloud-slash-fill", 20.0, t.t2()))
-                .child(div().flex_1().min_w(px(0.0)).line_height(gpui::relative(1.25)).child(div().font_weight(FontWeight::MEDIUM).child(tr("Offline"))).child(div().text_size(t.text(TEXT_XS)).text_color(t.t2()).child(tr("Downloads only"))))
+                .child(icon(&t, "cloud-slash-fill", 20.0, t.t_nav()))
+                .child(div().flex_1().min_w(px(0.0)).line_height(gpui::relative(1.25)).child(div().font_weight(FontWeight::MEDIUM).child(tr("Offline"))).child(div().text_size(t.text(TEXT_XS)).text_color(t.t_nav()).child(tr("Downloads only"))))
                 .mb(t.s(12.0))
-                .child(
+                // the switch is the way back, so no Retry while it's on
+                .when(!self.offline_switch, |d| d.child(
                     div()
                         .id("offline-retry")
                         .flex_none()
@@ -214,7 +213,7 @@ impl Shell {
                         .font_weight(FontWeight::MEDIUM)
                         .stop(&t).on_click(cx.listener(|this, _, _, cx| this.core_retry_connection(cx)))
                         .child(tr("Retry")),
-                )
+                ))
         });
 
         let inset = t.s(WINDOW_INSET);
@@ -222,7 +221,7 @@ impl Shell {
         // Shelf pages and the drawer have something bright under the sidebar, so it gets real blur and dark glass to
         // keep labels readable.
         let frosted = crate::ui::has_backdrop_blur() && (layout.sidebar_overlay || self.page.blocks.iter().any(|block| matches!(block, crate::pages::Block::Shelf(_))));
-        let glass = frosted || matches!(self.route, Route::Artist(_) | Route::Album(_) | Route::Playlist(_));
+        let glass = frosted || matches!(self.route, Route::Artist(_) | Route::ArtistTop(_) | Route::Album(_) | Route::Playlist(_) | Route::Upcoming(_));
         let fill = if glass { t.sidebar_glass() } else { t.panel_glass() };
         div()
             .id("sidebar")
@@ -233,7 +232,7 @@ impl Shell {
             .w(layout.sidebar_width)
             .rounded(radius)
             .when(layout.sidebar_overlay, |d| d.ml(inset).my(inset))
-            .when(!layout.sidebar_overlay, |d| d.absolute().left(inset).top(inset).bottom(inset))
+            .when(!layout.sidebar_overlay, |d| crate::animation::at_left(d.absolute(), layout.sidebar_room - layout.sidebar_width, inset, layout.scale).top(inset).bottom(inset))
             .occlude()
             .overflow_hidden()
             // Songs dragged over the sidebar leave their list, whether or not a playlist is under them.
@@ -251,14 +250,9 @@ impl Shell {
             )
             .child(top)
             .child({
-                // Rows fade as they reach the pinned header instead of being cut off.
-                let scrolled = f32::from(self.sidebar_scroll.offset().y) < -0.5;
-                let bar = self.render_scrollbar("sidebar", crate::ui_scroll::ScrollSource::Handle(self.sidebar_scroll.clone()), px(0.0), px(0.0), layout.scale, cx);
+                let bar = self.render_scrollbar("sidebar", crate::ui_scroll::ScrollSource::Handle(self.sidebar_scroll.clone()), px(0.0), px(0.0), cx);
                 let lifted = self.render_sidebar_lifted(layout);
-                div().relative().flex_1().min_h(px(0.0)).child(scroll).child(bar).children(lifted).when(scrolled, |d| {
-                    let fade = t.sidebar_fade();
-                    d.child(div().absolute().top(px(0.0)).left(px(0.0)).right(px(0.0)).h(t.s(26.0)).bg(gpui::linear_gradient(180.0, gpui::linear_color_stop(fade, 0.0), gpui::linear_color_stop(gpui::Rgba { a: 0.0, ..fade }, 1.0))))
-                })
+                div().relative().flex_1().min_h(px(0.0)).child(scroll).child(bar).children(lifted)
             })
             // Settings is in the account menu, so the playlists end the sidebar.
             .children(self.render_sync_card())

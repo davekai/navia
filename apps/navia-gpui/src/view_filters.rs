@@ -544,13 +544,14 @@ impl Shell {
         let placeholder = find.unwrap_or(crate::i18n::n_("Find"));
         let query = self.filters(page).find.clone();
         let needle = query.trim().to_lowercase();
-        let line = self.text_line_sized(&TextTarget::FilterFind, &query, tr(placeholder), "filter-find-text", t.text(TEXT_SM), window);
-        let field = crate::ui::float_filter(&t, "filter-find", line).stop_field(&t, TextTarget::FilterFind).on_click(cx.listener(|this, _, _, cx| this.focus_field(TextTarget::FilterFind, cx)));
+        let line = self.text_line_sized(&TextTarget::FilterFind, &query, tr(placeholder), "filter-find-text", t.text(MENU_TEXT), window);
+        let clear = self.search_clear(TextTarget::FilterFind, "filter-find-clear", &query, SEARCH_CLEAR_SM, cx);
+        let field = crate::ui::float_filter(&t, "filter-find", line, clear).stop_field(&t, TextTarget::FilterFind).on_click(cx.listener(|this, _, _, cx| this.focus_field(TextTarget::FilterFind, cx)));
         // Picked ones stay on top so they can be unpicked without scrolling.
         let shown: Vec<&FilterOption> = options.iter().filter(|o| picked.contains(&o.value)).chain(options.iter().filter(|o| !picked.contains(&o.value) && (needle.is_empty() || option_label(o).to_lowercase().contains(&needle)))).collect();
         let mut list = div().id("filter-list").flex().flex_col().max_h(t.s(FILTER_LIST_MAX_H)).overflow_y_scroll().track_scroll(&self.filters(page).list_scroll);
         if shown.is_empty() {
-            list = list.child(div().p(t.s(LIST_ROW_PAD_X)).text_size(t.text(TEXT_SM)).text_color(t.t2()).child(tr("No matches")));
+            list = list.child(div().px(t.s(MENU_ROW_PAD_X)).py(t.s(MENU_EMPTY_PAD_Y)).text_size(t.text(MENU_TEXT)).text_color(t.t2()).child(tr("No matches")));
         }
         for (i, o) in shown.into_iter().enumerate() {
             let value = o.value.clone();

@@ -7,6 +7,8 @@
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString, Window, div, point, px};
 
+use crate::i18n::{tr, trf};
+use crate::ui::FullTextTip;
 use crate::focus::FocusStop;
 use crate::shell::{Drag, Layout, Route, Shell};
 use crate::theme::size::*;
@@ -71,6 +73,13 @@ impl SidebarGroup {
             SidebarGroup::Shared => "playlist-shared",
         }
     }
+
+    fn cover_id(self) -> &'static str {
+        match self {
+            SidebarGroup::Mine => "playlist-cover",
+            SidebarGroup::Shared => "playlist-shared-cover",
+        }
+    }
 }
 
 /// A press on a playlist row, which may become a drag.
@@ -94,8 +103,9 @@ impl Shell {
     /// Rebuilds the order whenever the playlist list changes.
     pub fn refresh_sidebar_order(&mut self) {
         let saved = self.prefs.sidebar_orders.get(&self.order_key()).map_or(&[][..], Vec::as_slice);
+        let pinned: Vec<bool> = self.playlists.iter().map(|p| self.sidebar_pinned(p)).collect();
         let group = |section: Section| {
-            let members: Vec<usize> = (0..self.playlists.len()).filter(|i| self.playlists[*i].section() == section).collect();
+            let members: Vec<usize> = (0..self.playlists.len()).filter(|i| self.playlists[*i].section() == section && pinned[*i]).collect();
             let ids: Vec<&str> = members.iter().map(|i| self.playlists[*i].id.as_ref()).collect();
             merged_order(saved, &ids).into_iter().map(|k| members[k]).collect::<Vec<usize>>()
         };
@@ -119,12 +129,76 @@ impl Shell {
             SidebarGroup::Mine => self.sidebar_order = order,
             SidebarGroup::Shared => self.sidebar_shared = order,
         }
-        let ids = self.sidebar_order.iter().chain(&self.sidebar_shared).filter_map(|i| self.playlists.get(*i)).map(|p| p.id.to_string()).collect();
+        let mut ids: Vec<String> = self.sidebar_order.iter().chain(&self.sidebar_shared).filter_map(|i| self.playlists.get(*i)).map(|p| p.id.to_string()).collect();
+        // unpinned playlists keep their place in the saved order.
+        let saved = self.prefs.sidebar_orders.get(&self.order_key()).map_or(&[][..], Vec::as_slice);
+        let all: Vec<&str> = self.playlists.iter().map(|p| p.id.as_ref()).collect();
+        let rest: Vec<String> = merged_order(saved, &all).into_iter().map(|k| all[k].to_string()).filter(|id| !ids.contains(id)).collect();
+        ids.extend(rest);
         let key = self.order_key();
         self.prefs.sidebar_orders.insert(key, ids);
         self.prefs.save();
         cx.notify();
         true
+    }
+
+    /// own playlists unless unpinned, others' only once pinned.
+    pub fn sidebar_pinned(&self, p: &crate::model::PlaylistSummary) -> bool {
+        self.prefs.sidebar_pins.get(&self.order_key()).map_or(p.section() == Section::Mine, |pins| pins.is_pinned(&p.id, p.section() == Section::Mine))
+    }
+
+    pub fn set_sidebar_pinned(&mut self, id: &SharedString, on: bool, cx: &mut Context<Self>) {
+        let Some(mine) = self.playlists.iter().find(|p| &p.id == id).map(|p| p.section() == Section::Mine) else { return };
+        let key = self.order_key();
+        self.prefs.sidebar_pins.entry(key).or_default().set(id, on, mine);
+        self.prefs.save();
+        self.refresh_sidebar_order();
+        cx.notify();
+    }
+
+    /// "Pin to Sidebar" or "Unpin from Sidebar" in a playlist's menus. others' private playlists, which only an admin sees, have no sidebar section.
+    pub fn pin_row(&self, id: &SharedString) -> Option<crate::view_menu::MenuRow> {
+        use crate::view_menu::MenuRow;
+        let p = self.playlists.iter().find(|p| &p.id == id)?;
+        if p.section() == Section::Other {
+            return None;
+        }
+        let id = id.clone();
+        Some(if self.sidebar_pinned(p) {
+            MenuRow::item(tr("Unpin from Sidebar"), "push-pin-slash-regular", move |this, cx| this.set_sidebar_pinned(&id, false, cx))
+        } else {
+            MenuRow::item(tr("Pin to Sidebar"), "push-pin-regular", move |this, cx| this.set_sidebar_pinned(&id, true, cx))
+        })
+    }
+
+    /// over a hovered cover, plays the playlist from the start; on the playlist that's playing it pauses and resumes.
+    fn sidebar_cover_play(&self, group: SidebarGroup, stable: usize, id: &SharedString, name: &SharedString, cover: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        let source = navia_core::queue_order::SourceLink::Playlist(id.to_string());
+        let current = self.player.source.as_ref().and_then(|s| s.link.as_ref()) == Some(&source);
+        let has_songs = self.playlists_full.iter().find(|p| &p.id == id).is_some_and(|p| p.song_count > 0);
+        let wrap = div().relative().flex_none().size(t.s(SIDEBAR_COVER)).child(cover);
+        if !current && !has_songs {
+            return wrap.into_any_element();
+        }
+        let pause = current && self.player.playing;
+        let label = if pause { trf("Pause {name}", &[("name", name)]) } else { trf("Play {name}", &[("name", name)]) };
+        let key = gpui::ElementId::from((group.cover_id(), stable));
+        let id = id.clone();
+        wrap.id(key.clone())
+            .child(crate::ui::hover_track(key.clone()))
+            .children(crate::ui::art_overlay(&t, key, t.s(SIDEBAR_COVER_R), if pause { "pause-fill" } else { "play-fill" }, SIDEBAR_COVER_GLYPH))
+            .tooltip(crate::ui::tip(&t, label))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if current {
+                    this.toggle_play(cx);
+                } else {
+                    this.play_playlist(id.clone(), false, cx);
+                }
+            }))
+            .into_any_element()
     }
 
     fn sidebar_row_press(&mut self, id: SharedString, group: SidebarGroup, position: Point<Pixels>, grab: f32) {
@@ -180,7 +254,6 @@ impl Shell {
         }
     }
 
-    /// Scrolls just enough to show this row.
     fn sidebar_reveal(&mut self, group: SidebarGroup, position: usize, row_px: f32) {
         let store = self.bounds_store(group.rows_key());
         let rows = *store.borrow();
@@ -264,11 +337,12 @@ impl Shell {
             let download = self.download_mark(navia_core::library::collections::CollectionKind::Playlist, &playlist_id);
             let lifted = dragged.as_ref().is_some_and(|(id, _)| *id == playlist_id);
             let cover_id = self.playlist_art_key(&playlist_id);
-            let cover = self.artwork(Some(&cover_id), "playlist-regular", 22.0, ArtShape::Rounded(5.0), layout);
+            let cover = self.sidebar_cover(&cover_id, layout);
+            let cover = self.sidebar_cover_play(group, stable, &playlist_id, &name, cover, cx);
             let route = Route::Playlist(playlist_id.clone());
             let on = self.route == route;
-            let (press_id, key_id) = (playlist_id.clone(), playlist_id.clone());
-            // Dropped songs go to your own regular playlists. The rest refuse them.
+            let (press_id, key_id, menu_id) = (playlist_id.clone(), playlist_id.clone(), playlist_id.clone());
+            // Songs carried here are added to your own regular playlists; the rest refuse them.
             let drop = self.drop_mark(format!("sidebar:{playlist_id}"), self.playlist_drop(&playlist_id, &name), R_MD, 0.0);
             column = column.child(
                 div()
@@ -280,7 +354,7 @@ impl Shell {
                     .items_center()
                     .gap(t.s(12.0))
                     .h(row_h)
-                    .px(t.s(14.0))
+                    .px(t.s(SIDEBAR_ITEM_PAD_X))
                     .rounded(t.s(R_MD))
                     .when(lifted, |d| d.opacity(0.35))
                     .when(on, |d| d.bg(t.hover()))
@@ -290,6 +364,7 @@ impl Shell {
                         let grab = (f32::from(event.position.y) - f32::from(store.borrow().top())).rem_euclid(row_px);
                         this.sidebar_row_press(press_id.clone(), group, event.position, grab);
                     }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| this.open_playlist_menu(menu_id.clone(), event.position, cx)))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _: &mut Window, cx| this.sidebar_key(group, &key_id, event, row_px, cx)))
                     .stop(&t)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -301,7 +376,7 @@ impl Shell {
                     }))
                     .children(drop)
                     .child(cover)
-                    .child(div().flex_1().min_w(px(0.0)).truncate().text_color(if on { t.t_em() } else { t.t_nav() }).child(name))
+                    .child(div().id("name").flex_1().min_w(px(0.0)).truncate().text_color(if on { t.t_em() } else { t.t_nav() }).when(on, |d| d.font_weight(SIDEBAR_ACTIVE_WEIGHT)).child(name.clone()).full_text_tip(&t, name))
                     .child(div().flex_none().flex().flex_row().items_center().gap(t.s(8.0)).children(download).children(mark)),
             );
         }
@@ -311,13 +386,18 @@ impl Shell {
         column.into_any_element()
     }
 
-    /// The row following the pointer, in the same box as the scrolling list.
+    /// a playlist row's cover in the sidebar.
+    pub fn sidebar_cover(&mut self, key: &SharedString, layout: &Layout) -> AnyElement {
+        self.artwork(Some(key), "playlist-regular", SIDEBAR_COVER, ArtShape::Rounded(SIDEBAR_COVER_R), layout)
+    }
+
+    /// the row following the pointer, in the same box as the scrolling list.
     pub fn render_sidebar_lifted(&mut self, layout: &Layout) -> Option<AnyElement> {
         let t = self.theme;
         let (id, y, grab) = self.sidebar_drag.as_ref().filter(|d| d.moved).map(|d| (d.id.clone(), f32::from(d.pointer.y), d.grab))?;
         let name = self.playlists.iter().find(|p| p.id == id)?.name.clone();
         let cover_id = self.playlist_art_key(&id);
-        let cover = self.artwork(Some(&cover_id), "playlist-regular", 22.0, ArtShape::Rounded(5.0), layout);
+        let cover = self.sidebar_cover(&cover_id, layout);
         let top = y - grab - f32::from(self.sidebar_scroll.bounds().top());
         Some(
             div()
@@ -330,7 +410,7 @@ impl Shell {
                 .flex_row()
                 .items_center()
                 .gap(t.s(12.0))
-                .px(t.s(14.0))
+                .px(t.s(SIDEBAR_ITEM_PAD_X))
                 .rounded(t.s(R_MD))
                 .bg(gpui::rgb(crate::theme::PANEL_2))
                 .font_weight(FontWeight::MEDIUM)

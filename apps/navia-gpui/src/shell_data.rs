@@ -1,4 +1,4 @@
-//! The library data pages read, with small caches so a page never asks the library twice.
+//! library data for pages, cached so a page never asks the library twice.
 
 use crate::i18n::tr;
 use std::collections::HashMap;
@@ -249,10 +249,11 @@ impl Shell {
         let width = layout.viewport.width;
         let tint = match self.route.clone() {
             Route::Album(id) => Some(self.album_tint(&id)),
+            Route::Upcoming(_) => self.upcoming_cover.clone().map(|cover| self.album_tint(&cover)),
             _ => None,
         };
         let mut layer = div().absolute().inset_0().overflow_hidden();
-        if let Route::Artist(id) = &self.route {
+        if let Route::Artist(id) | Route::ArtistTop(id) = &self.route {
             if let Some(image) = self.artists.iter().find(|a| &a.id == id).and_then(|a| a.image.clone()) {
                 let (w, h) = ((f32::from(width) * layout.scale) as u32, (f32::from(layout.viewport.height) * 0.82 * layout.scale) as u32);
                 // The glow scrolls with the page.
@@ -269,6 +270,7 @@ impl Shell {
         let playlist = match &self.route {
             Route::Playlist(id) => self.playlists_full.iter().find(|p| &p.id == id).map(|_| (id.clone(), self.playlist_art_key(id))),
             Route::Mix(id) => self.for_you.mixes.iter().find(|m| &m.id == id).map(|m| (id.clone(), crate::art::genre_tint_key(&m.covers))),
+            Route::Liked => Some((crate::art::LIKED_COVER.into(), crate::art::LIKED_COVER.into())),
             _ => None,
         };
         match playlist {
@@ -393,6 +395,7 @@ impl Shell {
         self.playlist_detail = Default::default();
         self.liked_view = Default::default();
         self.playlists_view.query.clear();
+        self.settings_query.clear();
         self.artists_view = Default::default();
         self.playlists_view.kind = crate::view_playlists::PlaylistKind::All;
         self.playlists_view.scope = crate::view_playlists::PlaylistScope::All;
@@ -415,12 +418,13 @@ impl Shell {
             Route::Artists => Some(&mut self.artists_view.query),
             Route::Playlist(_) => Some(&mut self.playlist_detail.query),
             Route::Browse | Route::Search => Some(&mut self.search_query),
+            Route::Settings => Some(&mut self.settings_query),
             _ => None,
         }
     }
 
     pub fn page_has_field(&self) -> bool {
-        matches!(self.route, Route::Songs | Route::Liked | Route::Albums(_) | Route::Album(_) | Route::Artists | Route::Artist(_) | Route::Playlists | Route::Genres | Route::Playlist(_) | Route::Browse | Route::Search)
+        matches!(self.route, Route::Songs | Route::Liked | Route::Albums(_) | Route::Album(_) | Route::Artists | Route::Artist(_) | Route::Playlists | Route::Genres | Route::Playlist(_) | Route::Browse | Route::Search | Route::Settings)
     }
 
     pub fn page_field_value(&self) -> String {
@@ -435,6 +439,7 @@ impl Shell {
             Route::Artists => self.artists_view.query.clone(),
             Route::Playlist(_) => self.playlist_detail.query.clone(),
             Route::Browse | Route::Search => self.search_query.clone(),
+            Route::Settings => self.settings_query.clone(),
             _ => String::new(),
         }
     }
@@ -482,25 +487,30 @@ impl Shell {
             "confirm" => self.confirm = Some(crate::view_connect::Confirm::ClearCache),
             // The output device menu, as the player's output button opens it.
             "output-menu" => self.open_output_menu(point(px(600.0), px(300.0)), cx),
-            // AirPlay with sample receivers.
+            // `menu-quick` focuses the quick row, `menu-quick-right` moves along, `menu-quick-open` presses as Enter would.
+            "menu-quick" => self.script_menu_quick(cx),
+            "menu-quick-right" => self.script_menu_quick_move(1, cx),
+            "menu-quick-open" => self.menu_activate(cx),
+            // sample receivers, for previews.
             op if op.starts_with("airplay-") => self.airplay_preview(&op["airplay-".len()..], cx),
             // The page's filter row.
             op if op.starts_with("filter-") => self.filter_script(&op["filter-".len()..], viewport, cx),
-            // Opens the Settings output picker as if its pill were clicked.
-            "output-select" => {
-                let value = self.prefs.output_device.clone().unwrap_or_else(|| crate::eq_model::OUTPUT_DEFAULT.to_string());
-                let anchor = gpui::Bounds::new(point(px(900.0), px(300.0)), gpui::size(px(240.0), px(32.0)));
-                let options = self.output_options();
-                self.toggle_select_public(crate::view_settings::OUTPUT_SELECT.to_string(), value.into(), options, std::rc::Rc::new(|this: &mut Self, value, cx| this.set_output_device((value != crate::eq_model::OUTPUT_DEFAULT).then(|| value.to_string()), cx)), anchor, cx);
-            }
             // The open artist's About sheet.
             "about" => {
                 if let crate::pages::Route::Artist(id) = self.route.clone() {
                     self.open_artist_about(id, cx);
                 }
             }
-            // Share links. Shares the first album, creates a link and deletes it again. Needs
-            // `NAVIA_TEST_SHARE=1`, since test runs otherwise refuse writes.
+            // the open playlist's description sheet, even when MORE isn't shown.
+            "more" => {
+                if let crate::pages::Route::Playlist(id) = self.route.clone()
+                    && let Some(p) = self.playlists_full.iter().find(|p| p.id == id).cloned()
+                {
+                    let about = self.playlist_about(&p);
+                    self.open_about_text(about, cx);
+                }
+            }
+            // share links: needs `NAVIA_TEST_SHARE=1` in a test run, which otherwise refuses writes.
             "share-new" => {
                 if let Some(album) = self.albums.first() {
                     let target = navia_core::shares::ShareTarget { kind: navia_core::shares::ShareKind::Album, ids: vec![album.id.to_string()] };
@@ -540,7 +550,8 @@ impl Shell {
             }
             "menu" => {
                 let position = point(px(420.0), px(260.0));
-                self.open_song_menu(self.songs.iter().take(1).enumerate().map(|(i, _)| i as u32).collect(), position, false, cx);
+                let songs: Vec<u32> = self.songs.iter().take(1).enumerate().map(|(i, _)| i as u32).collect();
+                self.open_song_menu(songs.clone(), Some(Self::play_songs_row(&songs)), position, false, cx);
             }
             other => {
                 if self.eq_script(other, cx) || self.smart_script(other, cx) || self.settings_script(other, cx) {
@@ -548,14 +559,21 @@ impl Shell {
                     cx.notify();
                     return;
                 }
-                if let Some(name) = other.strip_prefix("edit-name:") {
+                if let Some(name) = other.strip_prefix("new-name:") {
+                    // the upload tile's slot presses it.
+                    self.set_text_value(&crate::ui_controls::TextTarget::NewPlaylistName, name.replace('_', " "), cx);
+                } else if let Some(slot) = other.strip_prefix("cover-slot:").and_then(|v| v.parse::<usize>().ok()) {
+                    self.script_cover_slot(slot, cx);
+                } else if other == "new-create" {
+                    self.new_playlist_submit(cx);
+                } else if let Some(name) = other.strip_prefix("edit-name:") {
                     self.set_edit_playlist_text(&crate::ui_controls::TextTarget::PlaylistName, name.to_string(), cx);
                 } else if let Some(id) = other.strip_prefix("cover-upload:") {
                     self.pick_playlist_image(id.to_string(), cx);
                 } else if let Some(id) = other.strip_prefix("cover-remove:") {
                     self.remove_playlist_image(id.to_string(), cx);
                 } else if let Some(y) = other.strip_prefix("pagescroll+").and_then(|v| v.parse::<f32>().ok()) {
-                    // Scrolls the page itself, for screenshots of rows further down.
+                    // for screenshots of rows further down.
                     self.page.state.scroll_by(px(y));
                 } else if let Some(q) = other.strip_prefix("search:") {
                     self.search_query = q.replace('_', " ");
@@ -590,6 +608,9 @@ impl Shell {
         let first_album = self.albums.first().map(|a| a.id.clone()).unwrap_or_default();
         let first_artist = self.artists.iter().find(|a| a.image.is_some()).or(self.artists.first()).map(|a| a.id.clone()).unwrap_or_default();
         let first_playlist = self.playlists_full.first().map(|p| p.id.clone()).unwrap_or_default();
+        if let Some(id) = name.strip_prefix("upcoming:").and_then(|id| id.parse().ok()) {
+            return Route::Upcoming(id);
+        }
         if let Some(album) = name.strip_prefix("album:").map(|p| p.replace('_', " ")) {
             let id = self.albums.iter().find(|a| a.name.starts_with(album.as_str())).map(|a| a.id.clone()).unwrap_or_default();
             return Route::Album(id);
@@ -606,6 +627,10 @@ impl Shell {
             };
             let id = self.artists.iter().find(|a| a.name.starts_with(artist.as_str())).map(|a| a.id.clone()).unwrap_or_default();
             return Route::Albums(AlbumScope::Artist(id, section));
+        }
+        if let Some(artist) = name.strip_prefix("artist-top:").map(|p| p.replace('_', " ")) {
+            let id = self.artists.iter().find(|a| a.name.starts_with(artist.as_str())).map(|a| a.id.clone()).unwrap_or_default();
+            return Route::ArtistTop(id);
         }
         if let Some(artist) = name.strip_prefix("artist:").map(|p| p.replace('_', " ")) {
             let id = self.artists.iter().find(|a| a.name.starts_with(artist.as_str())).map(|a| a.id.clone()).unwrap_or_default();
@@ -677,7 +702,7 @@ struct PlaylistTintEntry {
     tint: Option<Srgb>,
     /// Whether a worker has answered at least once, so `tint: None` means no art rather than unknown.
     answered: bool,
-    /// Only the newest job's answer counts, so a read from before an upload can't land after it.
+    /// so a read from before an upload can't land after it.
     generation: u64,
     retry_at: Instant,
     failures: u32,

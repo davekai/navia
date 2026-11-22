@@ -3,7 +3,7 @@
 use crate::i18n::{tr, trn};
 use gpui::prelude::*;
 use crate::focus::FocusStop;
-use gpui::{AnyElement, Context, FontWeight, Pixels, canvas, div, px};
+use gpui::{AnyElement, Context, FontWeight, Pixels, SharedString, canvas, div, px};
 
 use crate::persist::PlayerMode;
 use crate::shell::{Layout, Route, Shell, SortKey};
@@ -21,8 +21,9 @@ impl Shell {
         let main_tokens = f32::from(layout.main_width) / t.token_scale();
         // Narrow windows give the left group its real width so the center pill can't cover it.
         let tight = main_tokens <= 620.0;
-        let mut left = div().flex().flex_row().items_center().gap(t.s(10.0)).min_w(px(0.0)).when(!tight, |d| d.flex_1()).when(tight, |d| d.flex_none());
-        if !layout.sidebar_visible || layout.sidebar_overlay {
+        let crowded = self.search_crowded(main_tokens);
+        let mut left = div().flex().flex_row().items_center().gap(t.s(10.0)).min_w(px(0.0)).when(!tight && !crowded, |d| d.flex_1()).when(tight || crowded, |d| d.flex_none());
+        if !layout.sidebar_in {
             let controls = self.render_window_buttons(Side::Left, false);
             left = left.child(
                 div()
@@ -32,7 +33,7 @@ impl Shell {
                     .flex_none()
                     .mr(t.s(8.0))
                     .child(controls)
-                    .child(icon_button(&t, "show-sidebar", "sidebar-simple-regular", false).occlude().stop(&t).on_click(cx.listener(move |this, _, _, cx| this.toggle_sidebar(tokens_w, cx)))),
+                    .child(icon_button(&t, "show-sidebar", tr("Show sidebar"), "sidebar-simple-regular", false).occlude().stop(&t).on_click(cx.listener(move |this, _, _, cx| this.toggle_sidebar(tokens_w, cx)))),
             );
         }
         if !self.nav_pill_in_sidebar(layout) {
@@ -40,57 +41,56 @@ impl Shell {
         }
         let songs_page = self.route == Route::Songs;
         let settings_page = self.route == Route::Settings;
-        if settings_page && main_tokens > 620.0 {
-            left = left.child(div().font_weight(FontWeight::SEMIBOLD).text_color(t.t_em()).flex_none().child(tr("Settings")));
-        }
-        let page_title = self.page_title();
-        if let Some(title) = page_title.filter(|_| main_tokens > 620.0) {
-            left = left.child(div().font_weight(FontWeight::SEMIBOLD).text_color(t.t_em()).flex_none().truncate().min_w(px(0.0)).child(title));
-        }
-        if let Some(detail) = self.page_title_detail().filter(|_| main_tokens > 900.0) {
-            left = left.child(div().ml(t.s(10.0)).text_color(t.t2()).truncate().child(detail));
-        }
-        if self.route == Route::Liked && main_tokens > 900.0 {
-            left = left.child(div().ml(t.s(10.0)).text_color(t.t2()).truncate().child(self.liked_summary()));
-        }
-        if songs_page && main_tokens > 620.0 {
+        // the page's title and its detail: whole or not at all, since a cut title says nothing
+        let heading: Option<(SharedString, Option<SharedString>)> = if main_tokens <= 620.0 {
+            None
+        } else if settings_page {
+            Some((tr("Settings").into(), None))
+        } else if songs_page {
             let count = if self.query.is_empty() && !self.song_filters.is_filtering() {
                 trn("{count} song", "{count} songs", self.total)
             } else {
                 trn("{count} match", "{count} matches", self.order.len())
             };
-            let mut title = div().flex().flex_row().items_baseline().min_w(px(0.0)).child(
-                div().font_weight(FontWeight::SEMIBOLD).text_color(t.t_em()).flex_none().child(tr("Songs")),
-            );
-            if main_tokens > 900.0 {
-                title = title.child(div().ml(t.s(10.0)).text_color(t.t2()).truncate().child(count));
+            Some((tr("Songs").into(), (main_tokens > 900.0).then(|| count.into())))
+        } else {
+            self.page_title().map(|title| (title, self.page_title_detail().filter(|_| main_tokens > 900.0)))
+        };
+        if let Some((title, detail)) = heading {
+            let size = t.text(TEXT_MD);
+            let need = crate::ui::text_width_app(cx, &title, size, FontWeight::SEMIBOLD).ceil()
+                + detail.as_ref().map_or(px(0.0), |d| t.s(TITLE_DETAIL_GAP) + crate::ui::text_width_app(cx, d, size, FontWeight::NORMAL).ceil());
+            let store = self.bounds_store("page-title");
+            let room = store.borrow().size.width;
+            let fits = room + px(0.5) >= need;
+            let mut slot = div().relative().flex().flex_row().flex_1().min_w(px(0.0)).h_full().items_center().child(crate::ui::watch_fit(store, need, fits));
+            if fits {
+                slot = slot
+                    .child(div().font_weight(FontWeight::SEMIBOLD).text_color(t.t_em()).flex_none().whitespace_nowrap().child(title))
+                    .children(detail.map(|d| div().ml(t.s(TITLE_DETAIL_GAP)).text_color(t.t2()).flex_none().whitespace_nowrap().child(d)));
             }
-            left = left.child(title);
+            left = left.child(slot);
         }
 
-        let center: Option<AnyElement> = if songs_page || settings_page { None } else { self.render_page_center(main_tokens, cx) };
+        let center: Option<AnyElement> = if songs_page || settings_page { None } else { self.render_page_center(main_tokens, tokens_w, cx) };
+        // crowded, the field fills the middle and both sides keep their own width
+        let center = center.map(|c| if crowded { div().flex().flex_1().min_w(px(0.0)).child(c).into_any_element() } else { c });
 
         let right: AnyElement = if songs_page {
-            let search_w = if main_tokens <= 620.0 {
-                120.0
-            } else if main_tokens <= 1000.0 {
-                168.0
-            } else {
-                187.0
-            };
+            let search_w = crate::ui::pill_search_width(main_tokens);
             let compact = self.compact;
             let query = self.query.clone();
-            let query_line = self.field_line(&crate::ui_controls::TextTarget::Page, &query, tr("Search Songs"), "songs-query", t.text(TEXT_MD));
+            let search = self.fitted_search(["search-pill", "search-pill-clear", "songs-query"], tr("Search Songs"), query, search_w, cx);
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .flex_none()
+                .flex_shrink(1.0)
                 .gap(t.s(10.0))
                 .child(
                     glass_pill(&t)
                         .occlude()
-                        .child(icon_button(&t, "sort", "arrows-down-up-regular", false).stop(&t).on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                        .child(icon_button(&t, "sort", tr("Sort"), "arrows-down-up-regular", false).stop(&t).on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                             let position = event.position() + gpui::point(px(0.0), this.theme.s(14.0));
                             this.open_sort_menu(position, cx);
                         }))),
@@ -98,19 +98,16 @@ impl Shell {
                 .when(main_tokens > 620.0, |d| d.child(
                     glass_pill(&t)
                         .occlude()
-                        .child(icon_button(&t, "comfortable", if compact { "list-bullets-regular" } else { "list-bullets-fill" }, !compact).stop(&t).on_click(cx.listener(|this, _, _, cx| {
+                        .child(icon_button(&t, "comfortable", tr("Comfortable rows"), if compact { "list-bullets-regular" } else { "list-bullets-fill" }, !compact).stop(&t).on_click(cx.listener(|this, _, _, cx| {
                             this.compact = false;
                             cx.notify();
                         })))
-                        .child(icon_button(&t, "compact", if compact { "rows-fill" } else { "rows-regular" }, compact).stop(&t).on_click(cx.listener(|this, _, _, cx| {
+                        .child(icon_button(&t, "compact", tr("Compact rows"), if compact { "rows-fill" } else { "rows-regular" }, compact).stop(&t).on_click(cx.listener(|this, _, _, cx| {
                             this.compact = true;
                             cx.notify();
                         }))),
                 ))
-                .child(
-                    crate::ui::search_field(&t, "search-pill", crate::ui::SearchSize::Toolbar, search_w, self.search_active, query_line)
-                        .on_click(cx.listener(|this, _, _, cx| this.focus_field(crate::ui_controls::TextTarget::Page, cx))),
-                )
+                .child(search)
                 .into_any_element()
         } else {
             self.render_page_tools(main_tokens, cx)
@@ -123,7 +120,7 @@ impl Shell {
             .left(px(0.0))
             .right(px(0.0))
             .h(t.s(TOPBAR_H))
-            .pl(t.s(if layout.sidebar_visible && !layout.sidebar_overlay || self.has_window_buttons(Side::Left) { GUTTER } else { CORNER_GAP }))
+            .pl(t.s(if layout.sidebar_in || self.has_window_buttons(Side::Left) { GUTTER } else { CORNER_GAP }))
             .pr(t.s(GUTTER))
             .flex()
             .flex_row()
@@ -133,14 +130,19 @@ impl Shell {
             .block_mouse_except_scroll()
             .map(|d| Shell::drag_area(d, cx))
             .child(left);
+        let centred = center.is_some();
         if let Some(c) = center {
             bar = bar.child(c);
         }
-        // The account button ends the right group, left of any corner window buttons.
+        // The account button ends the right group, just left of any corner window buttons.
+        let refresh = self.render_refresh(cx);
         let account = self.render_account_button(crate::view_account::AccountPlace::TopBar, cx);
-        let right = div().flex().flex_row().items_center().flex_none().gap(t.s(10.0)).child(right).child(account);
-        let mut group = div().flex().flex_row().justify_end().flex_1().min_w(px(0.0)).when(tight, |d| d.overflow_hidden()).child(right);
-        // With no dock drawn, the top bar carries the window buttons in the top-right corner and pushes the pills in.
+        let right = div().flex().flex_row().items_center().flex_shrink(1.0).gap(t.s(10.0)).child(right).children(refresh).child(account);
+        // the bar's full height, so a clip on a tight bar never cuts a focus ring
+        let group = div().flex().flex_row().justify_end().items_center().h_full().child(right);
+        // with something centred both sides take half; without, the controls come first and the left takes what's left
+        let mut group = if crowded { group.flex_none() } else if centred { group.flex_1().min_w(px(0.0)).when(tight, |d| d.overflow_hidden()) } else { group.flex_shrink(1.0).when(tight, |d| d.overflow_hidden()) };
+        // with no dock drawn, the top bar carries the corner window buttons and pushes the pills in.
         let corner_buttons = (layout.mode != PlayerMode::Dock || !layout.player) && self.has_window_buttons(Side::Right);
         if corner_buttons {
             bar = bar.pr(t.s(self.window_buttons_width(Side::Right) + CORNER_GAP * 2.0));
@@ -156,16 +158,16 @@ impl Shell {
     /// Whether the nav pill sits in the sidebar header's left corner. That happens when the sidebar shows and no window
     /// buttons take that corner. Otherwise it stays in the top bar.
     pub fn nav_pill_in_sidebar(&self, layout: &Layout) -> bool {
-        layout.sidebar_visible && !layout.sidebar_overlay && !self.has_window_buttons(Side::Left)
+        layout.sidebar_in && !self.has_window_buttons(Side::Left)
     }
 
     pub fn render_nav_pill(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         glass_pill(&t)
             .occlude()
-            .child(icon_button(&t, "back", "caret-left-bold", false).stop(&t).on_click(cx.listener(|this, _, _, cx| this.go_back(cx))))
+            .child(icon_button(&t, "back", tr("Back"), "caret-left-bold", false).stop(&t).on_click(cx.listener(|this, _, _, cx| this.go_back(cx))))
             .child(divider(&t))
-            .child(icon_button(&t, "forward", "caret-right-bold", false).stop(&t).on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))))
+            .child(icon_button(&t, "forward", tr("Forward"), "caret-right-bold", false).stop(&t).on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))))
             .into_any_element()
     }
 
@@ -173,6 +175,7 @@ impl Shell {
         if self.history_pos > 0 {
             self.history_pos -= 1;
             self.route = self.history[self.history_pos].clone();
+            self.page_entered(-1.0);
             self.focus_arrival();
             self.route_arrival(cx);
             cx.notify();
@@ -183,6 +186,7 @@ impl Shell {
         if self.history_pos + 1 < self.history.len() {
             self.history_pos += 1;
             self.route = self.history[self.history_pos].clone();
+            self.page_entered(1.0);
             self.focus_arrival();
             self.route_arrival(cx);
             cx.notify();
@@ -196,16 +200,27 @@ impl Shell {
             self.history_pos = self.history.len() - 1;
             self.route = route;
             self.reset_page_state();
+            self.page_entered(1.0);
             self.focus_arrival();
             self.route_arrival(cx);
             cx.notify();
         }
     }
 
-    /// Pages reload each time they're opened.
+    fn page_entered(&mut self, direction: f32) {
+        self.page_entry = (self.page_entry.0 + 1, direction);
+    }
+
+    /// Pages read fresh each time they're opened.
     fn route_arrival(&mut self, cx: &mut Context<Self>) {
-        if self.route == Route::CachedSongs {
-            self.refresh_cached(cx);
+        match &self.route {
+            Route::CachedSongs => self.refresh_cached(cx),
+            Route::Album(id) => {
+                if let Some(library) = &self.library {
+                    library.reask_missing_heat(id);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -255,32 +270,27 @@ impl Shell {
             .h(t.s(PILL_H))
             .p(t.s(4.0))
             .rounded_full()
-            .map(|d| crate::ui::glass_layers(d, &t, t.s(PILL_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass_frost_fill(), t.glass_fill(), crate::ui::edge_and(crate::ui::shadow_pill(&t))))
+            .map(|d| crate::ui::glass_layers(d, &t, t.s(PILL_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass(), t.glass_fill(), crate::ui::edge_and(crate::ui::shadow_pill(&t))))
             .occlude();
         for (i, (regular, fill, route)) in items.into_iter().enumerate() {
             let active = match regular {
-                "nv-library" => matches!(self.route, Route::Albums(_) | Route::Album(_) | Route::Songs | Route::Liked | Route::Artists | Route::Artist(_) | Route::Playlists | Route::Playlist(_)),
+                "nv-library" => matches!(self.route, Route::Albums(_) | Route::Album(_) | Route::Songs | Route::Liked | Route::Artists | Route::Artist(_) | Route::ArtistTop(_) | Route::Playlists | Route::Playlist(_)),
                 "magnifying-glass-regular" => matches!(self.route, Route::Browse | Route::Search),
                 "star-four-regular" => matches!(self.route, Route::Discover(tab) if tab != crate::pages::DiscoverTab::New),
                 _ => self.route == route,
             };
             let name = if active { fill } else { regular };
+            let (segment, ink) = crate::ui::segment(&t, ("nav", i), active, t.t2());
             pill = pill.child(
-                {
-                let ink = crate::ui::ink(("nav", i));
-                div()
-                    .id(("nav", i))
+                segment
                     .w(t.s(width))
                     .h(t.s(48.0))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded_full()
-                    .when(active, |d| d.bg(t.glass_on()))
-                    .when(!active, |d| d.child(crate::ui::hover_track(("nav", i))).opacity(ink.opacity(1.0)))
-                    .stop(&t).on_click(cx.listener(move |this, _, _, cx| this.navigate(route.clone(), cx)))
-                    .child(icon(&t, name, 24.0, if active { t.t_em().into() } else { ink.color(t.t2(), t.hover_ink()) }))
-                },
+                    .stop(&t)
+                    .on_click(cx.listener(move |this, _, _, cx| this.navigate(route.clone(), cx)))
+                    .child(icon(&t, name, 24.0, ink)),
             );
         }
         pill.into_any_element()
@@ -289,7 +299,7 @@ impl Shell {
     pub fn render_bar_glow(&mut self, layout: &Layout) -> AnyElement {
         let t = self.theme;
         let Some((_, _, _, image)) = self.bar_glow.clone() else { return div().into_any_element() };
-        crate::ui::image(image).absolute().left(px(0.0)).right(px(0.0)).bottom(px(0.0)).w(layout.main_width).h(t.s(150.0)).into_any_element()
+        crate::ui::image(image).absolute().left(px(0.0)).right(px(0.0)).bottom(px(0.0)).w(layout.main_width).h(t.s(150.0)).opacity(layout.bar_shown).into_any_element()
     }
 }
 

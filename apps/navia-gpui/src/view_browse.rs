@@ -2,6 +2,7 @@
 //! compact row.
 
 
+use crate::ui::FullTextTip;
 use crate::i18n::{tr, trf, trn};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use crate::art::{genre_fan_key, genre_tint_key};
 use crate::color::tint_fg_dim;
 use crate::focus::FocusStop;
 use crate::model::GenrePage;
-use crate::pages::{Block, CardItem, GenreTiles, PageMetrics, grid_columns};
+use crate::pages::{Block, CardItem, GenreTiles, PageMetrics, grid_fit};
 use crate::shell::{Layout, Shell};
 use crate::shell_data::CoverTint;
 use crate::theme::size::*;
@@ -67,8 +68,7 @@ impl Shell {
                     .into_any_element()
             })]);
         } else {
-            let width = f32::from(layout.main_width) / self.theme.token_scale() - m.gutter * 2.0;
-            let columns = grid_columns(width, m.genre_chip_w, m.tile_gap);
+            let (columns, _) = grid_fit(self.grid_width(layout), m.genre_chip_w, m.tile_gap);
             let shown = Rc::new(shown);
             let mut blocks = vec![Self::section_heading(tr("All Genres").into())];
             for start in (0..shown.len()).step_by(columns) {
@@ -128,16 +128,14 @@ impl Shell {
         };
         let fill = crate::ui::tile_fill_bg(&t, tint);
         let count_color: gpui::Hsla = tint.map_or(t.t2().into(), |c| tint_fg_dim(c).hsla(1.0));
-        let [rest, hover] = fans;
-        // The resting fan, swapped for the spread one on hover.
-        let fan = |image: Option<(Arc<gpui::RenderImage>, f32)>, on_hover: bool| {
-            image.map(|(image, fade)| {
-                let el = div().absolute().top(px(0.0)).left(px(0.0)).size_full().child(crate::ui::image(image).size_full().opacity(fade));
-                if on_hover { el.opacity(0.0).group_hover(group.clone(), |s| s.opacity(1.0)) } else { el.group_hover(group.clone(), |s| s.opacity(0.0)) }
-            })
+        let [rest, spread] = fans;
+        let (hover, ticker) = crate::ui::card_hover(&group, crate::theme::motion::MED);
+        // the spread fan fades in over the resting one while the pointer is on the tile.
+        let fan = |image: Option<(Arc<gpui::RenderImage>, f32)>, shown: f32| {
+            image.map(|(image, fade)| div().absolute().top(px(0.0)).left(px(0.0)).size_full().opacity(shown).child(crate::ui::image(image).size_full().opacity(fade)))
         };
-        let rest_el = fan(rest, false);
-        let hover_el = fan(hover, true);
+        let rest_el = fan(rest, 1.0 - hover);
+        let hover_el = fan(spread, hover);
         let name = genre.name.clone();
         let text = div()
             .absolute()
@@ -149,7 +147,7 @@ impl Shell {
             .gap(t.s(2.0))
             .pt(t.s(width * GENRE_TILE_PAD_Y))
             .px(t.s(width * GENRE_TILE_PAD_X))
-            .child(div().text_size(t.text(TEXT_FEATURE)).font_weight(FontWeight::SEMIBOLD).line_height(relative(1.15)).text_color(t.t_em()).line_clamp(2).text_ellipsis().child(genre.name.clone()))
+            .child(div().text_size(t.text(TEXT_FEATURE)).font_weight(FontWeight::SEMIBOLD).line_height(relative(1.15)).text_color(t.t_em()).line_clamp(2).text_ellipsis().id("name").child(genre.name.clone()).full_text_tip(&t, genre.name.clone()))
             .child(div().text_size(t.text(TEXT_SM)).text_color(count_color).child(trn("{count} Album", "{count} Albums", genre.albums as usize)));
         let body = div()
             .relative()
@@ -157,16 +155,17 @@ impl Shell {
             .rounded(t.s(R_MD))
             .overflow_hidden()
             .bg(fill)
-            .group_hover(group.clone(), |s| s.top(-t.s(CARD_LIFT)))
+            .child(ticker)
             .children(rest_el)
             .children(hover_el)
             .child(text);
         crate::ui::press_dim(div().id(("card", ix)))
-            .group(group)
+            .relative()
             .flex_none()
             .w(t.s(width))
             .h(t.s(height))
             .child(body)
+            .child(crate::ui::card_track(&group))
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| this.open_genre(name.clone(), cx)))
             .into_any_element()
@@ -176,8 +175,7 @@ impl Shell {
     fn render_genre_line(&mut self, shown: &Rc<Vec<u32>>, start: usize, columns: usize, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let m = PageMetrics::of(layout);
-        let width = f32::from(layout.main_width) / t.token_scale() - m.gutter * 2.0;
-        let cell = (width - m.tile_gap * (columns.saturating_sub(1)) as f32) / columns as f32;
+        let (_, cell) = grid_fit(self.grid_width(layout), m.genre_chip_w, m.tile_gap);
         let mut line = div().flex().flex_row().gap(t.s(m.tile_gap)).px(t.s(m.gutter));
         for pos in start..(start + columns).min(shown.len()) {
             line = line.child(self.render_genre_row(shown[pos], cell, layout, cx));
@@ -211,7 +209,7 @@ impl Shell {
                     .flex_1()
                     .min_w(px(0.0))
                     .line_height(relative(1.3))
-                    .child(div().font_weight(FontWeight::MEDIUM).line_clamp(2).text_ellipsis().child(genre.name.clone()))
+                    .child(div().font_weight(FontWeight::MEDIUM).line_clamp(2).text_ellipsis().id("name").child(genre.name.clone()).full_text_tip(&t, genre.name.clone()))
                     .child(div().truncate().text_size(t.text(TEXT_SM)).text_color(t.t2()).child(trn("{count} Album", "{count} Albums", genre.albums as usize))),
             )
             .child(div().absolute().left(t.s(pad + THUMB + gap)).right(t.s(pad)).bottom(px(0.0)).h(px(1.0)).bg(t.line()))

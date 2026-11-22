@@ -1,5 +1,4 @@
-//! Decoded thumbnails, bounded by bytes. Evicted images are also dropped from the sprite atlas,
-//! because the atlas otherwise keeps every thumbnail ever drawn.
+//! decoded thumbnails, bounded by bytes; evicted ones also leave the sprite atlas, which otherwise keeps them all.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +23,8 @@ pub struct ThumbEntry {
     pub retry_at: Option<Instant>,
     /// Failures in a row, for the backoff.
     pub attempts: u32,
+    /// for the server's no-cover placeholder: when to ask again, since a cover may have been added.
+    pub expires_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -50,7 +51,7 @@ impl ThumbCache {
     }
 
     pub fn insert_loading(&mut self, key: ThumbKey, frame: u64) {
-        self.map.insert(key, ThumbEntry { image: None, loading: true, last_used: frame, bytes: 0, arrived: None, retry_at: None, attempts: 0 });
+        self.map.insert(key, ThumbEntry { image: None, loading: true, last_used: frame, bytes: 0, arrived: None, retry_at: None, attempts: 0, expires_at: None });
     }
 
     pub fn remove(&mut self, key: &ThumbKey) {
@@ -80,13 +81,17 @@ impl ThumbCache {
         }
     }
 
-    /// Stores a decoded image for a key that's still wanted.
-    pub fn set_image(&mut self, key: &ThumbKey, image: Option<Arc<RenderImage>>) {
+    /// stores a decoded image for a key that's still wanted. a `placeholder` expires after the
+    /// core's own `NO_STORE_TTL`.
+    pub fn set_image(&mut self, key: &ThumbKey, image: Option<Arc<RenderImage>>, placeholder: bool) {
         if let Some(entry) = self.map.get_mut(key) {
             let bytes = image.as_ref().map_or(0, image_bytes);
             self.bytes = self.bytes - entry.bytes + bytes;
             entry.bytes = bytes;
-            entry.arrived = image.is_some().then(Instant::now);
+            // a refreshed image that's the same placeholder again doesn't fade in a second time.
+            let again = placeholder && entry.image.is_some();
+            entry.arrived = (image.is_some() && !again).then(Instant::now);
+            entry.expires_at = (placeholder && image.is_some()).then(|| Instant::now() + navia_core::artwork::NO_STORE_TTL);
             if image.is_some() {
                 entry.retry_at = None;
                 entry.attempts = 0;

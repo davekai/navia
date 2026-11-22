@@ -5,6 +5,7 @@ use gpui::prelude::*;
 use gpui::{AnyElement, ClipboardItem, Context, FontWeight, MouseButton, ScrollHandle, SharedString, Window, div, px, relative};
 use navia_core::library::info::{AlbumInfo, ArtistInfo, Credit, PlaylistInfo, ReplayGainInfo, SongInfo};
 
+use crate::ui::FullTextTip;
 use crate::focus::FocusStop;
 use crate::i18n::{fmt_dec, fmt_int, fmt_release, tr, trf};
 use crate::pages::Route;
@@ -249,7 +250,7 @@ impl Shell {
                     .gap(t.s(2.0))
                     .min_w(px(0.0))
                     .child(div().text_size(t.text(TEXT_XS)).font_weight(FontWeight::SEMIBOLD).text_color(t.t_section()).child(kind))
-                    .child(div().text_size(t.text(TEXT_FEATURE)).font_weight(FontWeight::BOLD).line_height(relative(1.2)).text_color(t.t_em()).line_clamp(3).text_ellipsis().child(title))
+                    .child(div().text_size(t.text(TEXT_FEATURE)).font_weight(FontWeight::BOLD).line_height(relative(1.2)).text_color(t.t_em()).line_clamp(3).text_ellipsis().id("info-title").child(title.clone()).full_text_tip(&t, title))
                     .when_some(sub, |d, s| d.child(div().text_color(t.t2()).line_height(relative(1.3)).child(s))),
             )
             .into_any_element()
@@ -371,8 +372,8 @@ impl Shell {
         // Only for the song playing now, from the badge's own data.
         let playing = self.player.station.is_none() && self.player.current.as_ref().is_some_and(|c| c.id.as_ref() == s.id);
         if playing && let Some(q) = self.quality_info() {
-            let plays_as = match q.delivery.as_ref().and_then(|d| d.transcode) {
-                Some((codec, kbps)) => self.noted(format!("{} · {}", codec.label(), trf("{n} kbps", &[("n", &fmt_int(kbps as i64))])), tr("Transcoded by the server")),
+            let plays_as = match q.transcode() {
+                Some((format, kbps)) => self.noted(kbps.map_or(format.clone(), |k| format!("{format} · {}", crate::quality_badge::kbps(k))), tr("Transcoded by the server")),
                 None => Self::text(tr("The original file")),
             };
             let from = q.delivery.as_ref().map(|d| Field { label: tr("From||where a song plays from").into(), value: Self::text(crate::quality_badge::source_label(d.source)), copy: None });

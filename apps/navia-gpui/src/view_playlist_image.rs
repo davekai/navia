@@ -71,6 +71,10 @@ impl Shell {
             self.playlists_full = library.playlist_details();
         }
         self.invalidate_page();
+        if self.take_cover_upload(Some(&id)) {
+            cx.notify();
+            return;
+        }
         self.show_toast(if removed { tr("Removed the image") } else { tr("Updated the cover") }, cx);
     }
 }

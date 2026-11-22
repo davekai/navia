@@ -18,6 +18,8 @@ use crate::shell::{Layout, Shell};
 pub enum Part {
     Sidebar,
     Main,
+    Player,
+    Expanded,
 }
 
 pub struct Slot {
@@ -32,19 +34,11 @@ impl Render for Slot {
     }
 }
 
-/// An empty view, notified to get a frame that redraws the shell's own elements but no slots.
-pub struct Ticker;
-
-impl Render for Ticker {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-    }
-}
-
 pub struct Slots {
     sidebar: Entity<Slot>,
     main: Entity<Slot>,
-    ticker: Entity<Ticker>,
+    player: Entity<Slot>,
+    expanded: Entity<Slot>,
     /// The layout of the frame being drawn, for the slots that render after the shell.
     layout: Option<Layout>,
     /// The shell was notified since its last render, so this frame redraws everything.
@@ -56,14 +50,16 @@ impl Slots {
     pub fn new(cx: &mut Context<Shell>) -> Self {
         let shell = cx.entity().downgrade();
         let sidebar = cx.new(|_| Slot { shell: shell.clone(), part: Part::Sidebar });
-        let main = cx.new(|_| Slot { shell, part: Part::Main });
-        let ticker = cx.new(|_| Ticker);
+        let main = cx.new(|_| Slot { shell: shell.clone(), part: Part::Main });
+        let player = cx.new(|_| Slot { shell: shell.clone(), part: Part::Player });
+        let expanded = cx.new(|_| Slot { shell, part: Part::Expanded });
         let observer = cx.observe_self(|shell, cx| {
             shell.slots.full = true;
-            shell.slots.sidebar.update(cx, |_, cx| cx.notify());
-            shell.slots.main.update(cx, |_, cx| cx.notify());
+            for slot in [&shell.slots.sidebar, &shell.slots.main, &shell.slots.player, &shell.slots.expanded] {
+                slot.update(cx, |_, cx| cx.notify());
+            }
         });
-        Self { sidebar, main, ticker, layout: None, full: true, _observer: observer }
+        Self { sidebar, main, player, expanded, layout: None, full: true, _observer: observer }
     }
 
     /// Starts a render of the shell. Returns true for a full frame, when the shell itself changed.
@@ -72,29 +68,29 @@ impl Slots {
         std::mem::replace(&mut self.full, false)
     }
 
-    /// Asks for a frame that redraws the shell's own elements and leaves the slots as they are.
-    pub fn tick(&self, window: &mut Window) {
-        let ticker = self.ticker.entity_id();
-        window.on_next_frame(move |_, cx| cx.notify(ticker));
-    }
-
-    pub fn ticker_view(&self) -> AnyElement {
-        let mut style = StyleRefinement::default();
-        style.position = Some(gpui::Position::Absolute);
-        AnyView::from(self.ticker.clone()).cached(style.size_0()).into_any_element()
-    }
-
-    /// The sidebar, cached. It places itself, so the slot covers the shell's root.
+    /// the sidebar, cached; it places itself, so the slot covers the shell's root.
     pub fn sidebar_view(&self) -> AnyElement {
         let style = StyleRefinement::default().absolute().inset_0();
         AnyView::from(self.sidebar.clone()).cached(style).into_any_element()
     }
 
-    /// The main column, cached. It takes the column's place in the root row, with the sidebar's
-    /// width as its left margin.
-    pub fn main_view(&self, margin: Pixels) -> AnyElement {
-        let style = StyleRefinement::default().relative().flex_1().min_w(px(0.0)).h_full().ml(margin);
+    /// the main column, cached, with the sidebar's and the side player's rooms as its margins.
+    pub fn main_view(&self, margin: Pixels, dock_room: Pixels) -> AnyElement {
+        let style = StyleRefinement::default().relative().flex_1().min_w(px(0.0)).h_full().ml(margin).mr(dock_room);
         AnyView::from(self.main.clone()).cached(style).into_any_element()
+    }
+
+    pub fn player_view(&self, style: StyleRefinement) -> AnyElement {
+        AnyView::from(self.player.clone()).cached(style).into_any_element()
+    }
+
+    pub fn expanded_view(&self) -> AnyElement {
+        AnyView::from(self.expanded.clone()).cached(StyleRefinement::default().absolute().inset_0()).into_any_element()
+    }
+
+    pub fn notify_player(&self, cx: &mut gpui::App) {
+        self.player.update(cx, |_, cx| cx.notify());
+        self.expanded.update(cx, |_, cx| cx.notify());
     }
 }
 
@@ -106,9 +102,8 @@ impl Shell {
         if !self.window_shown {
             return;
         }
-        let in_shell = self.slots.layout.as_ref().is_some_and(|l| l.player && (self.expanded || l.mode == crate::persist::PlayerMode::Dock));
-        if in_shell {
-            self.slots.ticker.update(cx, |_, cx| cx.notify());
+        if self.slots.layout.as_ref().is_some_and(|l| l.player) {
+            self.slots.notify_player(cx);
         } else {
             cx.notify();
         }
@@ -124,6 +119,21 @@ impl Shell {
             Part::Main => {
                 let element = crate::focus::scoped(crate::focus::Scope::Main, crate::focus::SECTION_PAGE, || self.render_main_column(&layout, false, window, cx));
                 div().relative().size_full().child(crate::testing::timed(["main.layout", "main.prepaint", "main.paint"], element)).into_any_element()
+            }
+            Part::Player | Part::Expanded => {
+                self.marquees_begin(crate::marquee::Host::of(part));
+                self.lyrics_animating = false;
+                let element = if part == Part::Expanded {
+                    crate::focus::scoped(crate::focus::Scope::Expanded, crate::focus::SECTION_PAGE, || self.render_expanded(&layout, cx))
+                } else {
+                    crate::focus::scoped(crate::focus::Scope::Player, crate::focus::SECTION_PAGE, || self.render_player_forms(&layout, cx))
+                };
+                self.marquees_end(crate::marquee::Host::of(part), cx);
+                // the lyrics glide and sweep with frames for this slot alone.
+                if self.window_shown && self.lyrics_animating {
+                    window.request_animation_frame();
+                }
+                element
             }
         }
     }

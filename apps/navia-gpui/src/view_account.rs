@@ -29,7 +29,7 @@ impl Shell {
     /// The signed-in name and the server host without its scheme, or None before sign-in.
     fn account_identity(&self) -> Option<(SharedString, SharedString)> {
         if self.sample_mode {
-            // Sample data is a developer mode with no account behind it.
+            // sample data has no account behind it.
             return Some(("sample".into(), "sample data".into()));
         }
         let lib = self.core.as_ref().map(|c| c.lib.clone())?;
@@ -55,7 +55,7 @@ impl Shell {
             .flex_none()
             .size(t.s(CONTROL_H))
             .rounded_full()
-            .map(|d| crate::ui::glass_layers(d, &t, t.s(CONTROL_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass_frost_fill(), t.glass_fill(), glass_edge()))
+            .map(|d| crate::ui::glass_layers(d, &t, t.s(CONTROL_H / 2.0), GLASS_BLUR, GLASS_SATURATION, t.glass(), t.glass_fill(), glass_edge()))
             .when(open, |d| d.child(div().absolute().inset_0().rounded_full().bg(t.glass_press())))
             .child(crate::view_topbar::track_bounds(bounds))
             .when(!open, |d| d.child(crate::ui::hover_fill(crate::ui::HoverShape::Pill, t.glass_hover(), t.glass_press())))
@@ -86,6 +86,10 @@ impl Shell {
             MenuRow::toggle(tr("Private Mode"), "eye-slash-regular", self.private_mode, |this, cx| {
                 let on = !this.private_mode;
                 this.set_private_mode(on, cx);
+            }),
+            MenuRow::toggle(tr("Offline"), "cloud-slash-regular", self.offline_switch, |this, cx| {
+                let on = !this.offline_switch;
+                this.set_offline_switch(on, cx);
             }),
             MenuRow::Divider,
             MenuRow::item(tr("Settings…"), "gear-regular", |this, cx| this.open_settings(cx)).with_shortcut("Ctrl+,"),

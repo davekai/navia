@@ -7,8 +7,9 @@ use gpui::{AnyElement, Context, Hsla, MouseButton, MouseDownEvent, Rgba, WindowB
 
 use crate::chrome::{ButtonStyle, DoubleClick};
 use crate::shell::Shell;
-use crate::theme::{WINDOW_BUTTON_ON_ART, WINDOW_BUTTON_ON_ART_HOVER};
+use crate::theme::{WINDOW_BUTTON_HOVER, WINDOW_BUTTON_ON_ART, WINDOW_BUTTON_ON_ART_HOVER, WINDOW_CLOSE};
 use crate::ui::icon;
+use crate::i18n::{n_, tr};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -29,8 +30,8 @@ struct Look {
 
 fn look(style: ButtonStyle) -> Look {
     match style {
-        // Flat until hovered, and red on hover for close.
-        ButtonStyle::Breeze => Look { width: 26.0, height: 26.0, glyph: 16.0, gap: 4.0, rest: (None, Some(rgba(WINDOW_BUTTON_ON_ART))), hover: (rgba(0xffffff24), rgba(WINDOW_BUTTON_ON_ART_HOVER)), close_hover: Some(rgb(0xda4453)) },
+        // Flat until hovered, and red under the pointer on close.
+        ButtonStyle::Breeze => Look { width: 26.0, height: 26.0, glyph: 16.0, gap: 4.0, rest: (None, Some(rgba(WINDOW_BUTTON_ON_ART))), hover: (rgba(WINDOW_BUTTON_HOVER), rgba(WINDOW_BUTTON_ON_ART_HOVER)), close_hover: Some(rgb(WINDOW_CLOSE)) },
         // Round, always a subtle disc, no color on close.
         ButtonStyle::Adwaita => Look { width: 27.0, height: 27.0, glyph: 16.0, gap: 9.0, rest: (Some(rgba(0xffffff1a)), Some(rgba(WINDOW_BUTTON_ON_ART))), hover: (rgba(0xffffff29), rgba(WINDOW_BUTTON_ON_ART_HOVER)), close_hover: None },
         ButtonStyle::Neutral => Look { width: 26.0, height: 26.0, glyph: 15.0, gap: 8.0, rest: (Some(rgba(0xffffff0f)), Some(rgba(0x00000033))), hover: (rgba(0xffffff1a), rgba(0x00000052)), close_hover: None },
@@ -58,7 +59,7 @@ impl Shell {
         !self.side_buttons(side).is_empty()
     }
 
-    /// Width of one side's buttons in tokens, for reserving room around them.
+    /// in tokens, for reserving room around them.
     pub fn window_buttons_width(&self, side: Side) -> f32 {
         let l = look(self.button_style);
         let count = self.side_buttons(side).len() as f32;
@@ -74,7 +75,7 @@ impl Shell {
         }
         let l = look(self.button_style);
         let breeze = self.button_style == ButtonStyle::Breeze;
-        let glyph_color: Hsla = if on_art { t.t_on_art() } else { Hsla::from(t.t1()).alpha(0.82) };
+        let glyph_color: Hsla = if on_art { t.t_on_art() } else { gpui::rgba(crate::theme::WINDOW_BUTTON_INK).into() };
         let mut row = div().flex().flex_row().items_center().flex_none().gap(t.s(l.gap)).occlude();
         for button in buttons {
             let glyph = match button {
@@ -100,6 +101,12 @@ impl Shell {
                 .occlude()
                 .when_some(rest, |d, bg| d.bg(bg))
                 .hover(move |s| s.bg(hover))
+                .tooltip(crate::ui::tip(&t, tr(match button {
+                    WindowButton::Close => n_("Close"),
+                    WindowButton::Minimize => n_("Minimize"),
+                    WindowButton::Maximize if self.maximized => n_("Restore"),
+                    WindowButton::Maximize => n_("Maximize"),
+                })))
                 .child(icon(&t, glyph, l.glyph, glyph_color));
             // On Windows the buttons are reported to the system as caption buttons (HTMINBUTTON, HTMAXBUTTON, HTCLOSE).
             // Windows then handles presses, shows Snap layouts over Maximize, and closes through the same path as

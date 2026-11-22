@@ -93,23 +93,17 @@ impl Shell {
             None => placeholder().into_any_element(),
         };
         if self.thumbs_fading {
-            window.request_animation_frame();
+            crate::animation::request_frame(window);
         }
 
         // The title and artists link to their pages. The line being sung shows when the song has synced lyrics.
         let title_size = if large { TEXT_LG } else { TEXT_MD };
-        let title: AnyElement = if station {
-            div().truncate().child(song.title.clone()).into_any_element()
-        } else {
-            let target = (!song.album_id.is_empty()).then(|| crate::song_links::LinkTarget::Album(song.album_id.clone()));
-            self.link(("mini-title", 0), song.title.clone(), target, t.t_on_art(), cx)
-        };
+        let (title, artists) = self.player_names(&song, ("mini-title", "mini-artist"), crate::marquee::Host::Mini, (title_size, TEXT_SM), 1.3, (t.t_on_art().into(), dim), 1.0, cx);
         let title = crate::ui::titled(&t, div().flex().min_w(px(0.0)).overflow_hidden().child(title), song.explicit, title_size)
             .font_weight(FontWeight::MEDIUM)
             .text_size(t.text(title_size))
             .text_color(t.t_on_art())
             .when(large, |d| d.justify_center());
-        let artists: AnyElement = if station { div().truncate().child(song.artist.clone()).into_any_element() } else { self.artist_links(("mini-artist", 0), &song, dim, cx) };
         let lyric = (!station && self.lyrics_synced()).then(|| self.current_lyric_line()).flatten().and_then(|i| self.lyrics.get(i)).map(|l| l.text.clone()).filter(|l| !l.is_empty());
         let info = div()
             .flex()
@@ -121,7 +115,6 @@ impl Shell {
             .child(div().flex().min_w(px(0.0)).max_w_full().text_size(t.text(TEXT_SM)).text_color(dim).child(artists))
             .when_some(lyric, |d, line| d.child(div().max_w_full().truncate().text_size(t.text(TEXT_XS)).text_color(dim).child(line)));
 
-        // Previous, play and next, the shell's own controls.
         let (skip, play) = if large { (26.0, 38.0) } else { (20.0, 28.0) };
         let button = |b: gpui::Stateful<gpui::Div>| if large { b } else { b.size(t.s(MINI_BUTTON)) };
         let transport = div()
@@ -131,10 +124,10 @@ impl Shell {
             .flex_none()
             .occlude()
             .when(large, |d| d.gap(t.s(MINI_GAP * 2.0)))
-            .child(button(crate::ui::transport_button(&t, "mini-prev", "rewind-fill", skip, fg, !station)).when(!station, |d| d.on_click(cx.listener(|this, _, _, cx| this.previous(cx)))))
-            .child(button(crate::ui::transport_button(&t, "mini-play", if playing { "pause-fill" } else { "play-fill" }, play, fg, true)).on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))))
-            .child(button(crate::ui::transport_button(&t, "mini-next", "fast-forward-fill", skip, fg, !station)).when(!station, |d| d.on_click(cx.listener(|this, _, _, cx| this.next(cx)))));
-        let seek = div().w_full().text_color(fg).child(self.render_scrubber(ScrubVariant::Thin, t.player_track(), fg, dim, cx));
+            .child(button(crate::ui::transport_button(&t, "mini-prev", if station { tr(crate::ui::STATION_NO_SKIP) } else { tr("Previous") }, "rewind-fill", skip, fg, !station, crate::ui::Feel::PLAIN)).when(!station, |d| d.on_click(cx.listener(|this, _, _, cx| this.previous(cx)))))
+            .child(button(crate::ui::play_button(&t, "mini-play", playing, play, fg, crate::ui::Feel::PLAIN)).on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))))
+            .child(button(crate::ui::transport_button(&t, "mini-next", if station { tr(crate::ui::STATION_NO_SKIP) } else { tr("Next") }, "fast-forward-fill", skip, fg, !station, crate::ui::Feel::PLAIN)).when(!station, |d| d.on_click(cx.listener(|this, _, _, cx| this.next(cx)))));
+        let seek = div().w_full().text_color(fg).child(self.render_scrubber(ScrubVariant::Thin, t.player_track(), fg, dim, crate::ui::Feel::PLAIN, cx));
 
         let body = if large {
             div()
@@ -165,15 +158,14 @@ impl Shell {
                 .child(seek)
         };
 
-        // Size and back to the full window, top right, while the pointer is over the card. On the large cover they sit
-        // on a dark fill.
-        let chrome_button = |id: &'static str, name: &'static str, glyph: f32| {
-            let b = crate::ui::ink_button(&t, id, name, glyph, fg, fg);
+        // on the large cover they sit on the window buttons' dark fill.
+        let chrome_button = |id: &'static str, label: &'static str, name: &'static str, glyph: f32| {
+            let b = crate::ui::player_button(&t, id, label, name, glyph, fg, fg, crate::ui::Feel::PLAIN);
             if large {
                 let on = crate::ui::ink(id).amount;
                 let fill = gpui::rgba(crate::theme::WINDOW_BUTTON_ON_ART);
                 let fill_hover = gpui::rgba(crate::theme::WINDOW_BUTTON_ON_ART_HOVER);
-                b.size(t.s(CONTROL_H)).bg(crate::ui::Ink { amount: on, pressed: false, press: 0.0 }.color(fill, fill_hover))
+                b.size(t.s(CONTROL_H)).bg(crate::ui::Ink { amount: on, ..Default::default() }.color(fill, fill_hover))
             } else {
                 b.size(t.s(MINI_CHROME_BUTTON))
             }
@@ -189,8 +181,8 @@ impl Shell {
             .gap(if large { t.s(MINI_GAP / 2.0) } else { px(2.0) })
             .opacity(hover)
             .occlude()
-            .child(chrome_button("mini-size", resize_icon, resize_glyph).on_click(cx.listener(|this, _, window, cx| this.toggle_mini_size(window, cx))))
-            .child(chrome_button("mini-back", "app-window-regular", back_glyph).on_click(cx.listener(|this, _, _, cx| this.close_mini_player(true, cx))));
+            .child(chrome_button("mini-size", if large { tr("Smaller") } else { tr("Larger") }, resize_icon, resize_glyph).on_click(cx.listener(|this, _, window, cx| this.toggle_mini_size(window, cx))))
+            .child(chrome_button("mini-back", tr("Back to Full Window"), "app-window-regular", back_glyph).on_click(cx.listener(|this, _, _, cx| this.close_mini_player(true, cx))));
 
         let background = gpui::linear_gradient(180.0, gpui::linear_color_stop(vivid.hsla(glass), 0.0), gpui::linear_color_stop(shade.hsla(glass), 1.0));
         let mut card_el = div()
@@ -282,7 +274,7 @@ impl Shell {
             .collect()
     }
 
-    /// While the card or its seek bar is held, follows the pointer even past the card's edge.
+    /// follows the pointer even past the card's edge.
     fn mini_drag_tracker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let on_move = cx.listener(|this: &mut Self, event: &gpui::MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>| {
             if event.pressed_button != Some(MouseButton::Left) {

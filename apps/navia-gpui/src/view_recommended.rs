@@ -184,7 +184,7 @@ impl Shell {
                 cx.stop_propagation();
                 this.recommended_add(song_ix, cx);
             })))
-            .child(crate::ui::icon_button_colored(&t, ("rec-more", pos), "dots-three-bold", false, color, hover).w(t.s(ACTION_W)).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+            .child(crate::ui::icon_button_colored(&t, ("rec-more", pos), tr("More"), "dots-three-bold", false, color, hover).w(t.s(ACTION_W)).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                 cx.stop_propagation();
                 this.open_list_song_menu(list, vec![pos], event.position(), true, cx);
             })))

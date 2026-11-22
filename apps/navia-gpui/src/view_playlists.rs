@@ -1,5 +1,6 @@
 //! Playlists: a grid or list, with sort, filter and search in the top bar.
 
+use crate::ui::FullTextTip;
 use crate::i18n::tr;
 use gpui::prelude::*;
 use navia_core::library::collections::CollectionKind;
@@ -8,7 +9,7 @@ use gpui::{FontWeight, div, px, relative};
 
 use crate::model::{PlaylistDetails, Section};
 use crate::ui_controls::segmented_glass;
-use crate::pages::{Block, CardItem, PageMetrics, Route, grid_columns};
+use crate::pages::{Block, CardItem, PageMetrics, Route, grid_fit};
 use crate::shell::{Layout, Shell};
 use crate::theme::size::*;
 use crate::view_albums::grid_blocks;
@@ -136,6 +137,7 @@ impl Shell {
                         let cover_id = this.playlist_art_key(&p.id);
                         let thumb = this.artwork(Some(&cover_id), "playlist-regular", 42.0, crate::view_cards::ArtShape::Rounded(R_SM), layout);
                         let route = Route::Playlist(p.id.clone());
+                        let menu_id = p.id.clone();
                         let drop = this.drop_mark(format!("row:{}", p.id), this.playlist_drop(&p.id, &p.name), R_MD, 0.0);
                         div()
                             .id(("playlist-row", index as usize))
@@ -150,8 +152,9 @@ impl Shell {
                             .text_color(t.t2())
                             .hover(|s| s.bg(t.row()))
                             .stop(&t).on_click(cx.listener(move |this, _, _, cx| this.navigate(route.clone(), cx)))
+                            .on_mouse_down(gpui::MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_playlist_menu(menu_id.clone(), event.position, cx)))
                             .child(div().w(t.s(55.0)).flex_none().child(thumb))
-                            .child(div().flex_1().truncate().min_w(px(0.0)).font_weight(FontWeight::MEDIUM).text_color(t.t1()).child(p.name.clone()))
+                            .child(div().id("name").flex_1().truncate().min_w(px(0.0)).font_weight(FontWeight::MEDIUM).text_color(t.t1()).child(p.name.clone()).full_text_tip(&t, p.name.clone()))
                             .child(div().w(relative(0.2)).flex_none().flex().flex_row().items_center().gap(t.s(DOWNLOAD_MARK_GAP)).min_w(px(0.0)).children(this.download_mark(CollectionKind::Playlist, &p.id)).child(div().min_w(px(0.0)).truncate().child(crate::view_cards::playlist_subtitle(&p))))
                             .child(div().w(relative(0.2)).flex_none().child(long_duration(p.duration_s)))
                             .child(div().absolute().left(px(0.0)).right(px(0.0)).bottom(px(0.0)).h(px(1.0)).bg(t.line()))
@@ -161,8 +164,7 @@ impl Shell {
             );
             return head;
         }
-        let width = f32::from(layout.main_width) / self.theme.token_scale() - m.gutter * 2.0;
-        let columns = grid_columns(width, m.grid_card, m.card_gap);
+        let (columns, _) = grid_fit(self.grid_width(layout), m.grid_card, m.card_gap);
         head.extend(grid_blocks(found.into_iter().map(CardItem::Playlist).collect(), columns));
         head
     }

@@ -10,14 +10,13 @@ use navia_core::audio::player::Player as CorePlayer;
 use navia_core::quality::{Codec, Leveling, Quality, QualityControl, offered_codecs};
 use navia_core::reporting::PlayThreshold;
 
-use crate::color::{hex_to_hue, hue_to_hex, is_hex, parse_hex};
+use crate::color::{ACCENT_PRESETS, hex_to_hue, hue_to_hex, is_hex, parse_hex};
 use crate::eq_model::OUTPUT_DEFAULT;
 
-/// Navia's license file in its repository, for Settings > About.
+/// for Settings > About.
 pub const LICENSE_URL: &str = "https://github.com/davekai/navia/blob/main/LICENSE";
 
-/// The output pickers in Settings and the Equalizer, refreshed when devices change.
-pub const OUTPUT_SELECT: &str = "output-device";
+/// refreshed when devices change.
 pub const EQ_OUTPUT_SELECT: &str = "eq-output";
 use crate::persist::{BetweenSongs, DiscordArt, PlayerMode};
 use crate::shell::{Layout, Route, Shell};
@@ -26,7 +25,6 @@ use crate::theme::size::*;
 use crate::ui::{glass_edge, icon};
 use crate::ui_controls::{SelectOption, SliderLook, SliderSpec, TextTarget, ring, segmented_settings, switch};
 
-pub const ACCENT_PRESETS: [u32; 7] = [0x5a93f5, 0x50ffff, 0x8b7cf6, 0xe879a6, 0xf2685c, 0xf5a33d, 0x4cc38a];
 const ZOOM_MIN: f32 = 70.0;
 const ZOOM_MAX: f32 = 130.0;
 const ZOOM_STEP: f32 = 5.0;
@@ -43,26 +41,25 @@ pub fn section_title(t: &Theme, title: &'static str) -> gpui::Div {
     div().mb(t.s(10.0)).text_size(t.text(TEXT_SECTION)).font_weight(FontWeight::SEMIBOLD).child(title)
 }
 
-fn row_shell(t: &Theme, pos: RowPos, main_tokens: f32) -> gpui::Div {
+/// the control goes under the text when the text would get less than `SETTINGS_TEXT_MIN` beside it.
+fn row_shell(t: &Theme, pos: RowPos) -> gpui::Div {
     let r = t.s(14.0);
-    let mut row = div().flex().flex_row().items_center().justify_between().gap(t.s(24.0)).min_h(t.s(60.0)).px(t.s(16.0)).py(t.s(10.0)).bg(t.panel_glass());
-    if main_tokens <= 620.0 {
-        row = row.flex_wrap();
-    }
-    row = match pos {
+    let row = div().flex().flex_row().flex_wrap().items_center().justify_between().gap_x(t.s(24.0)).gap_y(t.s(8.0)).min_h(t.s(60.0)).px(t.s(16.0)).py(t.s(10.0)).bg(t.panel());
+    match pos {
         RowPos::First => row.rounded_tl(r).rounded_tr(r).border_b_1().border_color(t.line()),
         RowPos::Middle => row.border_b_1().border_color(t.line()),
         RowPos::Last => row.rounded_bl(r).rounded_br(r),
         RowPos::Single => row.rounded(r),
-    };
-    row
+    }
 }
 
 fn row_text(t: &Theme, label: impl Into<SharedString>, hint: Option<SharedString>, dim: bool) -> gpui::Div {
     div()
         .flex()
         .flex_col()
-        .flex_1()
+        .flex_grow(1.0)
+        .flex_shrink(1.0)
+        .flex_basis(t.s(SETTINGS_TEXT_MIN))
         .min_w(px(0.0))
         .line_height(relative(1.35))
         .child(div().font_weight(FontWeight::MEDIUM).when(dim, |d| d.text_color(t.t2())).child(label.into()))
@@ -74,28 +71,128 @@ pub fn settings_button(t: &Theme, id: impl Into<gpui::ElementId>, label: impl In
     div().id(id).flex().items_center().flex_none().h(t.s(34.0)).px(t.s(14.0)).rounded_full().bg(t.panel_2()).text_size(t.text(TEXT_SM)).font_weight(FontWeight::MEDIUM).when(!enabled, |d| d.opacity(DISABLED_OPACITY)).when(enabled, |d| d.child(crate::ui::hover_pill(t))).child(label.into())
 }
 
-pub fn settings_row(t: &Theme, label: impl Into<SharedString>, hint: Option<SharedString>, control: AnyElement, pos: RowPos, main_tokens: f32) -> gpui::Div {
-    row_shell(t, pos, main_tokens).child(row_text(t, label, hint, false)).child(control)
+pub fn settings_row(t: &Theme, label: impl Into<SharedString>, hint: Option<SharedString>, control: AnyElement, pos: RowPos) -> gpui::Div {
+    row_shell(t, pos).child(row_text(t, label, hint, false)).child(control)
 }
 
-/// A row that opens a page, with label, hint, an optional value and a caret. Hover fill is its only feedback.
-pub(crate) fn settings_link_row(t: &Theme, id: &'static str, label: impl Into<SharedString>, hint: SharedString, value: Option<AnyElement>, pos: RowPos, main_tokens: f32) -> gpui::Stateful<gpui::Div> {
-    row_shell(t, pos, main_tokens)
+/// an optional value (Downloads' size), then a caret; the hover fill is the only feedback.
+pub(crate) fn settings_link_row(t: &Theme, id: &'static str, label: impl Into<SharedString>, hint: SharedString, value: Option<AnyElement>, pos: RowPos) -> gpui::Stateful<gpui::Div> {
+    row_shell(t, pos)
         .id(id)
         .hover(|s| s.bg(t.hover()))
         .child(row_text(t, label, Some(hint), false))
         .child(div().flex().flex_row().flex_none().items_center().gap(t.s(10.0)).children(value).child(icon(t, "caret-right-bold", 16.0, t.t3())))
 }
 
+/// the lowercased runs of letters and digits.
+pub fn search_words(text: &str) -> Vec<String> {
+    text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect()
+}
+
+/// every word starts a word of `texts`.
+fn words_match(words: &[String], texts: &[&str]) -> bool {
+    let hay = search_words(&texts.join(" "));
+    words.iter().all(|w| hay.iter().any(|h| h.starts_with(w.as_str())))
+}
+
+pub type ClickHandler = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App)>;
+
+/// one Settings row before its place in its card is known, so the search can leave rows out.
+pub struct SettingRow {
+    label: SharedString,
+    hint: Option<SharedString>,
+    /// a sub-page's own settings, so searching finds them on the row that opens it.
+    terms: Vec<SharedString>,
+    draw: Box<dyn FnOnce(RowPos, Option<SharedString>) -> AnyElement>,
+}
+
+impl SettingRow {
+    /// `dim` when the control can't act; the hint says why.
+    pub fn new(t: &Theme, label: impl Into<SharedString>, hint: Option<SharedString>, dim: bool, control: Option<AnyElement>) -> Self {
+        let (t, label) = (*t, label.into());
+        let (text_label, text_hint) = (label.clone(), hint.clone());
+        let draw = Box::new(move |pos, _| row_shell(&t, pos).child(row_text(&t, text_label, text_hint, dim)).children(control).into_any_element());
+        SettingRow { label, hint, terms: Vec::new(), draw }
+    }
+
+    /// opens a sub-page; without `open` it can't yet.
+    pub fn link(t: &Theme, id: &'static str, label: impl Into<SharedString>, summary: SharedString, value: Option<AnyElement>, open: Option<ClickHandler>) -> Self {
+        let (t, label) = (*t, label.into());
+        let (text_label, text_hint) = (label.clone(), summary.clone());
+        let draw = Box::new(move |pos, found: Option<SharedString>| {
+            let row = settings_link_row(&t, id, text_label, found.unwrap_or(text_hint), value, pos);
+            match open {
+                Some(open) => row.stop(&t).on_click(open).into_any_element(),
+                None => row.into_any_element(),
+            }
+        });
+        SettingRow { label, hint: Some(summary), terms: Vec::new(), draw }
+    }
+
+    pub fn terms(mut self, terms: &[&'static str]) -> Self {
+        self.terms = terms.iter().map(|t| SharedString::from(tr(t))).collect();
+        self
+    }
+}
+
+/// the section's title over the rows the search kept, or nothing when it kept none.
+pub fn settings_card(t: &Theme, words: &[String], title: &'static str, rows: Vec<SettingRow>) -> Option<gpui::Div> {
+    let kept: Vec<(SettingRow, Option<SharedString>)> = rows
+        .into_iter()
+        .filter_map(|row| {
+            if words_match(words, &[&row.label, row.hint.as_deref().unwrap_or("")]) {
+                return Some((row, None));
+            }
+            let found: Vec<&str> = row.terms.iter().filter(|term| words_match(words, &[&row.label, term])).map(|term| term.as_ref()).collect();
+            let hint = (!found.is_empty()).then(|| SharedString::from(found.join(", ")));
+            hint.map(|hint| (row, Some(hint)))
+        })
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let last = kept.len() - 1;
+    let mut col = div().flex().flex_col().child(section_title(t, title));
+    for (i, (row, found)) in kept.into_iter().enumerate() {
+        let pos = match (i, last) {
+            (0, 0) => RowPos::Single,
+            (0, _) => RowPos::First,
+            (i, last) if i == last => RowPos::Last,
+            _ => RowPos::Middle,
+        };
+        col = col.child((row.draw)(pos, found));
+    }
+    Some(col)
+}
+
+const EQUALIZER_TERMS: &[&str] = &[n_("Equalizer mode"), n_("Graphic"), n_("Parametric"), n_("Preset"), n_("Preamp"), n_("Custom filters"), n_("Reset to Flat"), n_("Save as preset"), n_("Balance"), n_("Mono"), n_("Crossfeed"), n_("Crossfeed strength"), n_("Soft limiter"), n_("Headphone Correction"), n_("Headphone model")];
+
+type SettingsSection = fn(&mut Shell, f32, &mut Window, &mut Context<Shell>) -> Option<gpui::Div>;
+
+const SETTINGS_SECTIONS: [SettingsSection; 9] = [
+    Shell::render_settings_playback,
+    Shell::render_settings_appearance,
+    Shell::render_settings_player,
+    Shell::render_settings_startup,
+    Shell::render_settings_library,
+    Shell::render_settings_storage,
+    Shell::render_settings_connections,
+    Shell::render_settings_friends,
+    Shell::render_settings_about,
+];
+
 impl Shell {
-    /// The "Use Deezer for recommendations" row. This account's choice alone decides Navia's own Deezer requests, so
-    /// it's never dimmed.
-    fn render_deezer_row(&mut self, main_tokens: f32, cx: &mut Context<Self>) -> gpui::Div {
+    /// this account's choice alone decides Navia's Deezer requests. never dimmed.
+    fn deezer_row(&mut self, cx: &mut Context<Self>) -> SettingRow {
         let t = self.theme;
         let on = self.deezer.choice == Some(true);
         let control = switch(&t, "deezer", on, true, cx, move |this, cx| this.set_deezer_choice(!on, cx)).into_any_element();
-        let hint = tr("Better Autoplay and Artist Radio. Sends artist and song names to Deezer from this computer. No account needed.");
-        row_shell(&t, RowPos::Middle, main_tokens).child(row_text(&t, tr("Use Deezer for recommendations"), Some(hint.into()), false)).child(control)
+        let hint = tr("Better Autoplay and Artist Radio, and a Heat column on albums. Sends artist and song names to Deezer and ListenBrainz from this computer. No account needed.");
+        SettingRow::new(&t, tr("Use Deezer for recommendations"), Some(hint.into()), false, Some(control))
+    }
+
+    pub fn settings_words(&self) -> Vec<String> {
+        search_words(&self.settings_query)
     }
 }
 
@@ -114,8 +211,7 @@ const FRIEND_ID_HINT: &str = n_("Their Discord user ID. In Discord, turn on Deve
 const CONTROL_HINT: &str = n_("People listening along with you can pause, skip, seek and change the song.");
 /// The hint under Settings > Share what I'm playing.
 const SHARE_HINT: &str = n_("Others using Navia on this server can see what you play and listen along, and you can see who else shares.");
-/// The hints for the two Autoplay modes.
-const AUTOPLAY_NAVIA_HINT: &str = n_("Picks from the server's suggestions, your plays and favorites, and Deezer when it's on.");
+const AUTOPLAY_NAVIA_HINT: &str = n_("Picks from the server's suggestions, your plays and favorites, and Deezer and ListenBrainz when they're on.");
 const AUTOPLAY_SERVER_HINT: &str = n_("The server's similar songs, as they come.");
 const NO_FORMAT: &str = n_("The server can't make this format.");
 
@@ -187,15 +283,11 @@ impl Shell {
         .detach();
     }
 
-    fn render_quality_row(&mut self, label: &'static str, hint: SharedString, slot: QualitySlot, main_tokens: f32, cx: &mut Context<Self>) -> gpui::Div {
-        self.render_quality_row_at(label, hint, slot, RowPos::Middle, main_tokens, cx)
-    }
-
-    fn render_quality_row_at(&mut self, label: &'static str, hint: SharedString, slot: QualitySlot, pos: RowPos, main_tokens: f32, cx: &mut Context<Self>) -> gpui::Div {
+    fn quality_row(&mut self, label: &'static str, hint: SharedString, slot: QualitySlot, cx: &mut Context<Self>) -> SettingRow {
         let t = self.theme;
         self.ensure_format_check(cx);
         let Some(control) = self.quality_control() else {
-            return row_shell(&t, pos, main_tokens).child(row_text(&t, label, Some(tr("Needs a connection to the server.").into()), true)).child(disabled_pill(&t, tr("Original")));
+            return SettingRow::new(&t, label, Some(tr("Needs a connection to the server.").into()), true, Some(disabled_pill(&t, tr("Original"))));
         };
         let quality = slot.get(&control);
         let mut formats = vec![SelectOption::new("original", tr("Original"))];
@@ -221,13 +313,13 @@ impl Shell {
             }
         };
         let pair = div().flex().flex_row().flex_none().gap(t.s(8.0)).child(format_picker).child(rate_picker).into_any_element();
-        settings_row(&t, label, Some(hint), pair, pos, main_tokens)
+        SettingRow::new(&t, label, Some(hint), false, Some(pair))
     }
 
-    fn render_leveling_row(&mut self, main_tokens: f32, cx: &mut Context<Self>) -> gpui::Div {
+    fn leveling_row(&mut self, cx: &mut Context<Self>) -> SettingRow {
         let t = self.theme;
         let Some(control) = self.quality_control() else {
-            return row_shell(&t, RowPos::Middle, main_tokens).child(row_text(&t, tr("Volume leveling"), Some(tr("Needs a connection to the server.").into()), true)).child(disabled_pill(&t, tr("Off")));
+            return SettingRow::new(&t, tr("Volume leveling"), Some(tr("Needs a connection to the server.").into()), true, Some(disabled_pill(&t, tr("Off"))));
         };
         let options = Rc::new(vec![SelectOption::new("off", tr("Off")), SelectOption::new("album", tr("Album")), SelectOption::new("track", tr("Track"))]);
         let picker = self.select_pill("volume-leveling", control.leveling().id(), options, tr("Choose"), Some(240.0), |this, value, cx| {
@@ -238,35 +330,45 @@ impl Shell {
             }
             cx.notify();
         }, cx);
-        settings_row(&t, tr("Volume leveling"), Some(tr(LEVELING_HINT).into()), picker, RowPos::Middle, main_tokens)
+        SettingRow::new(&t, tr("Volume leveling"), Some(tr(LEVELING_HINT).into()), false, Some(picker))
     }
 
+    /// each section is its own block; while searching, the sections left are one block, or the empty state.
     pub fn build_settings(&mut self, _layout: &Layout) -> Vec<crate::pages::Block> {
-        let section = |render: fn(&mut Shell, &Layout, &mut Window, &mut Context<Shell>) -> AnyElement| Shell::plain_block(move |this, layout, window, cx| render(this, layout, window, cx));
-        vec![
-            section(Self::render_settings_playback),
-            crate::pages::Block::Spacer(30.0),
-            section(Self::render_settings_appearance),
-            crate::pages::Block::Spacer(30.0),
-            section(Self::render_settings_player),
-            crate::pages::Block::Spacer(30.0),
-            section(Self::render_settings_startup),
-            crate::pages::Block::Spacer(30.0),
-            section(Self::render_settings_library),
-            crate::pages::Block::Spacer(30.0),
-            section(Self::render_settings_storage),
-            crate::pages::Block::Spacer(30.0),
-            section(Self::render_settings_connections),
-            crate::pages::Block::Spacer(30.0),
-            section(Self::render_settings_friends),
-            crate::pages::Block::Spacer(30.0),
-            section(Self::render_settings_about),
-        ]
+        if !self.settings_words().is_empty() {
+            return vec![Shell::plain_block(|this, layout, window, cx| this.render_settings_found(layout, window, cx))];
+        }
+        let mut blocks = Vec::new();
+        for (i, render) in SETTINGS_SECTIONS.into_iter().enumerate() {
+            if i > 0 {
+                blocks.push(crate::pages::Block::Spacer(SETTINGS_SECTION_GAP));
+            }
+            blocks.push(Shell::plain_block(move |this, layout, window, cx| {
+                let main_tokens = f32::from(layout.main_width) / this.theme.token_scale();
+                let section = render(this, main_tokens, window, cx).unwrap_or_else(|| div());
+                this.settings_frame(layout, section)
+            }));
+        }
+        blocks
     }
 
-    fn settings_frame(&self, layout: &Layout, content: gpui::Div) -> AnyElement {
+    fn render_settings_found(&mut self, layout: &Layout, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
-        div().w(layout.main_width).child(div().w_full().max_w(t.s(780.0)).mx_auto().px(t.s(GUTTER)).child(content)).into_any_element()
+        let main_tokens = f32::from(layout.main_width) / t.token_scale();
+        let found: Vec<gpui::Div> = SETTINGS_SECTIONS.into_iter().filter_map(|render| render(self, main_tokens, window, cx)).collect();
+        if found.is_empty() {
+            let query = self.settings_query.trim().to_string();
+            return self
+                .empty_state("magnifying-glass-regular", tr("No settings match"), trf("Nothing matches \u{201c}{query}\u{201d}.", &[("query", &query)]), true)
+                .child(crate::ui_controls::empty_action(&t, "settings-clear-search").child(tr("Clear Search")).stop(&t).on_click(cx.listener(|this, _, _, cx| this.clear_field(TextTarget::Page, cx))))
+                .into_any_element();
+        }
+        self.settings_frame(layout, div().flex().flex_col().gap(t.s(SETTINGS_SECTION_GAP)).children(found))
+    }
+
+    pub fn settings_frame(&self, layout: &Layout, content: gpui::Div) -> AnyElement {
+        let t = self.theme;
+        div().w(layout.main_width).child(div().w_full().max_w(t.s(SETTINGS_MAX_W)).mx_auto().px(t.s(GUTTER)).child(content)).into_any_element()
     }
 
     pub fn ensure_outputs(&mut self, cx: &mut Context<Self>) {
@@ -287,7 +389,6 @@ impl Shell {
                 // A menu or picker opened before the list arrived, or across a hot-plug.
                 this.refresh_output_menu(cx);
                 let options = this.output_options();
-                this.refresh_select(OUTPUT_SELECT, options.clone(), cx);
                 this.refresh_select(EQ_OUTPUT_SELECT, options, cx);
                 cx.notify();
             });
@@ -352,7 +453,8 @@ impl Shell {
     pub fn apply_playback_settings(&self) {
         let Some(core) = self.core.as_ref() else { return };
         core.player.set_crossfade_ms(self.prefs.crossfade_ms());
-        core.player.set_smart_crossfade(self.prefs.between_songs == BetweenSongs::Smart);
+        core.player.set_smart_crossfade(self.prefs.between_songs.smart());
+        core.player.set_smart_transitions(self.prefs.between_songs == BetweenSongs::Mix);
         if self.prefs.output_device.is_some() {
             core.player.set_output_device(self.prefs.output_device.clone());
         }
@@ -363,20 +465,21 @@ impl Shell {
         self.prefs.save();
         if let Some(core) = self.core.as_ref() {
             core.player.set_crossfade_ms(self.prefs.crossfade_ms());
-            core.player.set_smart_crossfade(style == BetweenSongs::Smart);
+            core.player.set_smart_crossfade(style.smart());
+            core.player.set_smart_transitions(style == BetweenSongs::Mix);
         }
         cx.notify();
     }
 
-    fn render_settings_playback(&mut self, layout: &Layout, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_playback(&mut self, _main_tokens: f32, _window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let t = self.theme;
         self.ensure_outputs(cx);
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         let style = self.prefs.between_songs;
-        let segmented = segmented_settings(&t, "between-songs", style, &[(BetweenSongs::Gapless, tr("Gapless"), None), (BetweenSongs::Crossfade, tr("Crossfade"), None), (BetweenSongs::Smart, tr("Smart"), None)], cx, |this, value, cx| this.set_between_songs(value, cx)).into_any_element();
-        let hint: SharedString = tr("Gapless keeps albums seamless. Smart crossfades between unrelated songs, and stays gapless within an album.").into();
-        let mut col = div().flex().flex_col().child(section_title(&t, tr("Playback"))).child(settings_row(&t, tr("Between songs"), Some(hint), segmented, RowPos::First, main_tokens));
-        if style != BetweenSongs::Gapless {
+        let segmented = segmented_settings(&t, "between-songs", style, &[(BetweenSongs::Gapless, tr("Gapless"), None), (BetweenSongs::Crossfade, tr("Crossfade"), None), (BetweenSongs::Smart, tr("Smart"), None), (BetweenSongs::Mix, tr("Mix"), None)], cx, |this, value, cx| this.set_between_songs(value, cx)).into_any_element();
+        let hint: SharedString = tr("Gapless keeps albums seamless. Smart crossfades between unrelated songs, and stays gapless within an album. Mix shapes each transition to the music.").into();
+        let mut rows = vec![SettingRow::new(&t, tr("Between songs"), Some(hint), false, Some(segmented))];
+        // Mix chooses each transition's length itself.
+        if matches!(style, BetweenSongs::Crossfade | BetweenSongs::Smart) {
             let fade = self.prefs.crossfade_s as f32;
             let slider = self.render_slider(SliderSpec::new("crossfade-length", fade, 1.0, 12.0, |this, v, cx| {
                 this.prefs.crossfade_s = v.round() as u32;
@@ -385,7 +488,7 @@ impl Shell {
                 }
                 cx.notify();
             }).look(SliderLook::Plain).on_end(|this, _| this.prefs.save()), cx);
-            col = col.child(settings_row(&t, tr("Crossfade length"), Some(trn("{count} second", "{count} seconds", self.prefs.crossfade_s as usize).into()), slider, RowPos::Middle, main_tokens));
+            rows.push(SettingRow::new(&t, tr("Crossfade length"), Some(trn("{count} second", "{count} seconds", self.prefs.crossfade_s as usize).into()), false, Some(slider)));
         }
         use navia_core::queue_order::ShuffleStyle;
         let shuffle_style = self.prefs.shuffle_style;
@@ -396,7 +499,7 @@ impl Shell {
         })
         .into_any_element();
         let shuffle_hint = if shuffle_style == ShuffleStyle::FewerRepeats { tr("Fewer Repeats plays songs you heard recently later.") } else { tr("Standard plays the list in a plain random order.") };
-        col = col.child(settings_row(&t, tr("Shuffle"), Some(shuffle_hint.into()), shuffle, RowPos::Middle, main_tokens));
+        rows.push(SettingRow::new(&t, tr("Shuffle"), Some(shuffle_hint.into()), false, Some(shuffle)));
         let autoplay = switch(&t, "autoplay", self.prefs.autoplay, true, cx, |this, cx| {
             this.prefs.autoplay = !this.prefs.autoplay;
             this.prefs.save();
@@ -404,29 +507,22 @@ impl Shell {
             cx.notify();
         })
         .into_any_element();
-        col = col
-            .child(settings_row(&t, tr("Autoplay"), Some(tr("When your music ends, keep playing similar songs. Starts only once nothing is left, so after every song of a shuffled list, and never while Repeat is on.").into()), autoplay, RowPos::Middle, main_tokens));
+        rows.push(SettingRow::new(&t, tr("Autoplay"), Some(tr("When your music ends, keep playing similar songs. Starts only once nothing is left, so after every song of a shuffled list, and never while Repeat is on.").into()), false, Some(autoplay)));
         if self.prefs.autoplay {
             use navia_core::engine::AutoplayMode;
             let mode = self.autoplay_mode;
             let picker = segmented_settings(&t, "autoplay-mode", mode, &[(AutoplayMode::Navia, tr("Navia"), None), (AutoplayMode::Server, tr("Server"), None)], cx, |this, value, cx| this.set_autoplay_mode(value, cx)).into_any_element();
             let hint = if mode == AutoplayMode::Navia { tr(AUTOPLAY_NAVIA_HINT) } else { tr(AUTOPLAY_SERVER_HINT) };
-            col = col.child(settings_row(&t, tr("Autoplay mode"), Some(hint.into()), picker, RowPos::Middle, main_tokens));
+            rows.push(SettingRow::new(&t, tr("Autoplay mode"), Some(hint.into()), false, Some(picker)));
         }
-        col = col
-            .child(self.render_deezer_row(main_tokens, cx))
-            .child(self.render_leveling_row(main_tokens, cx))
-            .child(self.render_quality_row(tr("Streaming quality"), tr(STREAM_QUALITY_HINT).into(), QualitySlot::Streaming, main_tokens, cx))
-            .child(self.render_quality_row(tr("On metered connections"), self.metered_hint(), QualitySlot::Metered, main_tokens, cx));
-        let output_value = self.prefs.output_device.clone().unwrap_or_else(|| OUTPUT_DEFAULT.to_string());
-        let options = self.output_options();
-        let picker = self.select_pill(OUTPUT_SELECT, output_value, options, tr("Choose"), Some(240.0), |this, value, cx| this.set_output_device((value != OUTPUT_DEFAULT).then(|| value.to_string()), cx), cx);
-        let hint: SharedString = if self.outputs.is_empty() { tr("Your system's default output.").into() } else { tr("Where Navia plays. Applied to the player right away.").into() };
-        col = col.child(settings_row(&t, tr("Output device"), Some(hint), picker, RowPos::Middle, main_tokens));
-        let link = settings_link_row(&t, "equalizer-link", tr("Equalizer"), self.equalizer_summary().into(), None, RowPos::Last, main_tokens)
-            .stop(&t)
-            .on_click(cx.listener(|this, _, _, cx| this.navigate(Route::Equalizer, cx)));
-        self.settings_frame(layout, col.child(link))
+        rows.push(self.deezer_row(cx));
+        rows.push(self.leveling_row(cx));
+        rows.push(self.quality_row(tr("Streaming quality"), tr(STREAM_QUALITY_HINT).into(), QualitySlot::Streaming, cx));
+        let metered_hint = self.metered_hint();
+        rows.push(self.quality_row(tr("On metered connections"), metered_hint, QualitySlot::Metered, cx));
+        let open: ClickHandler = Box::new(cx.listener(|this, _, _, cx| this.navigate(Route::Equalizer, cx)));
+        rows.push(SettingRow::link(&t, "equalizer-link", tr("Equalizer"), self.equalizer_summary().into(), None, Some(open)).terms(EQUALIZER_TERMS));
+        settings_card(&t, &self.settings_words(), tr("Playback"), rows)
     }
 
     /// The "Public server address" field, as wide as the settings selects.
@@ -434,9 +530,8 @@ impl Shell {
         self.settings_field(TextTarget::DiscordAddress, "discord-address", "https://music.example.org", 240.0, cx)
     }
 
-    /// The "Public server address" row. While empty and not being edited it shows whether the server's own address is
-    /// used, plus a button to open the field. Hidden for External sources.
-    fn render_discord_address_row(&mut self, main_tokens: f32, cx: &mut Context<Self>) -> Option<gpui::Div> {
+    /// while empty and not being typed in: a status line and a text button that opens the field. hidden for External sources.
+    fn discord_address_row(&mut self, cx: &mut Context<Self>) -> Option<SettingRow> {
         use navia_integrations::art::{CoverSource, PublicAddressError, parse_public_address};
         let t = self.theme;
         let source = self.prefs.discord_covers_from;
@@ -451,7 +546,7 @@ impl Shell {
                 Ok(_) => tr("If your server is reachable from the internet, Discord can show its own covers.").into(),
             };
             let field = self.render_discord_address(cx);
-            return Some(settings_row(&t, tr("Public server address"), Some(hint), field, RowPos::Middle, main_tokens));
+            return Some(SettingRow::new(&t, tr("Public server address"), Some(hint), false, Some(field)));
         }
         let using: SharedString = tr("Using your server's address for covers.").into();
         let status: Option<SharedString> = match source {
@@ -464,23 +559,45 @@ impl Shell {
         let button = crate::view_album::text_button_on(&t, "discord-address-open", None, tr("Use a different address"), true, t.t1().into())
             .on_click(cx.listener(|this, _, _, cx| this.focus_field(TextTarget::DiscordAddress, cx)))
             .into_any_element();
-        Some(settings_row(&t, tr("Public server address"), status, button, RowPos::Middle, main_tokens))
+        Some(SettingRow::new(&t, tr("Public server address"), status, false, Some(button)))
     }
 
-    fn disabled_row(&self, label: &'static str, reason: &'static str, control: AnyElement, main_tokens: f32) -> gpui::Div {
-        let t = self.theme;
-        row_shell(&t, RowPos::Middle, main_tokens).child(row_text(&t, label, Some(reason.into()), true)).child(control)
-    }
 
     fn render_accent_picker(&mut self, main_tokens: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
-        let current = self.prefs.accent;
+        let current = self.accent_now();
         if self.controls.text != Some(TextTarget::AccentHex) {
             self.controls.hex_text = format!("#{current:06x}");
         }
-        let mut swatches = div().flex().flex_row().gap(t.s(7.0)).flex_none();
+        // without an accent setting on the desktop there's no System choice; a saved one gives the default
+        let offered = self.system_accent.is_some();
+        let system = self.prefs.accent_system && offered;
+        let selected = |d: gpui::Stateful<gpui::Div>| d.child(div().absolute().left(t.s(-4.0)).top(t.s(-4.0)).right(t.s(-4.0)).bottom(t.s(-4.0)).rounded_full().border_2().border_color(t.t1()));
+        // a ring of dark copies stands in for the check's soft shadow, which GPUI can't blur.
+        let shadow = gpui::rgba(crate::theme::ACCENT_WHEEL_CHECK_SHADOW);
+        let spread = t.s(crate::theme::ACCENT_WHEEL_CHECK_BLUR / 2.0);
+        let lifted_check = div().relative().size(t.s(13.0)).children([(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)].map(|(x, y)| div().absolute().left(spread * x).top(spread * y).child(icon(&t, "check-bold", 13.0, shadow)))).child(div().absolute().child(icon(&t, "check-bold", 13.0, t.t1())));
+        let wheel = div()
+            .id("accent-system")
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(t.s(ACCENT_SWATCH))
+            .rounded_full()
+            .child(crate::ui::accent_wheel())
+            .shadow(vec![crate::ui::inset_ring(gpui::rgba(crate::theme::GLASS_EDGE))])
+            .tooltip(crate::ui::tip(&t, tr("System")))
+            .stop(&t)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.set_accent_system(true);
+                this.prefs.save();
+                cx.notify();
+            }))
+            .when(system, |d| d.child(lifted_check));
+        let mut swatches = div().flex().flex_row().gap(t.s(7.0)).flex_none().when(offered, |d| d.child(if system { selected(wheel) } else { wheel }));
         for (i, preset) in ACCENT_PRESETS.into_iter().enumerate() {
-            let on = preset == current;
+            let on = !system && preset == current;
             let color = gpui::rgb(preset);
             swatches = swatches.child(
                 div()
@@ -489,7 +606,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(t.s(26.0))
+                    .size(t.s(ACCENT_SWATCH))
                     .rounded_full()
                     .bg(color)
                     .shadow(vec![crate::ui::inset_ring(gpui::rgba(crate::theme::GLASS_EDGE))])
@@ -498,7 +615,7 @@ impl Shell {
                         this.prefs.save();
                         cx.notify();
                     }))
-                    .when(on, |d| d.child(div().absolute().left(t.s(-4.0)).top(t.s(-4.0)).right(t.s(-4.0)).bottom(t.s(-4.0)).rounded_full().border_2().border_color(t.t1())).child(icon(&t, "check-bold", 13.0, t.on_accent.hsla(1.0)))),
+                    .when(on, |d| selected(d).child(icon(&t, "check-bold", 13.0, t.on_accent.hsla(1.0)))),
             );
         }
         let hue = self.render_slider(SliderSpec::new("accent-hue", hex_to_hue(current), 0.0, 359.0, |this, v, cx| {
@@ -514,7 +631,7 @@ impl Shell {
             .flex_row()
             .items_center()
             .flex_none()
-            .w(t.s(92.0)) // Inter clips the last digit of "#5a93f5" at 84.
+            .w(t.s(92.0)) // fits "#5a93f5" in Inter
             .h(t.s(34.0))
             .px(t.s(12.0))
             .rounded_full()
@@ -533,7 +650,10 @@ impl Shell {
 
     /// Settings actions for screenshots, like `accent:#e879a6`, `zoom:130`, `blur:0` and `crossfade`.
     pub fn settings_script(&mut self, op: &str, cx: &mut Context<Self>) -> bool {
-        if let Some(hex) = op.strip_prefix("accent:") {
+        if op == "accent:system" {
+            self.set_accent_system(true);
+            self.prefs.save();
+        } else if let Some(hex) = op.strip_prefix("accent:") {
             if let Some(c) = parse_hex(hex) {
                 self.set_accent(c);
                 self.prefs.save();
@@ -543,6 +663,14 @@ impl Shell {
         } else if let Some(b) = op.strip_prefix("blur:") {
             self.prefs.lyric_blur = b == "1";
             self.prefs.save();
+        } else if let Some(b) = op.strip_prefix("lyric-effects:") {
+            self.prefs.lyric_effects = b == "1";
+            self.prefs.save();
+        } else if let Some(b) = op.strip_prefix("lyric-sweep:") {
+            self.prefs.lyric_sweep = b == "1";
+            self.prefs.save();
+        } else if let Some(b) = op.strip_prefix("backing-vocals-line:") {
+            self.set_backing_vocals_line(b == "1");
         } else if op == "crossfade" {
             self.set_between_songs(BetweenSongs::Crossfade, cx);
         } else if let Some(choice) = op.strip_prefix("login:") {
@@ -558,6 +686,12 @@ impl Shell {
 
     pub fn set_accent(&mut self, accent: u32) {
         self.prefs.accent = accent;
+        self.prefs.accent_system = false;
+        self.refresh_theme();
+    }
+
+    pub fn set_accent_system(&mut self, on: bool) {
+        self.prefs.accent_system = on;
         self.refresh_theme();
     }
 
@@ -581,9 +715,8 @@ impl Shell {
         cx.notify();
     }
 
-    fn render_settings_appearance(&mut self, layout: &Layout, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_appearance(&mut self, main_tokens: f32, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let t = self.theme;
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         let accent = self.render_accent_picker(main_tokens, window, cx);
         // Always the user's choice. Without detected blur it only starts off and says what to expect, since GNOME
         // extensions can blur windows without telling us.
@@ -608,22 +741,29 @@ impl Shell {
             } else {
                 tr("Not available on this desktop, because it doesn't provide a title bar.").into()
             };
-            row_shell(&t, RowPos::Middle, main_tokens).child(row_text(&t, tr("Use the desktop's title bar"), Some(hint), !available)).child(switch)
+            SettingRow::new(&t, tr("Use the desktop's title bar"), Some(hint), !available, Some(switch))
         });
-        let col = div()
-            .flex()
-            .flex_col()
-            .child(section_title(&t, tr("Appearance")))
-            .child(settings_row(&t, tr("Accent color"), None, accent, RowPos::First, main_tokens))
-            .child(row_shell(&t, RowPos::Middle, main_tokens).child(row_text(&t, tr("Window translucency"), Some(hint), false)).child(translucency))
-            .children(frame_row)
-            .child(settings_row(&t, tr("Language"), Some(tr("Follows your system's language unless you pick one.").into()), language, RowPos::Last, main_tokens));
-        self.settings_frame(layout, col)
+        let accent_hint: Option<SharedString> = (self.prefs.accent_system && self.system_accent.is_some()).then(|| if cfg!(target_os = "macos") { tr("Matches your Mac's accent color.") } else { tr("Matches your computer's accent color.") }.into());
+        let mut rows = vec![SettingRow::new(&t, tr("Accent color"), accent_hint, false, Some(accent)), SettingRow::new(&t, tr("Window translucency"), Some(hint), false, Some(translucency))];
+        rows.extend(frame_row);
+        rows.push(SettingRow::new(&t, tr("Language"), Some(tr("Follows your system's language unless you pick one.").into()), false, Some(language)));
+        settings_card(&t, &self.settings_words(), tr("Appearance"), rows)
     }
 
-    fn render_settings_player(&mut self, layout: &Layout, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn set_backing_vocals_line(&mut self, on: bool) {
+        self.prefs.backing_vocals_line = on;
+        self.prepare_lyrics_again();
+    }
+
+    fn prepare_lyrics_again(&mut self) {
+        self.prefs.save();
+        if !self.lyrics.is_empty() {
+            self.lyrics = crate::lyrics::prepare(self.lyrics_written.clone(), self.prefs.backing_vocals_line);
+        }
+    }
+
+    fn render_settings_player(&mut self, _main_tokens: f32, _window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let t = self.theme;
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         let zoom = self.prefs.zoom as f32;
         let size = self.render_slider(SliderSpec::new("interface-size", zoom, ZOOM_MIN, ZOOM_MAX, |this, v, cx| this.set_zoom(v.round() as u32, cx)).step(ZOOM_STEP).look(SliderLook::Plain), cx);
         let position = segmented_settings(&t, "position", self.prefs.mode, &[(PlayerMode::Dock, tr("Right Dock"), None), (PlayerMode::Bar, tr("Bottom Bar"), None)], cx, |this, value, cx| this.set_mode(value, cx)).into_any_element();
@@ -632,21 +772,34 @@ impl Shell {
             this.prefs.save();
             cx.notify();
         }).into_any_element();
-        let col = div()
-            .flex()
-            .flex_col()
-            .child(section_title(&t, tr("Player")))
-            .child(settings_row(&t, tr("Interface size"), Some(trf("{zoom}%. Ctrl and plus or minus also changes it, and Ctrl+0 resets it.", &[("zoom", &self.prefs.zoom.to_string())]).into()), size, RowPos::First, main_tokens))
-            .child(settings_row(&t, tr("Position"), Some(tr("On narrow windows the dock becomes the bottom bar until there's room.").into()), position, RowPos::Middle, main_tokens))
-            .child(settings_row(&t, tr("Blur lyrics by distance"), None, blur, RowPos::Last, main_tokens));
-        self.settings_frame(layout, col)
+        let effects = switch(&t, "lyric-effects", self.prefs.lyric_effects, true, cx, |this, cx| {
+            this.prefs.lyric_effects = !this.prefs.lyric_effects;
+            this.prefs.save();
+            cx.notify();
+        }).into_any_element();
+        let sweep = switch(&t, "lyric-sweep", self.prefs.lyric_sweep, true, cx, |this, cx| {
+            this.prefs.lyric_sweep = !this.prefs.lyric_sweep;
+            this.prefs.save();
+            cx.notify();
+        }).into_any_element();
+        let backing = switch(&t, "backing-vocals-line", self.prefs.backing_vocals_line, true, cx, |this, cx| {
+            this.set_backing_vocals_line(!this.prefs.backing_vocals_line);
+            cx.notify();
+        }).into_any_element();
+        let rows = vec![
+            SettingRow::new(&t, tr("Interface size"), Some(trf("{zoom}%. Ctrl and plus or minus also changes it, and Ctrl+0 resets it.", &[("zoom", &self.prefs.zoom.to_string())]).into()), false, Some(size)),
+            SettingRow::new(&t, tr("Position"), Some(tr("On narrow windows the dock becomes the bottom bar until there's room.").into()), false, Some(position)),
+            SettingRow::new(&t, tr("Blur lyrics by distance"), None, false, Some(blur)),
+            SettingRow::new(&t, tr("Lyric effects"), Some(tr("Glow, rising words and animated gaps. Off shows plain synced lyrics.").into()), false, Some(effects)),
+            SettingRow::new(&t, tr("Lyric sweep"), Some(tr("Lights up the lyrics as they're sung. Off highlights the whole line.").into()), false, Some(sweep)),
+            SettingRow::new(&t, tr("Backing vocals on their own line"), Some(tr("Moves words in parentheses to a smaller line under the lyric.").into()), false, Some(backing)),
+        ];
+        settings_card(&t, &self.settings_words(), tr("Player"), rows)
     }
 
-    /// Startup and window: the tray and open at login, on Linux and Windows.
-    fn render_settings_startup(&mut self, layout: &Layout, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_startup(&mut self, _main_tokens: f32, _window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
         use crate::autostart::OpenAtLogin;
         let t = self.theme;
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         let close_options = Rc::new(vec![SelectOption::new("tray", tr("Keep playing in the tray")), SelectOption::new("quit", tr("Quit"))]);
         let close_value = if self.prefs.close_to_tray { "tray" } else { "quit" };
         let close = self.select_pill("close-window", close_value, close_options, tr("Choose"), Some(240.0), |this, value, cx| this.set_close_to_tray(value.as_ref() == "tray", cx), cx);
@@ -662,25 +815,20 @@ impl Shell {
             cx.notify();
         }).into_any_element();
         let login = self.select_pill("open-at-login", self.open_at_login.id(), login_options, tr("Choose"), Some(240.0), |this, value, cx| this.set_open_at_login(OpenAtLogin::from_id(value.as_ref()), cx), cx);
-        let col = div()
-            .flex()
-            .flex_col()
-            .child(section_title(&t, tr("Startup and window")))
-            .child(settings_row(&t, tr("When I close the window"), close_hint, close, RowPos::First, main_tokens))
-            .child(settings_row(&t, tr("Show the mini player when Navia is minimized"), None, mini, RowPos::Middle, main_tokens))
-            .child(settings_row(&t, tr("Open at login"), None, login, RowPos::Last, main_tokens));
-        self.settings_frame(layout, col)
+        let rows = vec![
+            SettingRow::new(&t, tr("When I close the window"), close_hint, false, Some(close)),
+            SettingRow::new(&t, tr("Show the mini player when Navia is minimized"), None, false, Some(mini)),
+            SettingRow::new(&t, tr("Open at login"), None, false, Some(login)),
+        ];
+        settings_card(&t, &self.settings_words(), tr("Startup and window"), rows)
     }
 
-    /// Settings > About: the version, Check for Updates and "Check for updates automatically".
-    fn render_settings_about(&mut self, layout: &Layout, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_about(&mut self, _main_tokens: f32, _window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
         use crate::updates::UpdateStatus;
         let t = self.theme;
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         let version = div().flex_none().text_size(t.text(TEXT_SM)).text_color(t.t2()).child(crate::updates::version_label()).into_any_element();
-        let mut col = div().flex().flex_col().child(section_title(&t, tr("About")));
         let license_button = settings_button(&t, "view-license", tr("View License"), true).stop(&t).on_click(|_, _, cx| cx.open_url(LICENSE_URL)).into_any_element();
-        let license = settings_row(&t, tr("License"), Some(tr("Licensed under GPL-3.0-or-later.").into()), license_button, RowPos::Last, main_tokens);
+        let license = SettingRow::new(&t, tr("License"), Some(tr("Licensed under GPL-3.0-or-later.").into()), false, Some(license_button));
         let status = self.update_status.clone();
         let label = match &status {
             UpdateStatus::Checking => tr("Checking…"),
@@ -696,11 +844,12 @@ impl Shell {
             this.set_check_updates(on, cx);
         })
         .into_any_element();
-        col = col
-            .child(settings_row(&t, tr("Version"), status.note().map(SharedString::from), controls, RowPos::First, main_tokens))
-            .child(settings_row(&t, tr("Check for updates automatically"), None, auto, RowPos::Middle, main_tokens))
-            .child(license);
-        self.settings_frame(layout, col)
+        let rows = vec![
+            SettingRow::new(&t, tr("Version"), status.note().map(SharedString::from), false, Some(controls)),
+            SettingRow::new(&t, tr("Check for updates automatically"), None, false, Some(auto)),
+            license,
+        ];
+        settings_card(&t, &self.settings_words(), tr("About"), rows)
     }
 
     fn server_summary(&self) -> (SharedString, bool) {
@@ -720,7 +869,7 @@ impl Shell {
         (text.into(), !lib.from_env)
     }
 
-    fn render_server_row(&mut self, main_tokens: f32, cx: &mut Context<Self>) -> gpui::Div {
+    fn server_row(&mut self, cx: &mut Context<Self>) -> SettingRow {
         let t = self.theme;
         let (hint, switchable) = self.server_summary();
         let button = |id: &'static str, label: &'static str| settings_button(&t, id, label, switchable);
@@ -733,14 +882,14 @@ impl Shell {
             }))
         });
         let actions = div().flex().flex_row().items_center().flex_none().gap(t.s(10.0)).child(change).child(sign_out).into_any_element();
-        settings_row(&t, tr("Server"), Some(hint), actions, RowPos::First, main_tokens)
+        SettingRow::new(&t, tr("Server"), Some(hint), false, Some(actions))
     }
 
-    /// The Share Links row: how many links, or why sharing is off on the server.
-    fn render_shares_row(&mut self, main_tokens: f32, cx: &mut Context<Self>) -> AnyElement {
+    /// with sharing off on the server, says why.
+    fn shares_row(&mut self, cx: &mut Context<Self>) -> SettingRow {
         let t = self.theme;
         if !self.sharing_on() {
-            return row_shell(&t, RowPos::Last, main_tokens).child(row_text(&t, tr("Share Links"), Some(tr("Sharing is turned off on this server").into()), true)).into_any_element();
+            return SettingRow::new(&t, tr("Share Links"), Some(tr("Sharing is turned off on this server").into()), true, None);
         }
         if self.shares.links.is_none() && self.shares.error.is_none() {
             self.refresh_shares();
@@ -749,16 +898,13 @@ impl Shell {
             Some(n) => trn("{count} link", "{count} links", n).into(),
             None => tr("Links to songs, albums and playlists that anyone can open.").into(),
         };
-        settings_link_row(&t, "shares-link", tr("Share Links"), hint, None, RowPos::Last, main_tokens)
-            .stop(&t)
-            .on_click(cx.listener(|this, _, _, cx| this.navigate(Route::Shares, cx)))
-            .into_any_element()
+        let open: ClickHandler = Box::new(cx.listener(|this, _, _, cx| this.navigate(Route::Shares, cx)));
+        SettingRow::link(&t, "shares-link", tr("Share Links"), hint, None, Some(open))
     }
 
-    fn render_settings_library(&mut self, layout: &Layout, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_library(&mut self, _main_tokens: f32, _window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let t = self.theme;
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
-        let server = self.render_server_row(main_tokens, cx);
+        let server = self.server_row(cx);
         let sync = switch(&t, "library-sync", self.prefs.library_sync, true, cx, |this, cx| {
             this.prefs.library_sync = !this.prefs.library_sync;
             this.prefs.save();
@@ -777,21 +923,18 @@ impl Shell {
             cx.notify();
         })
         .into_any_element();
-        let col = div()
-            .flex()
-            .flex_col()
-            .child(section_title(&t, tr("Library")))
-            .child(server)
-            .child(settings_row(&t, tr("Sync library in the background"), sync_hint, sync, RowPos::Middle, main_tokens))
-            .child(self.render_quality_row_at(tr("Download quality"), tr(DOWNLOAD_QUALITY_HINT).into(), QualitySlot::Download, RowPos::Middle, main_tokens, cx))
-            .child(settings_row(&t, tr("Download on metered connections"), Some(tr("Playlists and albums you keep downloaded wait while your system marks the connection as metered, like a phone hotspot. Turn this on to let them download there too. Downloading something yourself always runs.").into()), metered, RowPos::Middle, main_tokens))
-            .child(self.render_shares_row(main_tokens, cx));
-        self.settings_frame(layout, col)
+        let rows = vec![
+            server,
+            SettingRow::new(&t, tr("Sync library in the background"), sync_hint, false, Some(sync)),
+            self.quality_row(tr("Download quality"), tr(DOWNLOAD_QUALITY_HINT).into(), QualitySlot::Download, cx),
+            SettingRow::new(&t, tr("Download on metered connections"), Some(tr("Playlists and albums you keep downloaded wait while your system marks the connection as metered, like a phone hotspot. Turn this on to let them download there too. Downloading something yourself always runs.").into()), false, Some(metered)),
+            self.shares_row(cx),
+        ];
+        settings_card(&t, &self.settings_words(), tr("Library"), rows)
     }
 
-    fn render_settings_connections(&mut self, layout: &Layout, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_settings_connections(&mut self, _main_tokens: f32, _window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let t = self.theme;
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         let private = switch(&t, "private-mode", self.private_mode, true, cx, |this, cx| {
             let on = !this.private_mode;
             this.set_private_mode(on, cx);
@@ -803,12 +946,9 @@ impl Shell {
             this.apply_sharing(cx);
         })
         .into_any_element();
-        let share_row = if self.private_mode {
-            self.disabled_row(tr("Share what I'm playing"), tr("Paused while Private mode is on."), share, main_tokens)
-        } else {
-            settings_row(&t, tr("Share what I'm playing"), Some(tr(SHARE_HINT).into()), share, RowPos::Middle, main_tokens)
-        };
-        // Let listeners control playback. Only while sharing and not private.
+        let share_hint = if self.private_mode { tr("Paused while Private mode is on.") } else { tr(SHARE_HINT) };
+        let share_row = SettingRow::new(&t, tr("Share what I'm playing"), Some(share_hint.into()), self.private_mode, Some(share));
+        // only while sharing and not private.
         let control_row = (self.prefs.share_listening && !self.private_mode).then(|| {
             let control = switch(&t, "listeners-control", self.prefs.listeners_control, true, cx, |this, cx| {
                 this.prefs.listeners_control = !this.prefs.listeners_control;
@@ -817,7 +957,7 @@ impl Shell {
                 cx.notify();
             })
             .into_any_element();
-            settings_row(&t, tr("Let listeners control playback"), Some(tr(CONTROL_HINT).into()), control, RowPos::Middle, main_tokens)
+            SettingRow::new(&t, tr("Let listeners control playback"), Some(tr(CONTROL_HINT).into()), false, Some(control))
         });
         let discord_forced = crate::core_player::discord_override();
         let discord_on = discord_forced.map_or(self.prefs.discord_status, |_| self.discord_wanted());
@@ -866,7 +1006,7 @@ impl Shell {
             this.publish_integrations(true);
             cx.notify();
         }, cx);
-        let address_row = self.render_discord_address_row(main_tokens, cx);
+        let address_row = self.discord_address_row(cx);
         let scrobble_forced = crate::core_player::scrobble_override();
         let report_on = scrobble_forced.map_or(self.scrobble_setting(), |_| self.reporting_wanted());
         let scrobble = switch(&t, "scrobble", report_on, scrobble_forced.is_none(), cx, |this, cx| {
@@ -878,27 +1018,21 @@ impl Shell {
             None if self.private_mode => tr("Sends plays to the server, which forwards them to whichever services it has set up. Off while Private mode is on.").into(),
             None => tr("Sends plays to the server, which forwards them to whichever services it has set up.").into(),
         };
-        let (count_row, cap_row) = self.render_play_threshold(main_tokens, cx);
-        let col = div()
-            .flex()
-            .flex_col()
-            .child(section_title(&t, tr("Connections")))
-            .child(settings_row(&t, tr("Private Mode"), Some(tr("Plays aren't counted or sent to scrobbling, others on the server can't see what you're playing, and Discord status is hidden.").into()), private, RowPos::First, main_tokens))
-            .child(share_row)
-            .children(control_row)
-            .child(settings_row(&t, tr("Discord status"), Some(discord_hint), discord, RowPos::Middle, main_tokens))
-            .child(settings_row(&t, tr("Discord album art"), None, discord_art, RowPos::Middle, main_tokens))
-            .child(settings_row(&t, tr("Covers from"), Some(tr("If covers show up blank in Discord, choose External sources.").into()), covers_from, RowPos::Middle, main_tokens))
-            .children(address_row)
-            .child(settings_row(&t, tr("Scrobble plays"), Some(scrobble_hint), scrobble, RowPos::Middle, main_tokens))
-            .child(count_row)
-            .child(cap_row);
-        self.settings_frame(layout, col)
+        let (count_row, cap_row) = self.render_play_threshold(cx);
+        let mut rows = vec![SettingRow::new(&t, tr("Private Mode"), Some(tr("Plays aren't counted or sent to scrobbling, others on the server can't see what you're playing, and Discord status is hidden.").into()), false, Some(private)), share_row];
+        rows.extend(control_row);
+        rows.push(SettingRow::new(&t, tr("Discord status"), Some(discord_hint), false, Some(discord)));
+        rows.push(SettingRow::new(&t, tr("Discord album art"), None, false, Some(discord_art)));
+        rows.push(SettingRow::new(&t, tr("Covers from"), Some(tr("If covers show up blank in Discord, choose External sources.").into()), false, Some(covers_from)));
+        rows.extend(address_row);
+        rows.push(SettingRow::new(&t, tr("Scrobble plays"), Some(scrobble_hint), false, Some(scrobble)));
+        rows.push(count_row);
+        rows.push(cap_row);
+        settings_card(&t, &self.settings_words(), tr("Connections"), rows)
     }
 
-    /// "Count a play after" and "Or after 4 minutes", saved with the account in the core. Dimmed with the reason while
-    /// scrobbling is off or Private mode is on. A developer override of scrobbling doesn't dim them.
-    fn render_play_threshold(&mut self, main_tokens: f32, cx: &mut Context<Self>) -> (gpui::Div, gpui::Div) {
+    /// dimmed while scrobbling is off or Private mode is on, not by a developer override.
+    fn render_play_threshold(&mut self, cx: &mut Context<Self>) -> (SettingRow, SettingRow) {
         let t = self.theme;
         let threshold = self.core.as_ref().map(|c| c.lib.reporter.play_threshold());
         let reason: Option<&'static str> = match threshold {
@@ -928,8 +1062,8 @@ impl Shell {
         let count_hint = reason.unwrap_or(tr("Only the time you actually hear counts, and songs under 30 seconds never count."));
         let cap_hint = reason.unwrap_or(tr("Long songs also count once you've heard 4 minutes of them."));
         (
-            row_shell(&t, RowPos::Middle, main_tokens).child(row_text(&t, tr("Count a play after"), Some(count_hint.into()), dim)).child(count_control),
-            row_shell(&t, RowPos::Last, main_tokens).child(row_text(&t, tr("Or after 4 minutes"), Some(cap_hint.into()), dim)).child(cap),
+            SettingRow::new(&t, tr("Count a play after"), Some(count_hint.into()), dim, Some(count_control)),
+            SettingRow::new(&t, tr("Or after 4 minutes"), Some(cap_hint.into()), dim, Some(cap)),
         )
     }
 
@@ -944,17 +1078,15 @@ impl Shell {
 }
 
 impl Shell {
-    /// Settings > Spotify Friends: the friend list, adding one by Discord id, and the Lanyard address. Nothing contacts
-    /// Lanyard until a friend is added.
-    fn render_settings_friends(&mut self, layout: &Layout, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// nothing contacts Lanyard until a friend is added.
+    fn render_settings_friends(&mut self, _main_tokens: f32, _window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
         use navia_core::lanyard::{self as ly, Reach};
         let t = self.theme;
-        let main_tokens = f32::from(layout.main_width) / t.token_scale();
         let about = crate::view_album::text_button_on(&t, "lanyard-about", None, tr("About Lanyard"), true, t.t1().into())
             .stop(&t)
             .on_click(cx.listener(|_, _, _, cx| cx.open_url(ly::PROJECT_URL)))
             .into_any_element();
-        let mut col = div().flex().flex_col().child(section_title(&t, tr("Spotify Friends"))).child(settings_row(&t, tr("Spotify friends"), Some(tr(FRIENDS_HINT).into()), about, RowPos::First, main_tokens));
+        let mut rows = vec![SettingRow::new(&t, tr("Spotify friends"), Some(tr(FRIENDS_HINT).into()), false, Some(about))];
         let saved = self.prefs.spotify_friends.clone();
         for (k, friend) in saved.into_iter().enumerate() {
             let now = self.listen.friends.iter().find(|f| f.friend.id == friend.id).cloned();
@@ -975,7 +1107,7 @@ impl Shell {
                 .stop(&t)
                 .on_click(cx.listener(move |this, _, _, cx| this.remove_friend(&id, cx)))
                 .into_any_element();
-            col = col.child(settings_row(&t, name, Some(status.into()), remove, RowPos::Middle, main_tokens));
+            rows.push(SettingRow::new(&t, name, Some(status.into()), false, Some(remove)));
         }
         // The id, checked as typed, and an optional name.
         let draft = self.listen.draft_id.clone();
@@ -998,12 +1130,12 @@ impl Shell {
             }))
             .into_any_element();
         let controls = div().flex().flex_row().flex_wrap().items_center().justify_end().gap(t.s(8.0)).child(id_field).child(name_field).child(add).into_any_element();
-        col = col.child(settings_row(&t, tr("Add a friend"), Some(add_hint), controls, RowPos::Middle, main_tokens));
+        rows.push(SettingRow::new(&t, tr("Add a friend"), Some(add_hint), false, Some(controls)));
         let address_ok = ly::parse_address(&self.prefs.lanyard_address).is_some();
         let address_hint: SharedString = if address_ok { tr("Lanyard’s public service, or the address of your own.").into() } else { tr("Enter the address as https://lanyard.example.org.").into() };
         let address = self.settings_field(TextTarget::LanyardAddress, "lanyard-address", ly::PUBLIC_ADDRESS, 240.0, cx);
-        col = col.child(settings_row(&t, tr("Lanyard address"), Some(address_hint), address, RowPos::Last, main_tokens));
-        self.settings_frame(layout, col)
+        rows.push(SettingRow::new(&t, tr("Lanyard address"), Some(address_hint), false, Some(address)));
+        settings_card(&t, &self.settings_words(), tr("Spotify Friends"), rows)
     }
 
     /// A text field in a settings row, `width` tokens wide.

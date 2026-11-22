@@ -177,9 +177,8 @@ impl Shell {
             .tooltip(crate::ui::tip(&t, label));
         let tip: SharedString = if on { tr("Stop listening along").into() } else { trf("Listen along with {user}", &[("user", &name)]).into() };
         let id = f.friend.id.clone();
-        let button = icon_button(&t, ("friend-listen", k), "headphones-regular", on)
+        let button = icon_button(&t, ("friend-listen", k), tip, "headphones-regular", on)
             .flex_none()
-            .tooltip(crate::ui::tip(&t, tip))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if this.following_friend_id(&id) {
                     this.stop_listening(false, cx);
@@ -304,9 +303,8 @@ impl Shell {
         if e.can_listen_along() {
             let tip: SharedString = if on { tr("Stop listening along").into() } else { trf("Listen along with {user}", &[("user", &e.user)]).into() };
             let user = e.user.clone();
-            let button = icon_button(&t, ("person-listen", k), "headphones-regular", on)
+            let button = icon_button(&t, ("person-listen", k), tip, "headphones-regular", on)
                 .flex_none()
-                .tooltip(crate::ui::tip(&t, tip))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.following_user(&user) {
                         this.stop_listening(false, cx);
@@ -327,6 +325,25 @@ impl Shell {
         use crate::ui_controls::{DialogButton, dialog_button};
         let t = self.theme;
         let entry = self.listen.listing.iter().find(|e| e.user == user).cloned()?;
+        let close = |this: &mut Shell, cx: &mut Context<Shell>| {
+            this.confirm = None;
+            cx.notify();
+        };
+        // following them back would make two people follow each other
+        if navia_core::listen_along::listens_along(&self.listen.listeners, &user) {
+            let done = dialog_button(&t, "listen-done", DialogButton::Primary, true).child(tr("Done")).stop_top(&t).on_click(cx.listener(move |this, _, _, cx| close(this, cx)));
+            return Some(
+                crate::ui::dialog_scrim(&t, "listen-scrim")
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, _, _, cx| close(this, cx)))
+                    .child(
+                        crate::ui::dialog_panel(&t, "listen-confirm")
+                            .child(crate::ui::dialog_title(&t, trf("{user} is listening along with you", &[("user", &user)])))
+                            .child(crate::ui::dialog_text(&t, trf("{user} already hears what you play, so you’re listening together.", &[("user", &user)])))
+                            .child(crate::ui::dialog_actions(&t).child(done)),
+                    )
+                    .into_any_element(),
+            );
+        }
         let artist = entry.song.artist_line().unwrap_or_default();
         let vars = [("user", user.as_str()), ("song", entry.song.title.as_str()), ("artist", artist.as_str())];
         let what = if entry.state == Some(SessionState::Paused) {
@@ -338,10 +355,6 @@ impl Shell {
         let waits = match own {
             Some(song) => trf("Your queue waits. When you stop, it carries on from “{song}”.", &[("song", &song)]),
             None => tr("Your queue isn’t changed.").to_string(),
-        };
-        let close = |this: &mut Shell, cx: &mut Context<Shell>| {
-            this.confirm = None;
-            cx.notify();
         };
         let cancel = dialog_button(&t, "listen-cancel", DialogButton::Ghost, true).child(tr("Cancel")).stop_top(&t).on_click(cx.listener(move |this, _, _, cx| close(this, cx)));
         let go = dialog_button(&t, "listen-go", DialogButton::Primary, true).child(tr("Listen Along")).stop_top(&t).on_click(cx.listener(move |this, _, _, cx| {

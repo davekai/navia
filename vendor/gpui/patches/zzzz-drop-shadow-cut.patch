@@ -1,0 +1,61 @@
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -1094,7 +1094,7 @@
+     pub color: Hsla,
+     pub element_bounds: Bounds<ScaledPixels>,
+     pub element_corner_radii: Corners<ScaledPixels>,
+-    /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
++    /// 0 = drop shadow (rendered outside `element_bounds`), 1 = inset shadow (rendered inside).
+     pub inset: u32,
+     /// The rounded clip this is masked by: an index into [`Scene::rounded_clips`] plus one, or 0.
+     pub rounded_clip: u32,
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -5028,7 +5028,8 @@
+         let scale_factor = self.scale_factor();
+         let content_mask = self.snapped_content_mask();
+         let opacity = self.element_opacity();
+-        let element_bounds = self.shadow_bounds(bounds);
++        // cut where the element's fill is drawn, so no seam opens between them
++        let element_bounds = self.snap_bounds(bounds);
+         let element_corner_radii = corner_radii.scale(scale_factor);
+         for shadow in shadows {
+             if shadow.inset {
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -966,8 +966,7 @@
+     corner_radii: Corners,
+     content_mask: Bounds,
+     color: Hsla,
+-    // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
+-    // clip so the shadow never escapes the element.
++    // the element's own bounds: an inset shadow stays inside them, a drop shadow outside them.
+     element_bounds: Bounds,
+     element_corner_radii: Corners,
+     // 0 = drop shadow, 1 = inset shadow.
+@@ -1058,6 +1057,11 @@
+         let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                         shadow.element_corner_radii);
+         alpha *= saturate(0.5 - element_distance);
++    } else {
++        // as css draws it: never under the element, which may be translucent glass.
++        let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
++                                        shadow.element_corner_radii);
++        alpha *= saturate(0.5 + element_distance);
+     }
+ 
+     return blend_color(input.color, alpha);
+--- a/crates/gpui_windows/src/shaders.hlsl
++++ b/crates/gpui_windows/src/shaders.hlsl
+@@ -995,6 +995,11 @@
+         float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                           shadow.element_corner_radii);
+         alpha *= saturate(0.5 - element_distance);
++    } else {
++        // as css draws it: never under the element, which may be translucent glass.
++        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
++                                          shadow.element_corner_radii);
++        alpha *= saturate(0.5 + element_distance);
+     }
+ 
+     return input.color * float4(1., 1., 1., alpha);

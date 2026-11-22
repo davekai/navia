@@ -372,27 +372,28 @@ fn collage_cells(count: usize) -> &'static [usize] {
 
 /// A 2x2 grid of covers, or one cover filling the square when there's only one.
 fn collage(tiles: &[RgbaImage], size: u32) -> RgbaImage {
-    let size = size.max(1);
+    collage_fill(tiles, size, size, crop_fill)
+}
+
+/// the collage stretched to `width` by `height`, each cell cropped by `crop` to fill its share.
+fn collage_fill(tiles: &[RgbaImage], width: u32, height: u32, crop: impl Fn(&RgbaImage, u32, u32) -> RgbaImage) -> RgbaImage {
+    let (width, height) = (width.max(1), height.max(1));
     let cells = collage_cells(tiles.len());
-    let mut out = RgbaImage::from_pixel(size, size, Rgba([0x26, 0x26, 0x28, 255]));
+    let mut out = RgbaImage::from_pixel(width, height, Rgba([0x26, 0x26, 0x28, 255]));
     if let [only] = cells {
-        let fill = crop_square(&tiles[*only], size);
+        let fill = crop(&tiles[*only], width, height);
         image::imageops::replace(&mut out, &fill, 0, 0);
         return out;
     }
-    let half = size / 2;
+    let (half_w, half_h) = (width / 2, height / 2);
     for (position, tile) in cells.iter().enumerate() {
         let (column, row) = (position as u32 % 2, position as u32 / 2);
-        let width = if column == 0 { half } else { size - half };
-        let height = if row == 0 { half } else { size - half };
-        let cell = crop_fill(&tiles[*tile], width.max(1), height.max(1));
-        image::imageops::replace(&mut out, &cell, i64::from(column * half), i64::from(row * half));
+        let cell_w = if column == 0 { half_w } else { width - half_w };
+        let cell_h = if row == 0 { half_h } else { height - half_h };
+        let cell = crop(&tiles[*tile], cell_w.max(1), cell_h.max(1));
+        image::imageops::replace(&mut out, &cell, i64::from(column * half_w), i64::from(row * half_h));
     }
     out
-}
-
-fn crop_square(src: &RgbaImage, size: u32) -> RgbaImage {
-    crop_fill(src, size, size)
 }
 
 /// Center-crops `src` to the aspect of `width` by `height` and scales it to fit exactly.
@@ -443,17 +444,57 @@ fn playlist_cover_pixels(library: &dyn Library, id: &str, size: u32) -> Option<C
 /// A cover of albums laid out as a playlist grid, for a mix (`mix:<ids>`). `None` until every
 /// album loads, so the thumbnail cache asks again.
 fn make_album_grid(library: &dyn Library, ids: &str, size: u32) -> Option<Arc<RenderImage>> {
+    album_grid_tiles(library, ids, size).map(|tiles| into_render_image(collage(&tiles, size)))
+}
+
+fn album_grid_tiles(library: &dyn Library, ids: &str, size: u32) -> Option<Vec<RgbaImage>> {
     let ids: Vec<&str> = ids.split('|').filter(|s| !s.is_empty()).collect();
     let cell = (size / 2).max(1);
     let tiles: Vec<RgbaImage> = ids.iter().filter_map(|id| library.album_thumbnail(id, cell)).filter_map(|bytes| image::load_from_memory(&bytes).ok()).map(|i| i.into_rgba8()).collect();
-    (!tiles.is_empty() && tiles.len() == ids.len()).then(|| into_render_image(collage(&tiles, size)))
+    (!tiles.is_empty() && tiles.len() == ids.len()).then_some(tiles)
 }
 
-/// The tint of a playlist's current cover, using the album page rule. `None` for a plain
-/// placeholder. `key` comes from `Shell::playlist_art_key`.
+/// what a bake starts from: a cover, a photo, or a playlist's or mix's grid filling `width` by `height`, its cells cropped like a sheet's cover.
+fn bake_source(library: &dyn Library, id: &str, width: u32, height: u32) -> Option<RgbaImage> {
+    let size = width.max(height);
+    let crop = |tile: &RgbaImage, w: u32, h: u32| cover_crop_at(tile, w, h, crate::theme::size::SHEET_COVER_FOCUS_Y);
+    if let Some(playlist) = id.strip_prefix("pl:") {
+        return match library.playlist_cover(playlist, size) {
+            PlaylistCover::Server(bytes) => image::load_from_memory(&bytes).ok().map(|i| i.into_rgba8()),
+            PlaylistCover::Albums(albums) => {
+                let cell = (size / 2).max(1);
+                let tiles: Vec<RgbaImage> = albums.iter().filter_map(|a| library.album_thumbnail(a, cell)).filter_map(|bytes| image::load_from_memory(&bytes).ok()).map(|i| i.into_rgba8()).collect();
+                (!tiles.is_empty()).then(|| collage_fill(&tiles, width, height, crop))
+            }
+            PlaylistCover::Empty => None,
+        };
+    }
+    if let Some(ids) = id.strip_prefix("mix:") {
+        return album_grid_tiles(library, ids, size).map(|tiles| collage_fill(&tiles, width, height, crop));
+    }
+    if id == LIKED_COVER {
+        return liked_cover_pixels();
+    }
+    library.album_artwork(id).and_then(|bytes| image::load_from_memory(&bytes).ok()).map(|i| i.into_rgba8())
+}
+
+/// the art key of Navia's own Liked Songs cover, served like any thumbnail through the art cache.
+pub const LIKED_COVER: &str = "nv:liked";
+
+/// sized for the page header.
+const LIKED_COVER_BYTES: &[u8] = include_bytes!("../assets/covers/liked-songs-512.webp");
+
+fn liked_cover_pixels() -> Option<RgbaImage> {
+    image::load_from_memory(LIKED_COVER_BYTES).ok().map(|i| i.into_rgba8())
+}
+
+/// the tint of a playlist's current cover, by the album rule; `None` for a placeholder. `key` is from `Shell::playlist_art_key`.
 fn playlist_tint(library: &dyn Library, key: &str) -> Option<Srgb> {
     if let Some(ids) = key.strip_prefix("gtint:") {
         return genre_tint(library, ids);
+    }
+    if key == LIKED_COVER {
+        return liked_cover_pixels().map(|pixels| tint_of(&pixels));
     }
     let id = key.strip_prefix("pl:")?;
     playlist_cover_pixels(library, id, 256).map(|pixels| tint_of(pixels.image()))
@@ -491,7 +532,7 @@ fn make_genre_fan(library: &dyn Library, key: &str, width: u32) -> Option<Arc<Re
     let (w, h) = (width.max(1), ((width as f32 / GENRE_TILE_RATIO).round() as u32).max(1));
     let side = w as f32 * GENRE_FAN_SIZE;
     let px_side = side.ceil().max(1.0) as u32;
-    let covers: Vec<RgbaImage> = ids.iter().filter_map(|id| library.album_thumbnail(id, px_side)).filter_map(|b| image::load_from_memory(&b).ok()).map(|i| crop_square(&i.into_rgba8(), px_side)).collect();
+    let covers: Vec<RgbaImage> = ids.iter().filter_map(|id| library.album_thumbnail(id, px_side)).filter_map(|b| image::load_from_memory(&b).ok()).map(|i| crop_fill(&i.into_rgba8(), px_side, px_side)).collect();
     if covers.is_empty() || covers.len() != ids.len() {
         return None;
     }
@@ -675,7 +716,8 @@ pub enum BakeKind {
 }
 
 pub enum ArtEvent {
-    Thumb { album_id: SharedString, size: u32, image: Option<Arc<RenderImage>> },
+    /// `placeholder`: the server's no-cover placeholder, kept only until it expires.
+    Thumb { album_id: SharedString, size: u32, image: Option<Arc<RenderImage>>, placeholder: bool },
     Dock { album_id: SharedString, bake: Arc<DockBake> },
     Expanded { album_id: SharedString, width: u32, height: u32, image: Arc<RenderImage>, peaks: Arc<PeakGrid> },
     BarGlow { album_id: SharedString, width: u32, height: u32, image: Arc<RenderImage> },
@@ -745,6 +787,16 @@ impl ArtWorkers {
         Arc::new(Self { queue: Arc::new(Queue { jobs: Mutex::new(VecDeque::new()), signal: Condvar::new(), closed: std::sync::atomic::AtomicBool::new(false) }) })
     }
 
+    /// takes over what was asked for meanwhile, since the idle pool has no threads and those jobs would wait forever.
+    pub fn replace_with(&self, library: Arc<dyn Library>, events: UnboundedSender<ArtEvent>) -> Arc<Self> {
+        let pending: Vec<Job> = self.queue.jobs.lock().unwrap().drain(..).collect();
+        self.close();
+        let next = Self::start(library, events);
+        next.queue.jobs.lock().unwrap().extend(pending);
+        next.queue.signal.notify_all();
+        next
+    }
+
     /// Stops the workers and drops what's queued, releasing the library they hold.
     pub fn close(&self) {
         self.queue.closed.store(true, std::sync::atomic::Ordering::Release);
@@ -779,7 +831,9 @@ fn decode(library: &dyn Library, cache: &Mutex<DecodeCache>, album_id: &SharedSt
         rgba
     };
     let img = Arc::new(rgba);
-    cache.lock().unwrap().put(album_id.clone(), img.clone());
+    if !library.artwork_is_placeholder(album_id) {
+        cache.lock().unwrap().put(album_id.clone(), img.clone());
+    }
     Some(img)
 }
 
@@ -800,33 +854,38 @@ fn worker_loop(queue: &Queue, library: Arc<dyn Library>, events: &UnboundedSende
         let event = match job {
             Job::Thumb { album_id, size } if album_id.starts_with("pl:") => {
                 let image = make_playlist_cover(&*library, &album_id[3..], size);
-                ArtEvent::Thumb { album_id, size, image }
+                ArtEvent::Thumb { album_id, size, image, placeholder: false }
+            }
+            Job::Thumb { album_id, size } if album_id == LIKED_COVER => {
+                let image = liked_cover_pixels().map(|pixels| thumbnail(&pixels, size));
+                ArtEvent::Thumb { album_id, size, image, placeholder: false }
             }
             Job::Thumb { album_id, size } if album_id.starts_with("mix:") => {
                 let image = make_album_grid(&*library, &album_id[4..], size);
-                ArtEvent::Thumb { album_id, size, image }
+                ArtEvent::Thumb { album_id, size, image, placeholder: false }
             }
             // A Spotify friend's Discord avatar, from its URL.
             Job::Thumb { album_id, size } if album_id.starts_with(AVATAR_PREFIX) => {
                 let image = navia_core::lanyard::watch::fetch_image(&album_id[AVATAR_PREFIX.len()..]).and_then(|bytes| image::load_from_memory(&bytes).ok()).map(|i| thumbnail(&i.into_rgba8(), size));
-                ArtEvent::Thumb { album_id, size, image }
+                ArtEvent::Thumb { album_id, size, image, placeholder: false }
             }
             // Navia's own artwork, not cover art.
             Job::Thumb { album_id, size } if album_id.starts_with("gfan:") => {
                 let image = make_genre_fan(&*library, &album_id, size);
-                ArtEvent::Thumb { album_id, size, image }
+                ArtEvent::Thumb { album_id, size, image, placeholder: false }
             }
             Job::Bake { kind, id, width, height } => {
-                let image = library.album_artwork(&id).and_then(|bytes| image::load_from_memory(&bytes).ok()).map(|img| match kind {
-                    BakeKind::ArtistArt => bake_artist_art(&img.into_rgba8(), width, height),
-                    BakeKind::CoverFade => bake_cover_fade(&img.into_rgba8(), width, height),
-                    BakeKind::PageGlow => bake_page_glow(&img.into_rgba8(), width, height),
+                let image = bake_source(&*library, &id, width, height).map(|img| match kind {
+                    BakeKind::ArtistArt => bake_artist_art(&img, width, height),
+                    BakeKind::CoverFade => bake_cover_fade(&img, width, height),
+                    BakeKind::PageGlow => bake_page_glow(&img, width, height),
                 });
                 ArtEvent::Bake { kind, id, width, height, image }
             }
             Job::Thumb { album_id, size } => {
                 let image = library.album_thumbnail(&album_id, size).and_then(|bytes| image::load_from_memory(&bytes).ok()).map(|i| thumbnail(&i.into_rgba8(), size));
-                ArtEvent::Thumb { album_id, size, image }
+                let placeholder = library.artwork_is_placeholder(&album_id);
+                ArtEvent::Thumb { album_id, size, image, placeholder }
             }
             Job::Tint { album_id } => {
                 let tint = decode(&*library, cache, &album_id).map(|src| tint_of(&src)).unwrap_or(Srgb::hex(crate::theme::TINT_FALLBACK));
@@ -864,6 +923,11 @@ fn worker_loop(queue: &Queue, library: Arc<dyn Library>, events: &UnboundedSende
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_liked_cover_decodes() {
+        assert_eq!(liked_cover_pixels().map(|p| p.dimensions()), Some((512, 512)));
+    }
+
     use gpui::SharedString;
     use image::{Rgba, RgbaImage};
 

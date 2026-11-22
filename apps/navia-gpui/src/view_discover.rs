@@ -1,5 +1,6 @@
 //! Discover: For You, New, Charts and Radio, as the tabs in the top pill.
 
+use crate::ui::FullTextTip;
 use crate::i18n::tr;
 use gpui::prelude::*;
 use crate::focus::FocusStop;
@@ -75,9 +76,10 @@ impl Shell {
             // A tiny stretched thumbnail stands in for a blurred wash.
             let wash = self.thumb_faded(&album.id, 24);
             let route = Route::Album(album.id.clone());
+            let group = format!("feature-{slot}");
             row = row.child(
                 crate::ui::press_dim(div().id(("feature", slot)))
-                    .group(format!("feature-{slot}"))
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -85,8 +87,8 @@ impl Shell {
                     .line_height(relative(1.3))
                     .stop(&t).on_click(cx.listener(move |this, _, _, cx| this.navigate(route.clone(), cx)))
                     .child(div().text_size(t.text(TEXT_SM)).font_weight(FontWeight::SEMIBOLD).text_color(t.t2()).child(tr("NEW ALBUM")))
-                    .child(div().mt(t.s(4.0)).text_size(t.text(TEXT_FEATURE)).font_weight(FontWeight::MEDIUM).truncate().child(album.name.clone()))
-                    .child(div().mb(t.s(14.0)).text_size(t.text(TEXT_FEATURE)).font_weight(FontWeight::SEMIBOLD).text_color(t.t2()).truncate().child(album.artist.clone()))
+                    .child(div().mt(t.s(4.0)).text_size(t.text(TEXT_FEATURE)).font_weight(FontWeight::MEDIUM).truncate().id("name").child(album.name.clone()).full_text_tip(&t, album.name.clone()))
+                    .child(div().mb(t.s(14.0)).text_size(t.text(TEXT_FEATURE)).font_weight(FontWeight::SEMIBOLD).text_color(t.t2()).truncate().id("artist").child(album.artist.clone()).full_text_tip(&t, album.artist.clone()))
                     .child(
                         div()
                             .relative()
@@ -99,9 +101,10 @@ impl Shell {
                             .justify_center()
                             .when_some(wash, |d, (wash, fade)| d.child(crate::ui::image(wash).absolute().inset_0().size_full().opacity(HERO_GLOW_OPACITY * fade)))
                             .when_some(cover, |d, (cover, fade)| {
-                                d.child(div().relative().rounded(t.s(R_SM)).shadow(vec![crate::ui::shadow_art(&t)]).opacity(fade).group_hover(format!("feature-{slot}"), |s| s.top(-t.s(CARD_LIFT))).child(crate::ui::image(cover).size(t.s(284.0 * 0.8)).rounded(t.s(R_SM))))
+                                d.child(crate::ui::hero_art_frame(&t, R_SM, crate::ui::image(cover).size(t.s(284.0 * 0.8)).rounded(t.s(R_SM))).opacity(fade))
                             }),
-                    ),
+                    )
+                    .child(crate::ui::card_track(&group)),
             );
         }
         row.into_any_element()
@@ -172,9 +175,10 @@ impl Shell {
                 Some(_) => tr("Paused").into(),
                 None => tr("Internet radio").into(),
             };
+            let group = format!("station-{i}");
+            let (hover, ticker) = crate::ui::card_hover(&group, crate::theme::motion::FAST);
             wrap = wrap.child(
                 crate::ui::press_dim(div().id(("station", i)))
-                    .group(format!("station-{i}"))
                     .relative()
                     .flex()
                     .flex_col()
@@ -185,7 +189,7 @@ impl Shell {
                     .rounded(t.s(R_MD))
                     .bg(gpui::linear_gradient(135.0, gpui::linear_color_stop(t.accent.hsla(1.0), 0.0), gpui::linear_color_stop(t.accent.mix(crate::color::Srgb::hex(0), 0.4).hsla(1.0), 1.0)))
                     .stop(&t).on_click(cx.listener(move |this, _, _, cx| this.core_play_or_toggle_station(selected.clone(), cx)))
-                    .child(div().text_size(t.text(TEXT_FEATURE)).font_weight(FontWeight::SEMIBOLD).truncate().child(station.name.clone()))
+                    .child(div().text_size(t.text(TEXT_FEATURE)).font_weight(FontWeight::SEMIBOLD).truncate().id("name").child(station.name.clone()).full_text_tip(&t, station.name.clone()))
                     .child(div().text_color(t.t2()).child(label))
                     .child(
                         div()
@@ -198,10 +202,11 @@ impl Shell {
                             .justify_center()
                             .rounded_full()
                             .bg(t.hover())
-                            .opacity(0.0)
-                            .group_hover(format!("station-{i}"), |s| s.opacity(1.0))
+                            .opacity(hover)
                             .child(icon(&t, "play-fill", 16.0, t.t_on_art())),
-                    ),
+                    )
+                    .child(ticker)
+                    .child(crate::ui::card_track(&group)),
             );
         }
         wrap.into_any_element()

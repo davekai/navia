@@ -33,6 +33,8 @@ pub enum Route {
     Album(SharedString),
     Artists,
     Artist(SharedString),
+    /// the full list of an artist's top songs.
+    ArtistTop(SharedString),
     Playlists,
     Playlist(SharedString),
     Songs,
@@ -43,7 +45,6 @@ pub enum Route {
     Search,
     Settings,
     Downloads,
-    /// Settings > Storage > Cached Songs.
     CachedSongs,
     /// Settings > Library > Share Links.
     Shares,
@@ -52,6 +53,8 @@ pub enum Route {
     SmartEditor(Option<SharedString>),
     /// One of today's For You mixes, by its id.
     Mix(SharedString),
+    /// an upcoming album from Deezer, by Deezer's album id (`navia_core::upcoming`).
+    Upcoming(u64),
 }
 
 pub type BlockFn = Rc<dyn Fn(&mut Shell, &Layout, &mut Window, &mut Context<Shell>) -> AnyElement>;
@@ -95,6 +98,8 @@ pub enum CardItem {
     Mix(u32),
     /// An Artist Radio tile on Home. The seed artist and its neighbors, as indexes into `artists`.
     ArtistStation { seed: u32, neighbours: Rc<Vec<u32>> },
+    /// an upcoming album; `tag` names its state ("Upcoming", "Out now") instead of counting down, in lists it shares with library albums.
+    Upcoming { album: Rc<crate::model::Upcoming>, tag: bool },
 }
 
 pub struct Shelf {
@@ -166,7 +171,15 @@ impl Default for Page {
     }
 }
 
+/// at most this many blocks, a page is still waiting for its content; more arriving fades in (`LAND_FADE`).
+const LAND_WAITING_BLOCKS: usize = 3;
+
 impl Shell {
+    /// the page's content width in tokens, between its gutters.
+    pub fn grid_width(&self, layout: &Layout) -> f32 {
+        f32::from(layout.settled_width) / self.theme.token_scale() - PageMetrics::of(layout).gutter * 2.0
+    }
+
     pub fn page_uses_list(&self) -> bool {
         !matches!(self.route, Route::Songs)
     }
@@ -178,15 +191,23 @@ impl Shell {
 
     /// Rebuilds the blocks when the page's content or its column count could have changed.
     pub fn ensure_page(&mut self, layout: &Layout) {
-        let bucket = (f32::from(layout.main_width) / 8.0) as i32 + (f32::from(layout.viewport.height) / 40.0) as i32 * 1000 + ((self.theme.zoom * 100.0) as i32) * 1_000_000;
+        let bucket = (f32::from(layout.settled_width) / 8.0) as i32 + (f32::from(layout.viewport.height) / 40.0) as i32 * 1000 + ((self.theme.zoom * 100.0) as i32) * 1_000_000;
         let same_route = self.page.route.as_ref() == Some(&self.route);
         if same_route && self.page.data == self.page_data && self.page.width_bucket == bucket {
             return;
         }
         let keep_scroll = same_route;
+        // the top spacer and at most a header and a placeholder: the page was waiting for its content.
+        let before = self.page.blocks.len();
+        let was_waiting = before <= LAND_WAITING_BLOCKS;
         self.page.lists.clear();
         let blocks = self.build_page(layout);
         let count = blocks.len();
+        if !same_route {
+            self.page_land = None;
+        } else if was_waiting && count > before + 1 && !crate::theme::motion::reduced() {
+            self.page_land = Some(std::time::Instant::now());
+        }
         self.page.blocks = Rc::new(blocks);
         self.page.route = Some(self.route.clone());
         self.page.data = self.page_data;
@@ -202,6 +223,7 @@ impl Shell {
 
     fn build_page(&mut self, layout: &Layout) -> Vec<Block> {
         self.shelf_counter = 0;
+        self.page_countdown = false;
         let m = PageMetrics::of(layout);
         let mut blocks = Vec::new();
         // A filter row sits `CHIP_GAP` under the top bar, in place of the content top.
@@ -214,6 +236,7 @@ impl Shell {
             Route::Album(id) => self.build_album(&id, layout),
             Route::Artists => self.build_artists(layout),
             Route::Artist(id) => self.build_artist(&id, layout),
+            Route::ArtistTop(id) => self.build_artist_top(&id, layout),
             Route::Playlists => self.build_playlists(layout),
             Route::Liked => self.build_liked(layout),
             Route::Playlist(id) => self.build_playlist(&id, layout),
@@ -227,6 +250,7 @@ impl Shell {
             Route::Equalizer => self.build_equalizer(layout),
             Route::SmartEditor(id) => self.build_smart_editor(id, layout),
             Route::Mix(id) => self.build_mix(&id, layout),
+            Route::Upcoming(id) => self.build_upcoming(id, layout),
             Route::Songs => Vec::new(),
         };
         blocks.extend(content);
@@ -275,7 +299,7 @@ impl Shell {
     /// Zero for a page embedded in another, such as the Albums split's right side.
     pub fn sidebar_under(&self, layout: &Layout) -> Pixels {
         if crate::ui::has_backdrop_blur() && !layout.embedded && layout.sidebar_visible && !layout.sidebar_overlay && self.page_uses_list() {
-            layout.sidebar_width
+            layout.sidebar_width * layout.sidebar_shown
         } else {
             px(0.0)
         }
@@ -328,7 +352,8 @@ impl Shell {
         // Always wrap in a plain block. A list item's root is sized to its content, so a flex row with
         // something pushed right only spans the page inside one.
         let keep_clear = |el: AnyElement| div().pl(under).child(el).into_any_element();
-        match block {
+        let landing = self.land_opacity(ix);
+        let el = match block {
             Block::Spacer(h) => div().h(t.s(h)).into_any_element(),
             Block::View(render) => keep_clear(render(self, &layout, window, cx)),
             Block::Shelf(shelf) => self.render_shelf(&shelf, &layout, cx),
@@ -340,7 +365,40 @@ impl Shell {
                 keep_clear(if self.row_dragging() { div().child(row).into_any_element() } else { row })
             }
             Block::Mini { list, pos, columns } => keep_clear(self.render_mini_pair(list, pos, columns, &layout, cx)),
+        };
+        match landing {
+            Some(opacity) => div().opacity(opacity).child(el).into_any_element(),
+            None => el,
         }
+    }
+
+    /// how far block `ix` has faded in while late content lands: each a `LAND_STAGGER` after the one before (the top
+    /// spacer is block 0), those past `LAND_STAGGER_MAX` together; None once in.
+    fn land_opacity(&self, ix: usize) -> Option<f32> {
+        use crate::theme::motion;
+        let since = self.page_land?;
+        let slow = crate::testing::slow_motion();
+        let delay = ix.saturating_sub(1).min(motion::LAND_STAGGER_MAX) as f32 * motion::LAND_STAGGER * slow;
+        let p = motion::progress(since.elapsed().as_secs_f32() - delay, motion::LAND_FADE * slow);
+        (p < 1.0).then(|| motion::cubic_bezier(motion::EASE, p.max(0.0)))
+    }
+
+    /// frames while landing blocks fade in; a child of the main column.
+    pub fn land_ticker(&self) -> Option<AnyElement> {
+        use crate::theme::motion;
+        let since = self.page_land?;
+        let slow = crate::testing::slow_motion();
+        let end = since + std::time::Duration::from_secs_f32((motion::LAND_STAGGER * motion::LAND_STAGGER_MAX as f32 + motion::LAND_FADE) * slow);
+        (std::time::Instant::now() < end).then(|| {
+            gpui::canvas(|_, _, _| {}, move |_, _, window, _| {
+                if std::time::Instant::now() < end {
+                    crate::animation::request_frame(window);
+                }
+            })
+            .absolute()
+            .size_0()
+            .into_any_element()
+        })
     }
 
     /// The song list for a page row, after confirming the row still exists.
@@ -363,7 +421,8 @@ impl Shell {
     }
 }
 
-/// How many cards of `card` tokens fit across `width` tokens with `gap` between them.
-pub fn grid_columns(width: f32, card: f32, gap: f32) -> usize {
-    (((width + gap) / (card + gap)).floor() as usize).max(1)
+/// as many columns at least `cell` wide as fit `width` with `gap` between, and the width each stretches to.
+pub fn grid_fit(width: f32, cell: f32, gap: f32) -> (usize, f32) {
+    let columns = (((width + gap) / (cell + gap)).floor() as usize).max(1);
+    (columns, (width - gap * (columns - 1) as f32) / columns as f32)
 }

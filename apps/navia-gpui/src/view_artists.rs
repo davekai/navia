@@ -8,7 +8,7 @@ use crate::focus::FocusStop;
 use std::rc::Rc;
 
 use crate::i18n::{tr, trf, trn};
-use crate::pages::{Block, CardItem, PageMetrics, grid_columns};
+use crate::pages::{Block, CardItem, PageMetrics, grid_fit};
 use crate::shell::{Layout, Shell};
 use crate::theme::size::{CHIP_GAP, CHIP_H, CONTENT_TOP, FILTER_ROW_GAP, SPLIT_ART, TOPBAR_H};
 use crate::view_cards::{ArtShape, song_count};
@@ -134,8 +134,7 @@ impl Shell {
             blocks.push(self.build_artists_split(shown, above, layout));
             return blocks;
         }
-        let width = f32::from(layout.main_width) / self.theme.token_scale() - m.gutter * 2.0;
-        let columns = grid_columns(width, m.grid_card, m.card_gap);
+        let (columns, _) = grid_fit(self.grid_width(layout), m.grid_card, m.card_gap);
         let items: Vec<CardItem> = shown.into_iter().map(CardItem::Artist).collect();
         blocks.extend(grid_blocks(items, columns));
         blocks

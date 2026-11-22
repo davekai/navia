@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::core_library::Connection;
 
-/// The keyring's service name. The entry's name is `user@url`.
+/// the entry's name is `user@url`.
 const SERVICE: &str = "navia";
 pub const NO_KEYRING: &str = n_("No system keyring was found, so Navia can't remember your password.");
 
@@ -22,7 +22,7 @@ pub struct SavedAccount {
     pub user: String,
 }
 
-/// What to show on the sign-in screen instead of starting the app.
+/// shown instead of starting the app.
 #[derive(Clone, Debug, Default)]
 pub struct SignInPrompt {
     pub account: Option<SavedAccount>,
@@ -68,7 +68,6 @@ fn write_private(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
     }
 }
 
-/// The result of asking for a saved password.
 pub enum SecretRead {
     Found(String),
     Missing,
@@ -101,7 +100,6 @@ fn read_test_file(path: &std::path::Path) -> Value {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| json!({}))
 }
 
-/// The saved password for this account.
 pub fn read_secret(url: &str, user: &str) -> SecretRead {
     let name = entry_name(url, user);
     match test_mode() {
@@ -121,7 +119,7 @@ pub fn read_secret(url: &str, user: &str) -> SecretRead {
     }
 }
 
-/// Saves the password. An error means it couldn't be saved, and the text says why.
+/// the error text says why it couldn't be saved.
 pub fn write_secret(url: &str, user: &str, password: &str) -> Result<(), String> {
     let name = entry_name(url, user);
     match test_mode() {
@@ -139,7 +137,7 @@ pub fn write_secret(url: &str, user: &str, password: &str) -> Result<(), String>
     })
 }
 
-/// Forgets the password for this account. Quietly does nothing if there isn't one.
+/// does nothing if there isn't one.
 pub fn forget_secret(url: &str, user: &str) {
     let name = entry_name(url, user);
     match test_mode() {
@@ -182,7 +180,6 @@ pub fn resolve() -> Result<Connection, SignInPrompt> {
     }
 }
 
-/// The per-account folder key for a login.
 pub fn account_key(url: &str, user: &str) -> String {
     Credentials::new(user, "").account_key(url)
 }

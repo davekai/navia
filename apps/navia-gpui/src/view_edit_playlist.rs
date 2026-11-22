@@ -12,6 +12,7 @@ use crate::focus::FocusStop;
 use crate::shell::Shell;
 use crate::theme::size::*;
 use crate::ui_controls::{DialogButton, TextTarget, dialog_button, switch};
+use crate::view_new_playlist::CoverRow;
 
 pub struct EditPlaylist {
     pub id: SharedString,
@@ -22,6 +23,8 @@ pub struct EditPlaylist {
     original: (String, String, bool),
     pub saving: bool,
     pub error: Option<SharedString>,
+    /// the cover row, starting on the cover as it is. `None` where the image can't be changed.
+    pub covers: Option<CoverRow>,
 }
 
 /// Public toggles sent but not answered yet, with the value to revert to if the server refuses.
@@ -32,14 +35,16 @@ impl Shell {
     pub fn open_edit_playlist(&mut self, id: SharedString, cx: &mut Context<Self>) {
         let Some(p) = self.playlists_full.iter().find(|p| p.id == id) else { return };
         let (name, description, public) = (p.name.to_string(), p.description.to_string(), p.public);
-        self.edit_playlist = Some(EditPlaylist { id, name: name.clone(), description: description.clone(), public, original: (name, description, public), saving: false, error: None });
+        let covers = self.core.as_ref().is_some_and(|core| core.lib.can_change_playlist_images()).then(|| CoverRow::new(Some(self.playlist_art_key(&id))));
+        self.edit_playlist = Some(EditPlaylist { id, name: name.clone(), description: description.clone(), public, original: (name, description, public), saving: false, error: None, covers });
         self.focus_field(TextTarget::PlaylistName, cx);
         cx.notify();
     }
 
     pub fn close_edit_playlist(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.edit_playlist.take().is_none() {
-            return false;
+        let Some(dialog) = self.edit_playlist.take() else { return false };
+        if let Some(row) = dialog.covers {
+            self.lyrics_view.garbage.extend(row.images());
         }
         self.controls.text = None;
         cx.notify();
@@ -73,18 +78,31 @@ impl Shell {
             comment: (description != d.original.1).then_some(description),
             public: (d.public != d.original.2).then_some(d.public),
         };
-        if details == navia_core::client::PlaylistDetails::default() {
+        // the image changes only when another cover than the one it has was chosen.
+        let cover = d.covers.as_ref().and_then(|row| row.pick());
+        let unchanged = details == navia_core::client::PlaylistDetails::default();
+        if unchanged && cover.is_none() {
             self.close_edit_playlist(cx);
             return;
         }
-        let Some(core) = self.core.as_ref() else {
+        let Some(lib) = self.core.as_ref().map(|core| core.lib.clone()) else {
             d.error = Some(tr("Editing a playlist needs the server.").into());
             cx.notify();
             return;
         };
-        d.saving = true;
-        d.error = None;
-        core.lib.update_playlist_details(d.id.to_string(), details);
+        let id = d.id.to_string();
+        if !unchanged {
+            d.saving = true;
+            d.error = None;
+            lib.update_playlist_details(id.clone(), details);
+        }
+        if let Some(pick) = cover {
+            let title = d.name.trim().to_string();
+            self.upload_cover_pick(&id, &title, pick, false);
+        }
+        if unchanged {
+            self.close_edit_playlist(cx);
+        }
         cx.notify();
     }
 
@@ -140,6 +158,7 @@ impl Shell {
 
     pub fn render_edit_playlist(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = self.theme;
+        let cover_row = if self.edit_playlist.is_some() { self.render_cover_row(cx) } else { None };
         let d = self.edit_playlist.as_ref()?;
         let (name, description, public, saving, error) = (d.name.clone(), d.description.clone(), d.public, d.saving, d.error.clone());
         let empty = name.trim().is_empty();
@@ -169,6 +188,7 @@ impl Shell {
                 .child(
                     crate::ui::dialog_panel(&t, "edit-playlist")
                         .child(crate::ui::dialog_title(&t, tr("Edit Details")))
+                        .children(cover_row)
                         .child(crate::ui::dialog_block(&t, tr("Name"), name_field))
                         .child(crate::ui::dialog_block(&t, tr("Description"), description_field))
                         .child(crate::ui::dialog_switch(&t, tr("Public"), tr("Other people on this server can see it."), toggle))

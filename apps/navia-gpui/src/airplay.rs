@@ -54,7 +54,7 @@ pub fn start(lib: &Arc<CoreLibrary>, events: UnboundedSender<CoreEvent>) -> Opti
 }
 
 impl Shell {
-    /// AirPlay receivers on the network, for the Output menu.
+    /// for the Output menu.
     pub fn airplay_outputs(&self) -> Vec<AirPlayOutput> {
         self.core.as_ref().and_then(|c| c.airplay.as_ref()).map(|a| a.outputs()).unwrap_or_default()
     }
@@ -69,7 +69,6 @@ impl Shell {
         .detach();
     }
 
-    /// Finish pairing with the PIN the listener typed.
     pub fn airplay_pair_finish(&mut self, id: String, pin: String, cx: &mut Context<Self>, done: impl FnOnce(&mut Self, Result<(), String>, &mut Context<Self>) + 'static) {
         let Some(ap) = self.core.as_ref().and_then(|c| c.airplay.clone()) else { return };
         cx.spawn(async move |this, cx| {
@@ -79,7 +78,6 @@ impl Shell {
         .detach();
     }
 
-    /// Forget a receiver's pairing.
     pub fn airplay_forget(&mut self, id: &str) {
         if let Some(ap) = self.core.as_ref().and_then(|c| c.airplay.as_ref()) {
             let _ = ap.forget(id);

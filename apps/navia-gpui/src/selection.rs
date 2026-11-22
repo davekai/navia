@@ -1,11 +1,11 @@
-//! Which song rows are selected. Rows are held by song, so a selection survives sorting and search.
+//! held by song, so a selection survives sorting and search.
 
 use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct Selection {
     songs: HashSet<u32>,
-    /// Where a Shift range starts: the last row clicked without Shift.
+    /// the last row clicked without Shift.
     anchor: Option<u32>,
 }
 
@@ -52,7 +52,7 @@ impl Selection {
         }
     }
 
-    /// The first selected row in the current order.
+    /// in the current order.
     pub fn first_in(&self, order: &[u32]) -> Option<usize> {
         order.iter().position(|s| self.songs.contains(s))
     }

@@ -27,14 +27,13 @@ pub enum Field {
     Form,
 }
 
-/// The result of a check.
 #[derive(Clone, Debug)]
 pub enum Outcome {
     /// `test` is true for Test, false for Sign In.
     Checking { test: bool },
     /// The server answered and the login worked. `line` is "<server> · <API>".
     Connected { line: SharedString },
-    /// A server answered, with no login to check.
+    /// with no login to check.
     Found { line: SharedString },
     Problem { field: Field, title: SharedString, detail: SharedString },
     /// Why this screen is up, when that isn't an error.
@@ -50,9 +49,9 @@ pub struct ConnectState {
     pub from_settings: bool,
     /// The saved login was refused. Cancel then reads Browse Offline.
     pub rejected: bool,
-    /// The one-time Deezer step after the first sign-in, with the library already open behind it.
+    /// with the library already open behind it.
     pub deezer_step: bool,
-    /// "<server> · <API>" once a check found the server, until the address changes.
+    /// until the address changes.
     pub server_line: Option<SharedString>,
     generation: u64,
     busy: bool,
@@ -72,7 +71,6 @@ impl ConnectState {
     }
 }
 
-/// What a confirmation dialog is about.
 #[derive(Clone)]
 pub enum Confirm {
     SignOut { host: SharedString },
@@ -92,6 +90,8 @@ pub enum Confirm {
     ListenAlongFriend { id: String },
     /// Deleting a share link. `title` is what it shares.
     DeleteShare { id: String, title: SharedString },
+    /// `removed` downloaded songs leave the device with it.
+    DeletePlaylist { id: SharedString, name: SharedString, removed: usize },
 }
 
 fn describe(result: Probe) -> Outcome {
@@ -194,7 +194,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// True when a field shows dots instead of its text.
     pub fn field_masked(&self, target: &TextTarget) -> bool {
         *target == TextTarget::ConnectPassword && self.connect.as_ref().is_some_and(|c| !c.reveal)
     }
@@ -251,7 +250,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Replaces the current account, if any, with the checked login.
+    /// replaces the current account, if any.
     fn finish_connect(&mut self, address: String, user: String, password: String, cx: &mut Context<Self>) {
         let Some(url) = parse_address(&address).map(|a| a.url) else { return };
         let user = user.trim().to_string();
@@ -364,7 +363,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The spinner in Test and Sign In while a check runs.
     fn connect_spinner(&self, size: f32, color: gpui::Hsla) -> AnyElement {
         crate::ui::spinner(&self.theme, "connect-spin", size, color)
     }
@@ -399,7 +397,7 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(t.s(CONNECT_GAP))
-            .child(self.connect_heading(tr("Use Deezer for recommendations?").into(), tr("Better Autoplay and Artist Radio, with suggestions from Deezer added to the server\u{2019}s.").into()))
+            .child(self.connect_heading(tr("Use Deezer for recommendations?").into(), tr("Better Autoplay and Artist Radio, with suggestions from Deezer and ListenBrainz added to the server\u{2019}s, and a Heat column showing each album\u{2019}s most popular songs.").into()))
             .child(
                 div()
                     .flex()
@@ -409,14 +407,13 @@ impl Shell {
                     .rounded(t.s(R_MD))
                     .bg(gpui::rgba(crate::theme::STATUS_FILL))
                     .line_height(relative(1.35))
-                    .child(fact("paper-plane-tilt-regular", "Sends artist and song names to Deezer from this computer."))
+                    .child(fact("paper-plane-tilt-regular", "Sends artist and song names to Deezer and ListenBrainz from this computer."))
                     .child(fact("key-regular", "No Deezer account needed. Your login is never sent.")),
             )
             .child(div().text_size(t.text(TEXT_SM)).text_color(t.t3()).line_height(relative(1.4)).child(tr("You can change this any time in Settings > Playback.")))
             .child(div().flex().flex_row().gap(t.s(DIALOG_ACTIONS_GAP)).mt(t.s(DIALOG_ACTIONS_TOP)).child(not_now).child(turn_on))
     }
 
-    /// The whole screen.
     pub fn render_connect(&mut self, _layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let Some(state) = self.connect.as_ref() else { return div().into_any_element() };
@@ -449,6 +446,7 @@ impl Shell {
                 .when(test_enabled, |d| d.stop(&t).on_click(cx.listener(|this, _, _, cx| this.connect_test(cx))))
                 .into_any_element();
             let reveal = crate::ui::field_action(&t, "connect-reveal", true)
+                .tooltip(crate::ui::tip(&t, if reveal_on { tr("Hide password") } else { tr("Show password") }))
                 .occlude()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(icon(&t, if reveal_on { "eye-slash-regular" } else { "eye-regular" }, 18.0, crate::ui::ink("connect-reveal").color(gpui::Hsla::from(t.t2()), t.hover_ink())))
@@ -545,7 +543,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The confirmation dialog on top, when there is one.
     pub fn render_confirm(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = self.theme;
         let confirm = self.confirm.as_ref()?;
@@ -561,29 +558,34 @@ impl Shell {
         if let Confirm::ListenAlongFriend { id } = confirm.clone() {
             return self.render_friend_confirm(id, cx);
         }
-        let (title, body, action): (&'static str, String, &'static str) = match confirm {
-            Confirm::SignOut { host } => (tr("Sign out?"), trf("You'll need to sign in to {host} again. Your downloads stay on this device.", &[("host", host)]), tr("Sign Out")),
+        let (title, body, action): (SharedString, String, &'static str) = match confirm {
+            Confirm::SignOut { host } => (tr("Sign out?").into(), trf("You'll need to sign in to {host} again. Your downloads stay on this device.", &[("host", host)]), tr("Sign Out")),
             Confirm::ClearDownloads { count, total, collections } => {
                 let mut body = trnf("{count} song and {size} will be removed from this device. Nothing changes on the server.", "{count} songs and {size} will be removed from this device. Nothing changes on the server.", *count, &[("size", &format_size(*total))]);
                 if *collections > 0 {
                     body.push(' ');
                     body.push_str(&trn("{count} playlist or album stops downloading.", "{count} playlists and albums stop downloading.", *collections));
                 }
-                (tr("Clear all downloads?"), body, tr("Clear All"))
+                (tr("Clear all downloads?").into(), body, tr("Clear All"))
             }
             Confirm::StopDownload { .. } | Confirm::Duplicates { .. } | Confirm::ListenAlong { .. } | Confirm::ListenAlongFriend { .. } => return None,
-            Confirm::DeleteShare { title, .. } => (tr("Delete this link?"), trf("The link to \u{201c}{title}\u{201d} stops working for everyone who has it.", &[("title", title)]), tr("Delete")),
+            Confirm::DeletePlaylist { name, removed, .. } => {
+                let (title, body) = Shell::delete_playlist_text(name, *removed);
+                (title.into(), body, tr("Delete"))
+            }
+            Confirm::DeleteShare { title, .. } => (tr("Delete this link?").into(), trf("The link to \u{201c}{title}\u{201d} stops working for everyone who has it.", &[("title", title)]), tr("Delete")),
             Confirm::ClearSongCache { count, total } => (
-                tr("Clear cached songs?"),
+                tr("Clear cached songs?").into(),
                 trnf("{count} song and {size} will be removed from this device. Downloads stay, and the song streams from the server the next time it plays.", "{count} songs and {size} will be removed from this device. Downloads stay, and the songs stream from the server the next time they play.", *count, &[("size", &format_size(*total))]),
                 tr("Clear Cache"),
             ),
-            Confirm::ClearCache => (tr("Clear the cache?"), tr("Cached songs, artwork and lyrics are removed from this device. Downloads and your library stay, and anything removed comes from the server again when it's needed.").to_string(), tr("Clear Cache")),
+            Confirm::ClearCache => (tr("Clear the cache?").into(), tr("Cached songs, artwork and lyrics are removed from this device. Downloads and your library stay, and anything removed comes from the server again when it's needed.").to_string(), tr("Clear Cache")),
         };
         let clear_cache = matches!(confirm, Confirm::ClearCache);
         let clear_songs = matches!(confirm, Confirm::ClearSongCache { .. });
         let sign_out = matches!(confirm, Confirm::SignOut { .. });
         let delete_share = if let Confirm::DeleteShare { id, .. } = confirm { Some(id.clone()) } else { None };
+        let delete_playlist = if let Confirm::DeletePlaylist { id, .. } = confirm { Some(id.clone()) } else { None };
         let cancel = dialog_button(&t, "confirm-cancel", DialogButton::Ghost, true)
             .child(tr("Cancel"))
             .stop_top(&t)
@@ -597,6 +599,8 @@ impl Shell {
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(id) = delete_share.clone() {
                     this.delete_share(id, cx);
+                } else if let Some(id) = delete_playlist.clone() {
+                    this.delete_playlist(id, cx);
                 } else if clear_songs {
                     this.confirm = None;
                     this.clear_song_cache(cx);

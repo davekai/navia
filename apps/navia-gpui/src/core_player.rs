@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 
 use crate::core_library::CoreLibrary;
 use crate::persist::DiscordArt;
-use crate::model::Song;
+use crate::model::{Library as _, Song};
 use crate::shell::Shell;
 
 /// `song_ix` for something with no library row, such as a station or a followed song this library lacks.
@@ -53,6 +53,8 @@ pub enum CoreEvent {
     SyncProgress,
     SyncFailed,
     SyncDone,
+    /// a page's refresh ended.
+    Refreshed,
     Rows { rows: Vec<(u32, Song)>, requested: Vec<u32> },
     Order { generation: u64, order: Vec<u32>, total: Option<usize> },
     /// What the Songs filters know about every song, reread after the library changes.
@@ -93,8 +95,8 @@ pub enum CoreEvent {
     PlaylistOrderSaved { id: String, result: Result<(), navia_core::library::sync::PlaylistEditError> },
     /// A playlist's name, description or Public setting was saved, or the reason it wasn't.
     PlaylistDetailsSaved { id: String, result: Result<(), String> },
-    /// Songs were added to or removed from a playlist, or why not. The stored copy is current either
-    /// way. `toast` replaces the usual message on success.
+    PlaylistDeleted { id: String, result: Result<(), String> },
+    /// songs were added or removed, or weren't and why; the stored copy is current either way. `toast` replaces the success message.
     PlaylistSongsChanged { id: String, name: String, added: bool, toast: Option<String>, result: Result<(), navia_core::library::sync::PlaylistEditError> },
     TrackExtras(TrackExtras),
     /// What Autoplay offers now, or with `fetched`, that new answers arrived.
@@ -568,7 +570,8 @@ impl Shell {
             }
         };
         player.set_album_lookup(navia_core::audio::player::library_album_lookup(lib.db.clone()));
-        // The song's name on the sound server's stream, as shown in mixers.
+        player.set_edge_store(navia_core::audio::player::library_edge_store(lib.db.clone()));
+        // The song's name on the sound server's stream (the desktop's mixer, Discord's app audio).
         player.set_title_lookup(navia_core::audio::player::library_title_lookup(lib.db.clone()));
         player.set_volume(volume_gain(self.prefs.volume));
         player.set_muted(self.prefs.muted);
@@ -651,6 +654,9 @@ impl Shell {
         self.core_refresh_downloaded(cx);
         self.private_mode = self.prefs.private_mode;
         self.apply_reporting();
+        // before the background starts, so a launch with the switch on never tries the server
+        self.offline_switch = self.prefs.offline_accounts.contains(&lib.account_key());
+        lib.set_offline(self.offline_switch);
         lib.set_background_sync(self.prefs.library_sync);
         self.refresh_downloads(cx);
         self.refresh_synced(cx);
@@ -953,6 +959,7 @@ impl Shell {
                     self.rebuild_order();
                 }
             }
+            CoreEvent::Refreshed => cx.notify(),
             CoreEvent::SyncDone => {
                 if let Some(core) = self.core.as_mut() {
                     core.rows.clear();
@@ -1098,11 +1105,15 @@ impl Shell {
             CoreEvent::ShareSaved(result) => self.on_share_saved(result, cx),
             CoreEvent::ShareDeleted(result) => self.on_share_deleted(result, cx),
             CoreEvent::PlaylistImageChanged { id, removed } => self.on_playlist_image_changed(id, removed, cx),
-            CoreEvent::PlaylistImageFailed { message } => self.show_toast(message, cx),
+            CoreEvent::PlaylistImageFailed { message } => {
+                self.take_cover_upload(None);
+                self.show_toast(message, cx)
+            }
             CoreEvent::SmartSaved { id, name, created } => self.on_smart_saved(id, name, created, cx),
             CoreEvent::SmartSaveFailed { message } => self.on_smart_save_failed(message, cx),
             CoreEvent::PlaylistOrderSaved { id, result } => self.on_playlist_order_saved(id, result, cx),
             CoreEvent::PlaylistDetailsSaved { id, result } => self.on_playlist_details_saved(id, result, cx),
+            CoreEvent::PlaylistDeleted { id, result } => self.on_playlist_deleted(id, result, cx),
             CoreEvent::AirPlayChanged => self.on_airplay_changed(cx),
             CoreEvent::RemoteReady => {
                 self.top_song_cache.clear();
@@ -1276,6 +1287,7 @@ impl Shell {
                 PlayerEvent::QueueEnded => {
                     self.player.playing = false;
                     self.player.status = PlayerStatus::Stopped;
+                    self.session_followed_ended(cx);
                     self.check_listening(cx);
                     cx.notify();
                     return;
@@ -1309,6 +1321,7 @@ impl Shell {
                     }
                 }
                 let heard = self.player.queue.get(self.player.queue_pos).copied();
+                self.session_track_changed();
                 self.autoplay_update(heard, cx);
                 self.request_tint(cx);
                 self.fetch_track_extras(cx);
@@ -1317,6 +1330,7 @@ impl Shell {
                 cx.notify();
             }
             PlayerEvent::StatusChanged(status) => {
+                self.note_started(status);
                 self.player.status = status;
                 self.player.playing = matches!(status, PlayerStatus::Playing | PlayerStatus::Buffering);
                 self.publish_integrations(true);
@@ -1379,11 +1393,24 @@ impl Shell {
                 self.publish_integrations(true);
                 cx.notify();
             }
-            PlayerEvent::QueueChanged | PlayerEvent::OutputChanged { .. } | PlayerEvent::Heard { .. } | PlayerEvent::PlayEnded { .. } => {}
+            PlayerEvent::OutputChanged { device_rate, .. } => {
+                if self.player.device_rate != device_rate {
+                    self.player.device_rate = device_rate;
+                    if self.quality_pop_open() {
+                        cx.notify();
+                    }
+                }
+            }
+            PlayerEvent::QueueChanged | PlayerEvent::Heard { .. } | PlayerEvent::PlayEnded { .. } => {}
             PlayerEvent::QueueEnded => {
                 self.player.playing = false;
                 self.player.status = PlayerStatus::Stopped;
-                // Autoplay may still be finding its songs and continues once they're here.
+                // ended for a listening session's hand-over, not because the queue ran out
+                if self.session_queue_ended(cx) {
+                    cx.notify();
+                    return;
+                }
+                // Autoplay may still be finding its songs; it carries on once they're here.
                 self.autoplay_update(None, cx);
                 self.publish_integrations(true);
                 cx.notify();
@@ -1707,7 +1734,7 @@ impl Shell {
             self.show_toast(tr(NEEDS_SERVER), cx);
             return;
         }
-        // Like Spotify, jumping to a song further down Next in Queue drops the queued songs above it,
+        // Jumping to a song further down Next in Queue drops the queued songs above it,
         // and jumping within Next from keeps them next.
         let Some(core) = self.core.as_mut() else { return };
         let edits = core.pq.jump(queue_ix);
@@ -1793,6 +1820,28 @@ impl Shell {
         core.player.retry_now();
         core.lib.retry_connection();
         self.show_toast(tr("Trying the server"), cx);
+    }
+
+    /// the account menu's Offline switch: on, nothing goes to the server and only what's on this
+    /// device plays; off, it reconnects at once the way Retry does. kept per account.
+    pub fn set_offline_switch(&mut self, on: bool, cx: &mut Context<Self>) {
+        let Some(core) = self.core.as_ref() else { return };
+        let key = core.lib.account_key();
+        self.offline_switch = on;
+        if on {
+            self.prefs.offline_accounts.insert(key);
+        } else {
+            self.prefs.offline_accounts.remove(&key);
+        }
+        self.prefs.save();
+        core.lib.set_offline(on);
+        if on {
+            self.refresh_storage(cx);
+        } else {
+            core.player.retry_now();
+        }
+        self.apply_sharing(cx);
+        cx.notify();
     }
 
     fn fetch_track_extras(&mut self, cx: &mut Context<Self>) {
@@ -2095,7 +2144,11 @@ impl Shell {
                 let on = !self.private_mode;
                 self.set_private_mode(on, cx);
             }
-            // Song radio from the current song, for tests that allow one external lookup.
+            "offline" => {
+                let on = !self.offline_switch;
+                self.set_offline_switch(on, cx);
+            }
+            // Song radio from the song playing now, for tests that allow one external lookup.
             "song_radio" => {
                 if let Some(song_ix) = self.player.song_ix.filter(|&i| i != LIVE_ROW) {
                     self.start_song_radio(song_ix as u32, cx);

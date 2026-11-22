@@ -1,5 +1,6 @@
 //! The queue, virtualized. Used by the dock and the expanded player.
 
+use crate::ui::FullTextTip;
 use crate::i18n::tr;
 use gpui::prelude::*;
 use crate::focus::FocusStop;
@@ -72,8 +73,9 @@ impl Shell {
         let finding = if auto_heading && state == navia_core::autoplay::AutoplayState::Finding { QUEUE_FINDING_ROWS } else { 0 };
         let follows = auto_heading && state != navia_core::autoplay::AutoplayState::Repeat;
         let mut i = if current { 2 } else { 0 };
-        let queued_heading = (run > 0).then_some(i);
-        if run > 0 {
+        // in a listening session Next in Queue is the session's, shown even while empty
+        let queued_heading = (run > 0 || self.session_on()).then_some(i);
+        if queued_heading.is_some() {
             i += 1 + run;
         }
         let rest = up_next - run;
@@ -97,10 +99,13 @@ impl Shell {
         self.queue_sections().item(pos)
     }
 
-    /// The playing song gets its own row above Up Next, except during a station.
+    /// except during a station. while following in a listening session, their song.
     fn queue_current(&self) -> Option<u32> {
         if self.player.station.is_some() {
             return None;
+        }
+        if let Some(f) = self.listen.following.as_ref() {
+            return f.rowid.filter(|_| self.session_on());
         }
         let (queue, first) = self.upcoming_queue();
         first.checked_sub(1).and_then(|i| queue.get(i).copied()).filter(|s| self.player.song_ix == Some(*s as usize))
@@ -113,6 +118,7 @@ impl Shell {
             Route::Album(id) => self.albums.iter().find(|a| &a.id == id).and_then(|a| named(a.name.clone(), SourceLink::Album(id.to_string()))),
             Route::Playlist(id) => self.playlists.iter().find(|p| &p.id == id).and_then(|p| named(p.name.clone(), SourceLink::Playlist(id.to_string()))),
             Route::Artist(id) => self.artists.iter().find(|a| &a.id == id).and_then(|a| named(a.name.clone(), SourceLink::Artist(id.to_string()))),
+            Route::ArtistTop(id) => self.artists.iter().find(|a| &a.id == id).and_then(|a| named(trf("{artist} Top Songs", &[("artist", &a.name)]).into(), SourceLink::ArtistTop(id.to_string()))),
             Route::Mix(id) => self.for_you.mixes.iter().find(|m| &m.id == id).and_then(|m| named(crate::view_for_you::mix_title(m), SourceLink::Mix(id.to_string()))),
             Route::Liked => named(tr("Liked Songs").into(), SourceLink::Liked),
             Route::Songs => match self.song_filters.only_genre() {
@@ -124,14 +130,17 @@ impl Shell {
     }
 
     pub fn render_queue_panel(&mut self, top_inset: Pixels, scale: f32, cx: &mut Context<Self>) -> AnyElement {
-        // While following someone, show their song and that the listener's queue waits.
-        if let Some(following) = self.render_queue_following(scale, cx) {
+        // following: their song, and the listener's queue waiting; in a session the queue shows, to edit
+        if !self.session_on()
+            && let Some(following) = self.render_queue_following(scale, cx)
+        {
             return div().absolute().left(px(0.0)).right(px(0.0)).top(top_inset).bottom(px(0.0)).child(following).into_any_element();
         }
         self.autoplay_view_shown(cx);
         let sections = self.queue_sections();
         self.queue_rows_first = sections.item(0).min(sections.empty.unwrap_or(usize::MAX)).min(sections.auto_heading.unwrap_or(usize::MAX));
-        let key = (sections.run, sections.rest, (sections.auto_rows * (QUEUE_FINDING_ROWS + 1) + sections.finding) * 2 + usize::from(sections.auto_heading.is_some()), sections.current, self.autoplay_asks_deezer());
+        let session_rows = if sections.queued_heading.is_some() && sections.run == 0 { 1 + self.session_theirs().len() } else { 0 };
+        let key = (sections.run, sections.rest, (sections.auto_rows * (QUEUE_FINDING_ROWS + 1) + sections.finding) * 2 + usize::from(sections.auto_heading.is_some()), sections.current, self.autoplay_asks_deezer(), session_rows);
         if self.queue_key != key {
             self.queue_key = key;
             self.queue_list.reset(sections.count);
@@ -146,7 +155,7 @@ impl Shell {
             .bottom(px(0.0))
             .children(mark)
             .child(list(self.queue_list.clone(), cx.processor(|this, ix: usize, window, cx| this.render_queue_item(ix, window, cx))).size_full())
-            .child(self.render_scrollbar("queue", crate::ui_scroll::ScrollSource::List(self.queue_list.clone()), px(0.0), px(0.0), scale, cx))
+            .child(self.render_scrollbar("queue", crate::ui_scroll::ScrollSource::List(self.queue_list.clone()), px(0.0), px(0.0), cx))
             .into_any_element()
     }
 
@@ -176,20 +185,29 @@ impl Shell {
     fn queue_head_buttons(&mut self, clear: ModeButton, shuffle: ModeButton, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let ink = t.t_on_art();
+        let feel = crate::ui::Feel::PLAYER;
         let (clear_id, shuffle_id) = if clear == ModeButton::ClearQueue { ("queue-clear", "queue-shuffle-queued") } else { ("queue-clear-list", "queue-shuffle") };
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap(t.s(QUEUE_HEAD_GAP))
-            .child(self.render_mode_button(clear, clear_id, QUEUE_HEAD_ICON, ink, cx))
-            .child(self.render_mode_button(shuffle, shuffle_id, QUEUE_HEAD_ICON, ink, cx))
+            .child(self.render_mode_button(clear, clear_id, QUEUE_HEAD_ICON, ink, feel, cx))
+            .child(self.render_mode_button(shuffle, shuffle_id, QUEUE_HEAD_ICON, ink, feel, cx))
             .into_any_element()
     }
 
     /// "Next from: <source>" with the source linked, or "Up Next" when unknown.
     fn next_from_title(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
+        if self.listen.following.is_some() {
+            let own = self.player.queue.get(self.player.queue_pos).copied().map(|r| self.song_by_rowid(r).title).filter(|t| !t.is_empty());
+            let title = match own {
+                Some(song) => trf("Your queue waits at “{song}”", &[("song", &song)]),
+                None => tr("Your queue waits").to_string(),
+            };
+            return div().truncate().child(title).into_any_element();
+        }
         let Some(source) = self.player.source.clone() else { return div().truncate().child(tr("Up Next")).into_any_element() };
         let name: SharedString = if source.radio { trf("{name} Radio", &[("name", &source.name)]).into() } else { source.name.clone().into() };
         let link = self.link(("queue-source", 0), name, source.link.as_ref().map(LinkTarget::from), t.t_on_art().into(), cx);
@@ -212,13 +230,28 @@ impl Shell {
         }
         if s.queued_heading == Some(ix) {
             let buttons = self.queue_head_buttons(ModeButton::ClearQueue, ModeButton::ShuffleQueue, cx);
-            return self.queue_heading(div().truncate().child(tr("Next in Queue")).into_any_element(), s.current, Some(buttons));
+            if !self.session_on() {
+                return self.queue_heading(div().truncate().child(tr("Next in Queue")).into_any_element(), s.current, Some(buttons));
+            }
+            let heading = self.queue_heading(div().truncate().child(tr("Session Queue")).into_any_element(), s.current, Some(buttons));
+            // the other side's songs can't be listed here, only that they have some
+            let mut notes: Vec<SharedString> = self.session_theirs().iter().map(|user| trf("{user} has songs queued", &[("user", user)]).into()).collect();
+            if s.run == 0 && notes.is_empty() {
+                notes.push(tr("Songs you add to the queue play in turns with the other side’s.").into());
+            }
+            let note_ink = Hsla::from(t.t_on_art()).alpha(0.7);
+            return div()
+                .flex()
+                .flex_col()
+                .child(heading)
+                .children(notes.into_iter().map(|n| div().px(t.s(SIDE_PAD + 8.0)).pb(t.s(10.0)).text_size(t.text(TEXT_SM)).text_color(note_ink).child(n)))
+                .into_any_element();
         }
         if s.from_heading == Some(ix) {
             let shift = self.row_drag_split_shift(DragList::Queue);
             let title = self.next_from_title(cx);
             let buttons = (!station).then(|| self.queue_head_buttons(ModeButton::ClearList, ModeButton::Shuffle, cx));
-            let heading = self.queue_heading(title, s.current || s.run > 0, buttons);
+            let heading = self.queue_heading(title, s.current || s.queued_heading.is_some(), buttons);
             return div().child(div().relative().top(shift).child(heading)).into_any_element();
         }
         if ix == s.count - 1 {
@@ -303,7 +336,7 @@ impl Shell {
             &t,
             tr("Better Autoplay with Deezer?").into(),
             "paper-plane-tilt-regular",
-            tr("Sends artist and song names to Deezer from this computer.").into(),
+            tr("Sends artist and song names to Deezer and ListenBrainz from this computer.").into(),
             vec![not_now.into_any_element(), turn_on.into_any_element()],
         );
         Some(div().px(t.s(SIDE_PAD)).pb(t.s(PROMPT_CARD_GAP)).child(card).into_any_element())
@@ -355,8 +388,8 @@ impl Shell {
                 .child(
                     div()
                         .id("queue-now")
-                        // Right-click opens the song's menu, without the remove and move actions.
-                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_song_menu(vec![song_ix], event.position, false, cx)))
+                        // the song's menu, without anything that removes or moves it.
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_song_menu(vec![song_ix], None, event.position, false, cx)))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -364,7 +397,7 @@ impl Shell {
                         .h(t.s(ROW_HEIGHT))
                         .px(t.s(8.0))
                         .child(div().size(t.s(42.0)).flex_none().child(thumb_el))
-                        .child(div().flex_1().min_w(px(0.0)).line_height(relative(1.3)).child(crate::ui::titled(&t, div().truncate().font_weight(FontWeight::MEDIUM).text_color(t.t_on_art()).child(song.title.clone()), song.explicit, TEXT_MD)).child(div().text_size(t.text(TEXT_SM)).child(self.artist_links(("queue-now-artist", 0), &song, gpui::Hsla::from(t.t_on_art()).alpha(0.7), cx))))
+                        .child(div().flex_1().min_w(px(0.0)).line_height(relative(1.3)).child(crate::ui::titled(&t, div().id("title").truncate().font_weight(FontWeight::MEDIUM).text_color(t.t_on_art()).child(song.title.clone()).full_text_tip(&t, song.title.clone()), song.explicit, TEXT_MD)).child(div().text_size(t.text(TEXT_SM)).child(self.artist_links(("queue-now-artist", 0), &song, gpui::Hsla::from(t.t_on_art()).alpha(0.7), cx))))
                         .child(div().flex_none().text_size(t.text(TEXT_SM)).text_color(t.t_on_art()).opacity(0.65).child(clock(song.duration_s))),
                 )
                 .into_any_element();
@@ -406,7 +439,7 @@ impl Shell {
                 .opacity(0.0)
                 .group_hover(group, |s| s.opacity(1.0))
                 .child(
-                    crate::ui::ink_button(&t, ("queue-remove", pos), "x-bold", 14.0, t.t_on_art(), t.t_on_art())
+                    crate::ui::ink_button(&t, ("queue-remove", pos), if auto { tr("Remove from Autoplay") } else { tr("Remove from Queue") }, "x-bold", 14.0, t.t_on_art(), t.t_on_art())
                         .w(t.s(QUEUE_REMOVE_W))
                         .h(t.s(QUEUE_REMOVE_W))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -434,6 +467,8 @@ impl Shell {
                     .h(t.s(ROW_HEIGHT))
                     .px(t.s(8.0))
                     .rounded(t.s(R_MD))
+                    .relative()
+                    .children(self.row_flash(song_ix, px(0.0), R_MD))
                     .when_some(row_bg, |d, bg| d.bg(bg))
                     .when(!dragging, |d| d.hover(|s| s.bg(t.on_art_hover())))
                     .when(lifted || carried, |d| d.opacity(0.0))
@@ -468,6 +503,7 @@ impl Shell {
                             .child(
                                 div()
                                     .id(("queue-play", pos))
+                                    .tooltip(crate::ui::tip(&t, tr("Play")))
                                     .absolute()
                                     .inset_0()
                                     .flex()
@@ -490,7 +526,7 @@ impl Shell {
                             .flex_1()
                             .min_w(px(0.0))
                             .line_height(relative(1.3)))
-                            .child(crate::ui::titled(&t, div().truncate().font_weight(FontWeight::MEDIUM).text_color(title_color).child(song.title.clone()), song.explicit, TEXT_MD))
+                            .child(crate::ui::titled(&t, div().id("title").truncate().font_weight(FontWeight::MEDIUM).text_color(title_color).child(song.title.clone()).full_text_tip(&t, song.title.clone()), song.explicit, TEXT_MD))
                             .child(div().text_size(t.text(TEXT_SM)).child(artist_line)),
                     )
                     .child(dim(end)),
@@ -538,8 +574,12 @@ impl Shell {
         self.selection.prepare_context(pos, &list);
         let positions: Vec<usize> = (0..list.len()).filter(|p| self.selection.contains(list[*p])).collect();
         let selected: Vec<u32> = positions.iter().map(|p| list[*p]).collect();
+        let play = match positions[..] {
+            [pos] => Self::play_row_item(move |this, cx| this.jump_in_queue(pos, cx)),
+            _ => Self::play_songs_row(&selected),
+        };
         let remove = (self.player.station.is_none() && !self.player.queue.is_empty()).then(|| self.queue_remove_row(positions));
-        let rows = self.song_rows(&selected, remove);
+        let rows = self.song_rows(&selected, Some(play), remove);
         self.open_menu(rows, position, false, cx);
         cx.notify();
     }
@@ -548,6 +588,7 @@ impl Shell {
         let mut layout = self.layout(self.edge.content_size(window.viewport_size()), window.scale_factor());
         if let Some(width) = self.layout_override {
             layout.main_width = width;
+            layout.settled_width = width;
             layout.embedded = true;
         }
         layout

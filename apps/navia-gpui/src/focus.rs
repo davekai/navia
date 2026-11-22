@@ -70,6 +70,8 @@ pub enum Scope {
     Shell,
     Sidebar,
     Main,
+    Player,
+    Expanded,
 }
 
 /// Builds `build` as `scope` in tab section `section`, keeping both set for anything built later
@@ -205,16 +207,22 @@ pub fn missed_this_frame() -> bool {
     with(|s| s.missed > 0)
 }
 
-/// `None` only when the pool ran out. The control stays clickable and gets its stop next frame.
-fn entry_for(id: ElementId, kind: StopKind, field: Option<TextTarget>) -> Option<FocusHandle> {
+/// `None` only when the pool ran out; the control stays clickable and gets its stop next frame.
+/// `live`: the stop takes focus this frame; one under a modal layer doesn't, so focus left on it counts as stale.
+fn entry_for(id: ElementId, kind: StopKind, field: Option<TextTarget>, live: bool) -> Option<FocusHandle> {
     with(|s| {
         let scope = s.scope;
         let n = s.counts.entry((scope, id.clone())).or_insert(0);
         let key = (scope, id, *n);
         *n += 1;
-        let frame = s.frame;
+        let mut frame = s.frame;
         let handle = match s.map.get(&key) {
-            Some(e) => e.handle.clone(),
+            Some(e) => {
+                if !live {
+                    frame = e.last_frame;
+                }
+                e.handle.clone()
+            }
             None => {
                 s.wanted += 1;
                 match s.pool.pop() {
@@ -267,7 +275,7 @@ fn ring(handle: FocusHandle, radius: Option<AbsoluteLength>, inset: Pixels, thic
 fn attach(mut el: Stateful<Div>, t: &Theme, kind: StopKind, field: Option<TextTarget>, top: bool, inset: Pixels) -> Stateful<Div> {
     let Some(id) = el.interactivity().element_id.clone() else { return el };
     let modal = with(|s| s.modal);
-    let Some(handle) = entry_for(id, kind, field) else { return el };
+    let Some(handle) = entry_for(id, kind, field, !modal || top) else { return el };
     if modal && !top {
         return el;
     }
@@ -285,7 +293,6 @@ fn attach(mut el: Stateful<Div>, t: &Theme, kind: StopKind, field: Option<TextTa
     el.track_focus(&handle).child(ring(handle, radius, inset, ring_px(t), t.accent_hsla()))
 }
 
-/// Makes an element a keyboard stop.
 pub trait FocusStop {
     /// A button. Enter and Space press it after keyboard navigation.
     fn stop(self, t: &Theme) -> Self;
@@ -294,7 +301,6 @@ pub trait FocusStop {
     /// A song row. Enter activates and Space toggles playback. `inset` fits the ring to the
     /// row's highlight pill.
     fn stop_row(self, t: &Theme, inset: Pixels) -> Self;
-    /// A text field.
     fn stop_field(self, t: &Theme, target: TextTarget) -> Self;
 }
 
@@ -313,7 +319,7 @@ impl FocusStop for Stateful<Div> {
 
     fn stop_field(self, t: &Theme, target: TextTarget) -> Self {
         // The dialog's field belongs to the dialog's layer.
-        let top = matches!(target, TextTarget::NewPlaylistName | TextTarget::PlaylistName | TextTarget::PlaylistDescription | TextTarget::ShareDescription | TextTarget::ShareDate);
+        let top = matches!(target, TextTarget::NewPlaylistName | TextTarget::NewPlaylistDescription | TextTarget::PlaylistName | TextTarget::PlaylistDescription | TextTarget::ShareDescription | TextTarget::ShareDate);
         attach(self, t, StopKind::Field, Some(target), top, px(0.0))
     }
 }

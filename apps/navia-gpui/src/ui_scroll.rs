@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
-use gpui::{AnyElement, Bounds, Context, ListState, MouseButton, Pixels, ScrollHandle, UniformListScrollHandle, Window, div, point, px};
+use gpui::{AnyElement, Bounds, Context, ListState, MouseButton, Pixels, ScrollHandle, UniformListScrollHandle, div, point, px};
 
 use crate::shell::{Drag, Shell};
 use crate::theme::motion;
@@ -23,8 +23,6 @@ pub enum ScrollSource {
     Uniform(UniformListScrollHandle),
     List(ListState),
     Handle(ScrollHandle),
-    /// The lyrics view keeps its own offset, in device pixels.
-    Lyrics,
 }
 
 struct Metrics {
@@ -34,7 +32,7 @@ struct Metrics {
 }
 
 impl ScrollSource {
-    fn metrics(&self, shell: &Shell, scale: f32) -> Option<Metrics> {
+    fn metrics(&self) -> Option<Metrics> {
         let (offset, max, viewport) = match self {
             ScrollSource::Uniform(handle) => {
                 let base = handle.0.borrow().base_handle.clone();
@@ -42,12 +40,11 @@ impl ScrollSource {
             }
             ScrollSource::List(list) => (-f32::from(list.scroll_px_offset_for_scrollbar().y), f32::from(list.max_offset_for_scrollbar().y), f32::from(list.viewport_bounds().size.height)),
             ScrollSource::Handle(handle) => (-f32::from(handle.offset().y), f32::from(handle.max_offset().y), f32::from(handle.bounds().size.height)),
-            ScrollSource::Lyrics => (shell.lyrics_view.scroll / scale, shell.lyrics_max_scroll / scale, f32::from(shell.lyrics_view.bounds.borrow().size.height)),
         };
         (max > 0.5 && viewport > 0.0).then_some(Metrics { offset: offset.max(0.0), max, viewport })
     }
 
-    fn set_offset(&self, shell: &mut Shell, y: f32, scale: f32) {
+    fn set_offset(&self, y: f32) {
         match self {
             ScrollSource::Uniform(handle) => {
                 let base = handle.0.borrow().base_handle.clone();
@@ -55,10 +52,6 @@ impl ScrollSource {
             }
             ScrollSource::List(list) => list.set_offset_from_scrollbar(point(px(0.0), px(-y))),
             ScrollSource::Handle(handle) => handle.set_offset(point(px(0.0), px(-y))),
-            ScrollSource::Lyrics => {
-                shell.lyrics_view.scroll = y * scale;
-                shell.lyrics_user_scrolled = true;
-            }
         }
     }
 }
@@ -82,11 +75,10 @@ impl Default for BarState {
 pub type Scrollbars = HashMap<&'static str, BarState>;
 
 impl Shell {
-    /// An overlay scrollbar for a scrolling area. Add it as a child of the area's positioned
-    /// parent, on top of the content. `top` and `bottom` keep it clear of fixed controls.
-    pub fn render_scrollbar(&mut self, id: &'static str, source: ScrollSource, top: Pixels, bottom: Pixels, scale: f32, cx: &mut Context<Self>) -> AnyElement {
+    /// add it on top of the content in the area's positioned parent; `top` and `bottom` clear fixed controls.
+    pub fn render_scrollbar(&mut self, id: &'static str, source: ScrollSource, top: Pixels, bottom: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
-        let Some(m) = source.metrics(self, scale) else { return div().into_any_element() };
+        let Some(m) = source.metrics() else { return div().into_any_element() };
         let dragging = matches!(self.dragging, Some(Drag::Scroll { id: d, .. }) if d == id);
         let now = Instant::now();
         let state = self.scrollbars.entry(id).or_default();
@@ -105,7 +97,7 @@ impl Shell {
         if idle >= VISIBLE_FOR && alpha > 0.0 {
             self.scrollbar_animating = true;
         } else if idle < VISIBLE_FOR && !state.armed {
-            // Wake up when it's time to start fading.
+            // wakes when it's time to start fading.
             state.armed = true;
             let wait = VISIBLE_FOR - idle + Duration::from_millis(16);
             cx.spawn(async move |this, cx| {
@@ -143,20 +135,19 @@ impl Shell {
             }))
             .child(crate::view_topbar::track_bounds(track_bounds))
             .when(visible, |d| {
-                d.on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                d.on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    this.scrollbar_press(id, event.position, window, cx);
+                    this.scrollbar_press(id, event.position, cx);
                 }))
                 .child(div().absolute().right(t.s(1.0)).top(px(thumb_y)).w(thumb_w).h(px(thumb_h)).rounded_full().bg(color))
             });
         strip.into_any_element()
     }
 
-    /// A press on the thumb grabs it. A press on the track jumps there and grabs it centered.
-    fn scrollbar_press(&mut self, id: &'static str, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let scale = window.scale_factor();
+    /// a press on the track jumps there and grabs the thumb centered.
+    fn scrollbar_press(&mut self, id: &'static str, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let Some((source, track)) = self.scrollbars.get(id).and_then(|s| Some((s.source.clone()?, *s.track.borrow()))) else { return };
-        let Some(m) = source.metrics(self, scale) else { return };
+        let Some(m) = source.metrics() else { return };
         let t = self.theme;
         let track_h = f32::from(track.size.height);
         let thumb_h = (track_h * m.viewport / (m.viewport + m.max)).max(f32::from(t.s(THUMB_MIN))).min(track_h);
@@ -166,22 +157,21 @@ impl Shell {
             local - thumb_y
         } else {
             let wanted = (local - thumb_h / 2.0).clamp(0.0, (track_h - thumb_h).max(0.0));
-            source.set_offset(self, wanted / (track_h - thumb_h).max(1.0) * m.max, scale);
+            source.set_offset(wanted / (track_h - thumb_h).max(1.0) * m.max);
             thumb_h / 2.0
         };
         self.dragging = Some(Drag::Scroll { id, grab: px(grab) });
         cx.notify();
     }
 
-    pub fn scrollbar_drag(&mut self, id: &'static str, grab: Pixels, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let scale = window.scale_factor();
+    pub fn scrollbar_drag(&mut self, id: &'static str, grab: Pixels, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let Some((source, track)) = self.scrollbars.get(id).and_then(|s| Some((s.source.clone()?, *s.track.borrow()))) else { return };
-        let Some(m) = source.metrics(self, scale) else { return };
+        let Some(m) = source.metrics() else { return };
         let track_h = f32::from(track.size.height);
         let thumb_h = (track_h * m.viewport / (m.viewport + m.max)).max(f32::from(self.theme.s(THUMB_MIN))).min(track_h);
         let room = (track_h - thumb_h).max(1.0);
         let y = (f32::from(position.y - track.origin.y) - f32::from(grab)).clamp(0.0, room);
-        source.set_offset(self, y / room * m.max, scale);
+        source.set_offset(y / room * m.max);
         cx.notify();
     }
 }

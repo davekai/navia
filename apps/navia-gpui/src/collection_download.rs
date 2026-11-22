@@ -159,9 +159,10 @@ impl Shell {
     pub fn download_toggle(&mut self, key: &'static str, kind: CollectionKind, id: SharedString, name: SharedString, has_songs: bool, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let status = self.collection_status(kind, &id).cloned();
+        let label = if !has_songs { tr("No songs to download") } else if status.is_some() { tr("Remove Download") } else { tr("Download") };
         let button = match &status {
-            Some(s) => icon_button_with(&t, key, true, download_glyph(&t, glyph_for(s), progress_of(s), DOWNLOAD_GLYPH, t.t1().into())),
-            None => icon_button(&t, key, "arrow-down-regular", false),
+            Some(s) => icon_button_with(&t, key, label, true, download_glyph(&t, glyph_for(s), progress_of(s), DOWNLOAD_GLYPH, t.t1().into())),
+            None => icon_button(&t, key, label, "arrow-down-regular", false),
         };
         if !has_songs {
             return button.opacity(DISABLED_OPACITY).into_any_element();

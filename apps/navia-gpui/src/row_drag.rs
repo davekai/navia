@@ -21,7 +21,6 @@ use crate::theme::motion;
 use crate::theme::size::*;
 use crate::ui::icon;
 
-/// How long a still press must last before the row lifts.
 pub const HOLD: Duration = Duration::from_millis(180);
 /// Moving this far while pressed lifts the row at once. Anything less is still a click.
 const MOVE_PX: f32 = 6.0;
@@ -42,7 +41,6 @@ pub fn edge_speed(y: f32, top: f32, bottom: f32) -> f32 {
     }
 }
 
-/// A row's vertical offset, sliding from one value to another.
 #[derive(Clone, Copy, Debug)]
 pub struct Slide {
     from: f32,
@@ -69,7 +67,6 @@ impl Slide {
         self.from != self.to && self.progress(now) < 1.0
     }
 
-    /// Heads for `to` from wherever it is now.
     pub fn retarget(&mut self, to: f32, now: Instant) {
         if to != self.to {
             *self = Self { from: self.value(now), to, start: now };
@@ -87,15 +84,15 @@ pub enum DragList {
     Page { list: usize, first_block: usize },
     /// A page's compact rows, such as Search or Top Songs, which only drag out.
     Mini { list: usize },
-    /// The Songs page's table of every song, which only drags out.
+    /// only drags out.
     Songs,
 }
 
-/// A press on a row, which becomes a drag once it's held or moved.
+/// becomes a drag once held or moved.
 pub struct RowDrag {
     pub list: DragList,
     pub pressed: usize,
-    /// The rows that move, in list order. Set when the row lifts.
+    /// in list order; set when the row lifts.
     pub rows: Vec<usize>,
     pub start: Point<Pixels>,
     pub pointer: Point<Pixels>,
@@ -112,7 +109,7 @@ pub struct RowDrag {
     follow: Option<Slide>,
     /// The first frame after lifting, when visible rows slide from their own places.
     fresh: bool,
-    /// The pressed row's item bounds at the press, for the floating copy's width.
+    /// for the floating copy's width.
     pub item: Bounds<Pixels>,
     pub count: usize,
     /// Rows from here on can be lifted but not dropped among, such as the queue's Autoplay section.
@@ -152,7 +149,6 @@ impl Shell {
         }
     }
 
-    /// The songs of the list a drag works on, by position.
     pub(crate) fn drag_songs(&self, list: DragList) -> Vec<u32> {
         match list {
             DragList::Queue => self.queue_view_list().0.as_ref().clone(),
@@ -161,7 +157,6 @@ impl Shell {
         }
     }
 
-    /// One song of the list a drag works on.
     pub(crate) fn drag_song(&self, list: DragList, pos: usize) -> Option<u32> {
         match list {
             DragList::Queue => self.queue_view_list().0.get(pos).copied(),
@@ -190,7 +185,7 @@ impl Shell {
         self.reorder_list == Some(list)
     }
 
-    /// Whether a row is the lifted one, or carried with it, while the rows are inside their list.
+    /// (lifted, carried) while inside their list.
     pub fn row_drag_marks(&self, list: DragList, pos: usize) -> (bool, bool) {
         match self.row_drag.as_ref().filter(|d| d.lifted && !d.out && d.list == list) {
             Some(d) => (d.pressed == pos, d.pressed != pos && d.rows.contains(&pos)),
@@ -228,7 +223,7 @@ impl Shell {
         self.row_drag.as_ref().is_some_and(|d| d.lifted)
     }
 
-    /// A left press on a row of a list that can be reordered. Modifier presses keep their meaning.
+    /// modifier presses keep their meaning.
     pub fn row_press(&mut self, list: DragList, pos: usize, count: usize, event: &MouseDownEvent, cx: &mut Context<Self>) {
         self.suppress_row_click = false;
         // A press on an artist, album or genre link belongs to the link.
@@ -239,7 +234,7 @@ impl Shell {
         if m.shift || m.control || m.platform || m.alt || count == 0 || event.click_count > 1 {
             return;
         }
-        // Rows that only drag out have no place in a list to keep.
+        // rows that only drag out have no place to keep.
         let item = match self.drag_item(list, pos) {
             Some(ix) => match self.drag_state(list).bounds_for_item(ix) {
                 Some(b) => b,
@@ -554,7 +549,6 @@ impl Shell {
         Some(deferred(anchored().position(view.origin).child(layer)).with_priority(5).into_any_element())
     }
 
-    /// A copy of the lifted row that follows the pointer.
     fn render_drag_float(&mut self, list: DragList, song_ix: u32, width: Pixels, layout: &Layout) -> AnyElement {
         let t = self.theme;
         let song = match list {

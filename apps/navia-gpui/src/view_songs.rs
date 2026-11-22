@@ -1,5 +1,6 @@
-//! The main column and the Songs table, virtualized with `uniform_list` over all tracks.
+//! the main column and the Songs table, virtualized with `uniform_list`.
 
+use crate::ui::FullTextTip;
 use crate::i18n::tr;
 use std::ops::Range;
 
@@ -12,6 +13,7 @@ use gpui::{AnyElement, Context, FontWeight, Hsla, MouseButton, Pixels, Window, d
 use crate::persist::PlayerMode;
 use crate::shell::{Layout, Route, Shell};
 use crate::theme::size::*;
+use crate::theme::motion;
 use crate::ui::clock;
 
 /// Grid columns of the song table, in pixels.
@@ -25,8 +27,6 @@ pub struct Columns {
     /// Optional columns, indexed by `view_rows::OptCol`.
     cols: [Option<Pixels>; 5],
     actions: Pixels,
-    title_pad: Pixels,
-    dim_pad: Pixels,
 }
 
 impl Shell {
@@ -44,8 +44,6 @@ impl Shell {
             time: c.time,
             cols: c.cols,
             actions: c.actions,
-            title_pad: t.s(12.0),
-            dim_pad: t.s(14.0),
         }
     }
 
@@ -56,18 +54,23 @@ impl Shell {
             _ => self.render_page(layout, cx),
         };
         let t = self.theme;
+        // a new page fades in rising, or falling after Back.
+        let (entry, entry_ticker) = crate::ui::swap("page-entry", &self.page_entry.0, motion::PAGE_FADE);
+        let content = if entry.leaving.is_some() {
+            div().relative().size_full().top(t.s(motion::PAGE_RISE) * self.page_entry.1 * (1.0 - entry.shown)).opacity(entry.shown).child(content).into_any_element()
+        } else {
+            content
+        };
         let sidebar_margin = if with_margin { self.main_column_margin(layout) } else { px(0.0) };
-        let mut col = div().relative().flex_1().min_w(px(0.0)).h_full().ml(sidebar_margin).child(content);
+        let mut col = div().relative().flex_1().min_w(px(0.0)).h_full().ml(sidebar_margin).child(entry_ticker).children(self.land_ticker()).child(content);
         if self.content_scrolled() {
             let page = gpui::rgb(crate::theme::BG);
             if crate::ui::has_backdrop_blur() {
                 let height = t.s(TOPBAR_H + 20.0);
                 let window = self.edge.corners;
-                // The band spans the window's whole top, under the sidebar, dock and gaps, so it never ends beside a
-                // panel. It takes the window's top corners.
-                let dock_at_right = layout.player && layout.mode == PlayerMode::Dock;
+                // the band spans the window's whole top so it never ends in an edge beside either panel.
                 let left = -self.main_column_margin(layout);
-                let right = if dock_at_right { -(layout.dock_width + t.s(WINDOW_INSET)) } else { px(0.0) };
+                let right = -layout.dock_room;
                 let corners = gpui::Corners { top_left: window.top_left, top_right: window.top_right, bottom_left: px(0.0), bottom_right: px(0.0) };
                 col = col
                     .child(div().absolute().top(px(0.0)).left(left).right(right).h(height).child(crate::ui::backdrop_blur(corners, t.s(EDGE_BLUR), EDGE_SATURATION, height * EDGE_FADE)))
@@ -77,8 +80,7 @@ impl Shell {
                         gpui::linear_color_stop(gpui::Rgba { a: 0.0, ..page }, 1.0),
                     )));
             } else {
-            let dock_at_right = layout.player && layout.mode == PlayerMode::Dock;
-            let right = if dock_at_right { -(layout.dock_width + t.s(WINDOW_INSET)) } else { px(0.0) };
+            let right = -layout.dock_room;
             col = col.child(crate::chrome::round_corners(div().absolute().top(px(0.0)).left(-self.main_column_margin(layout)).right(right).h(t.s(TOPBAR_H + 12.0)), gpui::Corners { top_left: self.edge.corners.top_left, top_right: self.edge.corners.top_right, bottom_left: px(0.0), bottom_right: px(0.0) }).bg(gpui::linear_gradient(
                 180.0,
                 gpui::linear_color_stop(page, 0.5),
@@ -98,17 +100,14 @@ impl Shell {
         if let Some(source) = page_scroll {
             let t = self.theme;
             let bottom = t.s(6.0) + if layout.mode == PlayerMode::Bar && layout.player { t.s(BAR_H) + t.s(WINDOW_INSET) + t.s(12.0) } else { px(0.0) };
-            col = col.child(self.render_scrollbar("page", source, t.s(TOPBAR_H), bottom, layout.scale, cx));
-        }
-        if layout.mode == PlayerMode::Bar && layout.player {
-            col = col.child(self.render_bar_glow(layout)).child(self.render_bar(layout, cx));
+            col = col.child(self.render_scrollbar("page", source, t.s(TOPBAR_H), bottom, cx));
         }
         col.into_any_element()
     }
 
     /// The sidebar's room to the left of the main column.
     pub fn main_column_margin(&self, layout: &Layout) -> Pixels {
-        if layout.sidebar_visible && !layout.sidebar_overlay { self.theme.s(WINDOW_INSET) + layout.sidebar_width } else { px(0.0) }
+        layout.sidebar_room
     }
 
     /// The main content has moved from its resting position.
@@ -235,17 +234,15 @@ impl Shell {
                     cx.notify();
                 }));
             }
-            let right = column == SortColumn::Plays;
-            div().w(w).flex_none().pr(if right { t.s(20.0) } else { c.dim_pad }).flex().when(right, |d| d.justify_end()).min_w(px(0.0)).child(inner)
+            crate::view_rows::head_cell(&t, w, crate::view_rows::is_number(column)).child(inner)
         };
-        let mut row = crate::view_rows::table_head_row(&t, self.row_height(), c.width, t.s(GUTTER), c.pad_left)
-            .child(label(c.lead + c.title, tr("Song Name"), SortColumn::Title))
-            .child(label(c.time, tr("Time"), SortColumn::Time));
+        let mut row = crate::view_rows::table_head_row(&t, self.row_height(), c.width, t.s(GUTTER), c.pad_left).child(label(c.lead + c.title, tr("Song Name"), SortColumn::Title));
         for col in OptCol::ALL {
             if let Some(w) = c.cols[col as usize] {
                 row = row.child(label(w, col.head(), col.sort()));
             }
         }
+        row = row.child(label(c.time, tr("Time"), SortColumn::Time));
         row.id("songs-header")
             .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| this.open_column_chooser(event.position, cx)))
             .child(div().absolute().left(px(0.0)).right(px(0.0)).bottom(px(0.0)).h(px(1.0)).bg(t.line()))
@@ -281,7 +278,6 @@ impl Shell {
             t.t1().into()
         };
         let dim_color: Hsla = t.t2().into();
-        let dim = |w: Pixels, text: gpui::SharedString| div().w(w).flex_none().pr(c.dim_pad).text_color(dim_color).truncate().opacity(offline_opacity).child(text);
 
         // Rows can be dragged out to a playlist or the queue.
         let out = self.row_drag_out(crate::row_drag::DragList::Songs, order_ix);
@@ -307,22 +303,21 @@ impl Shell {
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_row_menu(order_ix, event.position, cx)))
             .child(crate::view_rows::row_pill(&t, inset, group.clone(), fills))
+            .children(self.row_flash(song_ix, inset, R_ROW))
             .child(div().opacity(offline_opacity).child(lead))
-            .child(div().w(c.title).flex_none().pr(c.title_pad).flex().min_w(px(0.0)).opacity(offline_opacity).on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                // Pressing the title lifts the row.
+            .child(div().w(c.title).flex_none().pr(t.s(NAME_CELL_PAD)).flex().min_w(px(0.0)).opacity(offline_opacity).on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                // A press on the title lifts the row.
                 let count = this.order.len();
                 this.row_press(crate::row_drag::DragList::Songs, order_ix, count, event, cx);
-            })).child(crate::ui::titled(&t, div().truncate().text_color(name_color).font_weight(FontWeight::MEDIUM).child(song.title.clone()), song.explicit, TEXT_MD)))
-            .child(dim(c.time, clock(song.duration_s)));
-        // Artist, album and genre are links.
+            })).child(crate::ui::titled(&t, div().id("title").truncate().text_color(name_color).font_weight(FontWeight::MEDIUM).child(song.title.clone()).full_text_tip(&t, song.title.clone()), song.explicit, TEXT_MD)));
+        // Artist, album and genre are links (`song_links.rs`).
         for col in crate::view_rows::OptCol::ALL {
             if let Some(w) = c.cols[col as usize] {
-                let pad = if col == crate::view_rows::OptCol::Plays { t.s(20.0) } else { c.dim_pad };
                 let content = self.optional_cell(col, 900_000_000 + order_ix, &song, dim_color, cx);
-                row = row.child(div().w(w).flex_none().pr(pad).flex().min_w(px(0.0)).overflow_hidden().opacity(offline_opacity).child(content));
+                row = row.child(crate::view_rows::body_cell(&t, w, col == crate::view_rows::OptCol::Plays).opacity(offline_opacity).child(content));
             }
         }
-        let _ = &dim;
+        row = row.child(crate::view_rows::body_cell(&t, c.time, true).text_color(dim_color).opacity(offline_opacity).child(div().truncate().child(clock(song.duration_s))));
 
         let actions = self.song_actions(("songs", order_ix), song_ix, None, c.actions, cx);
         row = row.child(actions);

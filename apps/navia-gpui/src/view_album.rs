@@ -1,5 +1,4 @@
-//! The Album page: header, actions and track list.
-
+use crate::ui::FullTextTip;
 use crate::i18n::{tr, trf};
 use gpui::prelude::*;
 use crate::ui::LinkCursor;
@@ -11,8 +10,9 @@ use crate::pages::{AlbumScope, Block, CardItem, PageMetrics, RowVariant, Route};
 use crate::shell::{Layout, Shell};
 use crate::theme::size::*;
 use crate::ui::{divider, glass_pill, icon, icon_button};
-use crate::view_cards::{ArtShape, songs_and_length};
+use crate::view_cards::songs_and_length;
 use crate::view_menu::MenuRow;
+use crate::view_about::AboutText;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum SongFilter {
@@ -26,7 +26,6 @@ pub enum SongFilter {
 pub struct AlbumDetail {
     pub filter: SongFilter,
     pub query: String,
-    pub desc_open: bool,
 }
 
 impl Shell {
@@ -54,13 +53,16 @@ impl Shell {
         self.page_numbers = std::rc::Rc::new(shown.iter().map(|s| tracks.iter().find(|t| t.song == *s).and_then(|t| t.number)).collect());
         let description = self.library.as_ref().map(|l| l.album_description(id)).unwrap_or_default();
         self.core_preload_rows(&all);
+        let ranks = if self.deezer.choice == Some(true) { self.library.as_ref().map(|l| l.album_heat(id)).unwrap_or_default() } else { Default::default() };
+        let foot = crate::color::tint_fg(self.album_tint(id)).hsla(1.0);
+        self.page_heat = crate::heat::PageHeat::new(crate::heat::HeatScale::new(ranks.into_iter().filter(|(s, _)| shown.contains(s)).collect()), foot);
         let list = self.add_list(all.clone());
         let table = self.add_list(shown.clone());
         let album_for_head = album.clone();
         let head = Shell::plain_block(move |this, layout, _, cx| this.render_album_head(&album_for_head, hires, &description, layout, cx));
         let album_for_actions = album.clone();
         let actions = Shell::plain_block(move |this, layout, _, cx| this.render_album_actions(&album_for_actions, list, layout, cx));
-        let mut blocks = vec![head, Block::Spacer(32.0), actions, Block::Spacer(32.0)];
+        let mut blocks = vec![head, Block::Spacer(ALBUM_SECTION_GAP), actions, Block::Spacer(ALBUM_SECTION_GAP)];
         if shown.is_empty() {
             let empty_all = all.is_empty();
             let filtered = !needle.is_empty();
@@ -76,6 +78,7 @@ impl Shell {
             // Disc headers only for multi-disc albums, using the server's disc titles when present.
             let discs: std::collections::BTreeSet<u32> = tracks.iter().map(|t| t.disc.max(1)).collect();
             let disc_of = |s: u32| tracks.iter().find(|t| t.song == s).map_or(1, |t| t.disc.max(1));
+            blocks.push(Shell::plain_block(|this, layout, _, cx| if this.album_header_shown(layout) { this.render_album_header(layout, cx) } else { div().into_any_element() }));
             let mut last = None;
             for (pos, song) in shown.iter().enumerate() {
                 let disc = disc_of(*song);
@@ -102,7 +105,7 @@ impl Shell {
         blocks
     }
 
-    /// A disc's heading in an album's song list: its own name, or "Disc 2".
+    /// its own name, or "Disc 2".
     fn render_disc_header(&mut self, disc: u32, title: Option<SharedString>, layout: &Layout) -> AnyElement {
         let t = self.theme;
         let m = PageMetrics::of(layout);
@@ -146,22 +149,12 @@ impl Shell {
     fn render_album_head(&mut self, album: &crate::model::Album, hires: bool, description: &SharedString, layout: &Layout, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let m = PageMetrics::of(layout);
-        let art = self.artwork(Some(&album.id), "music-notes-fill", m.hero_art, ArtShape::Rounded(R_MD), layout);
+        let art = self.hero_artwork(&album.id, "music-notes-fill", m.hero_art, R_MD, layout, cx);
         let tint = self.album_tint(&album.id);
         let tint_fg: gpui::Hsla = crate::color::tint_fg(tint).hsla(1.0);
         let tint_dim: gpui::Hsla = crate::color::tint_fg_dim(tint).hsla(1.0);
-        let known_artist = self.artist_named(&album.artist).map(|a| a.id.clone());
-        let name_row = div().flex().flex_row().items_center().gap(t.s(5.0)).mt(t.s(14.0)).max_w_full().text_size(t.text(TEXT_SUBTITLE)).font_weight(FontWeight::SEMIBOLD).text_color(tint_fg).child(div().min_w(px(0.0)).truncate().child(album.artist.clone()));
-        let artist: AnyElement = if let Some(id) = known_artist {
-            name_row.id("album-artist").link_cursor().child(icon(&t, "caret-right-bold", 21.0, tint_fg)).stop(&t).on_click(cx.listener(move |this, _, _, cx| this.navigate(Route::Artist(id.clone()), cx))).into_any_element()
-        } else if crate::song_links::split_credit(&album.artist).iter().any(|(name, is_name)| *is_name && self.artist_named(&SharedString::from(name.clone())).is_some()) {
-            // With several credited artists, each one the library knows is its own link.
-            let names = self.artist_name_links(("album-artists", 0), &album.artist, tint_fg, cx);
-            div().flex().flex_row().mt(t.s(14.0)).max_w_full().min_w(px(0.0)).text_size(t.text(TEXT_SUBTITLE)).font_weight(FontWeight::SEMIBOLD).child(names).into_any_element()
-        } else {
-            name_row.into_any_element()
-        };
-        let mut meta = div().flex().flex_row().items_center().flex_wrap().mt(t.s(12.0)).text_color(tint_dim).font_weight(FontWeight::MEDIUM);
+        let artist = self.album_artist_line(&album.artist, tint_fg, cx);
+        let mut meta = album_meta_line(&t, tint_dim);
         if !album.genre.is_empty() {
             let genre = self.link(("album-genre", 0), album.genre.clone(), Some(crate::song_links::LinkTarget::Genre(album.genre.clone())), tint_fg, cx);
             meta = meta.child(div().font_weight(FontWeight::SEMIBOLD).child(genre)).child(div().px(t.s(5.0)).child("•"));
@@ -180,27 +173,38 @@ impl Shell {
         if hires {
             meta = meta.child(div().flex().flex_row().items_center().gap(t.s(5.0)).child(" • ").child(icon(&t, "waveform-regular", 16.0, tint_dim)).child(tr("Hi-res Lossless")));
         }
-        let title = div().text_size(t.text(m.title)).text_color(t.t_em()).font_weight(FontWeight::BOLD).line_height(relative(1.1)).line_clamp(3).text_ellipsis().child(album.name.clone());
-        let title = div().flex().flex_row().items_center().child(title.min_w(px(0.0))).when(album.explicit, |d| d.child(crate::ui::explicit_mark(&t, (m.title * 0.4).max(13.0) / 0.68)));
-        let mut info = div().flex().flex_col().flex_1().min_w(px(0.0)).pt(t.s(20.0)).child(title).child(artist).child(meta);
+        let title = album_title(&t, &m, album.name.clone(), album.explicit);
+        let mut info = album_info(&t).child(title).child(artist).child(meta);
         if !description.is_empty() {
-            let open = self.album_detail.desc_open;
-            info = info.child(self.more_text("album-desc", description.clone(), open, false, cx, |this, cx| {
-                this.album_detail.desc_open = !this.album_detail.desc_open;
-                cx.notify();
-            }));
+            let about = AboutText { title: album.name.clone(), subtitle: (!album.artist.is_empty()).then(|| album.artist.clone()), art: Some(album.id.clone()), text: description.clone() };
+            info = info.child(self.header_more_text("album-desc", about, cx));
         }
-        let main = f32::from(layout.main_width) / t.token_scale();
-        let stack = main <= 620.0;
-        let art = div().flex_none().shadow(vec![crate::ui::shadow_art(&t)]).rounded(t.s(R_MD)).child(art);
-        let mut head = div().flex().gap(t.s(25.0)).px(t.s(m.gutter)).w(layout.main_width);
-        head = if stack { head.flex_col().items_start() } else { head.flex_row() };
-        head.child(art).child(info).into_any_element()
+        album_head(&t, &m, art, info, layout)
     }
 
-    /// Text clamped to three lines, with MORE at the end of the third when it doesn't fit. GPUI can't wrap text around
-    /// a float, so the text is measured at its real width and the third line is drawn on its own with an ellipsis.
-    /// `inset` is for padded groups like Get Info.
+    pub fn album_artist_line(&mut self, artist: &SharedString, tint_fg: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        let known_artist = self.artist_named(artist).map(|a| a.id.clone());
+        let name_row = div().flex().flex_row().items_center().gap(t.s(5.0)).mt(t.s(ALBUM_ARTIST_GAP)).max_w_full().text_size(t.text(TEXT_SUBTITLE)).font_weight(FontWeight::SEMIBOLD).text_color(tint_fg).child(div().id("album-artist").min_w(px(0.0)).truncate().child(artist.clone()).full_text_tip(&t, artist.clone()));
+        if let Some(id) = known_artist {
+            name_row.id("album-artist").link_cursor().child(icon(&t, "caret-right-bold", 21.0, tint_fg)).stop(&t).on_click(cx.listener(move |this, _, _, cx| this.navigate(Route::Artist(id.clone()), cx))).into_any_element()
+        } else if crate::song_links::split_credit(artist).iter().any(|(name, is_name)| *is_name && self.artist_named(&SharedString::from(name.clone())).is_some()) {
+            // each credited artist the library knows is its own link.
+            let names = self.artist_name_links(("album-artists", 0), artist, tint_fg, cx);
+            div().flex().flex_row().mt(t.s(ALBUM_ARTIST_GAP)).max_w_full().min_w(px(0.0)).text_size(t.text(TEXT_SUBTITLE)).font_weight(FontWeight::SEMIBOLD).child(names).into_any_element()
+        } else {
+            name_row.into_any_element()
+        }
+    }
+
+    /// a page header's description: three lines at most, MORE (only when cut) opens the whole text in the About sheet.
+    pub fn header_more_text(&mut self, id: &'static str, about: AboutText, cx: &mut Context<Self>) -> AnyElement {
+        let text = about.text.clone();
+        self.more_text(id, text, false, false, cx, move |this, cx| this.open_about_text(about.clone(), cx))
+    }
+
+    /// GPUI can't wrap text around a float, so the third line is drawn alone, ending in an ellipsis before MORE.
+    /// `inset`: in a padded group, in the body ink, with no room above or width cap, and MORE opens it in place.
     pub fn more_text(&mut self, id: &'static str, text: SharedString, open: bool, inset: bool, cx: &mut Context<Self>, toggle: impl Fn(&mut Shell, &mut Context<Shell>) + 'static) -> AnyElement {
         let t = self.theme;
         let measure = self.more_measures.entry(id).or_default().clone();
@@ -251,8 +255,9 @@ impl Shell {
         let body = match (open, split) {
             (false, Some(at)) => {
                 let (head, tail) = text.split_at(at);
+                let third = third_line(tail);
                 body.child(div().child(SharedString::from(head.trim_end().to_string())))
-                    .child(div().flex().flex_row().items_center().min_w(px(0.0)).child(div().flex_1().min_w(px(0.0)).truncate().child(SharedString::from(tail.trim_start().to_string()))).child(label(false, toggle, cx)))
+                    .child(div().flex().flex_row().items_center().min_w(px(0.0)).child(div().flex_1().min_w(px(0.0)).truncate().child(third)).child(label(false, toggle, cx)))
             }
             // Not measured yet, or it fits. Up to three lines, no label.
             (false, None) => body.child(div().line_clamp(3).text_ellipsis().child(text)),
@@ -275,13 +280,16 @@ impl Shell {
         let album_name = album.name.clone();
         let album_id_info = album.id.clone();
         let actions = vec![
-            icon_button(&t, "album-star", if starred { "heart-fill" } else { "heart-regular" }, starred)
+            icon_button(&t, "album-star", tr("Favorite"), if starred { "heart-fill" } else { "heart-regular" }, starred)
                 .stop(&t).on_click(cx.listener(move |this, _, _, cx| {
+                    if !starred {
+                        crate::ui::pop("album-star");
+                    }
                     this.toggle_album_star(&album_id, cx);
                 }))
                 .into_any_element(),
             self.download_toggle("album-download", CollectionKind::Album, album.id.clone(), album.name.clone(), has_songs, cx),
-            icon_button(&t, "album-more", "dots-three-bold", false)
+            icon_button(&t, "album-more", tr("More"), "dots-three-bold", false)
                 .stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                     let queue_songs = menu_songs.clone();
                     let rows = vec![
@@ -306,7 +314,11 @@ impl Shell {
             .child(self.render_play_actions(list, has_songs, cx))
             .child(pill_group(&t, actions))
             .child(div().flex_1())
-            .child(glass_pill(&t).child(icon_button(&t, "album-filter", "funnel-simple-regular", filter != SongFilter::All).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+            .child(glass_pill(&t).child(icon_button(&t, "album-columns", tr("Columns"), "columns-regular", false).stop(&t).on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                let rows = this.album_column_rows();
+                this.open_toolbar_menu(rows, event, cx);
+            }))))
+            .child(glass_pill(&t).child(icon_button(&t, "album-filter", tr("Filter"), "funnel-simple-regular", filter != SongFilter::All).stop(&t).on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                 let rows = this.song_filter_rows(filter, |this, f| this.album_detail.filter = f);
                 this.open_toolbar_menu(rows, event, cx);
             }))))
@@ -329,13 +341,12 @@ impl Shell {
             .collect()
     }
 
-    /// The Play and Shuffle pill for a page's list.
     pub fn render_play_actions(&mut self, list: usize, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let opacity = if enabled { 1.0 } else { 0.4 };
         let play = text_button(&t, ("page-play", list), "play-fill", tr("Play"), enabled)
             .when(enabled, |d| d.stop(&t).on_click(cx.listener(move |this, _, _, cx| this.play_page_list(list, 0, false, cx))));
-        let shuffle = crate::ui::ink_button(&t, ("page-shuffle", list), "shuffle-regular", 20.0, t.t1().into(), t.hover_ink())
+        let shuffle = crate::ui::ink_button(&t, ("page-shuffle", list), tr("Shuffle"), "shuffle-regular", 20.0, t.t1().into(), t.hover_ink())
             .when(!enabled, |d| d.opacity(opacity))
             .when(enabled, |d| d.stop(&t).on_click(cx.listener(move |this, _, _, cx| {
                 let len = this.page.lists.get(list).map_or(0, |l| l.len());
@@ -344,13 +355,9 @@ impl Shell {
         glass_pill(&t).child(play).child(divider(&t)).child(shuffle).into_any_element()
     }
 
-    /// A glass search field for page toolbars. The route decides what it searches.
+    /// the route decides what it searches.
     pub fn search_pill(&mut self, placeholder: &'static str, query: String, cx: &mut Context<Self>) -> AnyElement {
-        let t = self.theme;
-        let line = self.field_line(&crate::ui_controls::TextTarget::Page, &query, placeholder, "page-query", t.text(TEXT_MD));
-        crate::ui::search_field(&t, "page-search", crate::ui::SearchSize::Toolbar, 187.0, self.search_active, line)
-            .on_click(cx.listener(|this, _, _, cx| this.focus_field(crate::ui_controls::TextTarget::Page, cx)))
-            .into_any_element()
+        self.fitted_search(["page-search", "page-search-clear", "page-query"], placeholder, query, SEARCH_PILL_W, cx)
     }
 }
 
@@ -361,8 +368,9 @@ pub fn text_button(t: &crate::theme::Theme, id: impl Into<gpui::ElementId>, icon
 
 /// [`text_button`] in another ink, with or without an icon.
 pub fn text_button_on(t: &crate::theme::Theme, id: impl Into<gpui::ElementId>, icon_name: Option<&'static str>, label: &'static str, enabled: bool, ink: gpui::Hsla) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
+    let id = id.into();
+    let button = div()
+        .id(id.clone())
         .flex()
         .flex_row()
         .items_center()
@@ -377,7 +385,8 @@ pub fn text_button_on(t: &crate::theme::Theme, id: impl Into<gpui::ElementId>, i
         .text_color(ink)
         .when(enabled, |d| d.child(crate::ui::hover_pill(t)))
         .when_some(icon_name, |d, name| d.child(icon(t, name, 18.0, ink)))
-        .child(label)
+        .child(label);
+    if enabled { crate::ui::pressable(button, id) } else { button }
 }
 
 /// How wide [`text_button_on`] draws a label without an icon.
@@ -397,7 +406,17 @@ pub struct MoreMeasure {
     pub split: Option<usize>,
 }
 
-/// The byte where the third visual line begins, if the text wraps to more than three lines.
+/// the collapsed text's last line, from `tail` to its first line break; a line cut there still ends in an ellipsis.
+fn third_line(tail: &str) -> SharedString {
+    let tail = tail.trim_start();
+    match tail.split_once('\n') {
+        // a truncated line draws each line break as a line of its own
+        Some((line, _)) => format!("{}…", line.trim_end()).into(),
+        None => tail.to_string().into(),
+    }
+}
+
+/// none unless the text wraps to more than three lines.
 fn third_line_start(lines: &[gpui::WrappedLine]) -> Option<usize> {
     let mut starts = vec![0usize];
     let mut offset = 0usize;
@@ -415,4 +434,37 @@ fn third_line_start(lines: &[gpui::WrappedLine]) -> Option<usize> {
         offset += line.len() + 1;
     }
     (starts.len() > 3).then(|| starts[2])
+}
+
+pub fn album_head(t: &crate::theme::Theme, m: &PageMetrics, art: AnyElement, info: gpui::Div, layout: &Layout) -> AnyElement {
+    let stack = f32::from(layout.main_width) / t.token_scale() <= 620.0;
+    let art = crate::ui::hero_art_frame(t, R_MD, art);
+    let head = div().flex().gap(t.s(ALBUM_HEAD_GAP)).px(t.s(m.gutter)).w(layout.main_width);
+    // stacked, the text spans the column between the gutters; fitted to its content it ran past the right one
+    let (head, info) = if stack { (head.flex_col().items_start(), info.w_full()) } else { (head.flex_row(), info) };
+    head.child(art).child(info).into_any_element()
+}
+
+pub fn album_info(t: &crate::theme::Theme) -> gpui::Div {
+    div().flex().flex_col().flex_1().min_w(px(0.0)).pt(t.s(ALBUM_INFO_PAD_TOP))
+}
+
+pub fn album_title(t: &crate::theme::Theme, m: &PageMetrics, name: SharedString, explicit: bool) -> gpui::Div {
+    let title = div().text_size(t.text(m.title)).text_color(t.t_em()).font_weight(FontWeight::BOLD).line_height(relative(1.1)).line_clamp(3).text_ellipsis().id("album-title").child(name.clone()).full_text_tip(t, name);
+    div().flex().flex_row().items_center().child(title.min_w(px(0.0))).when(explicit, |d| d.child(crate::ui::explicit_mark(t, (m.title * 0.4).max(13.0) / 0.68)))
+}
+
+pub fn album_meta_line(t: &crate::theme::Theme, tint_dim: gpui::Hsla) -> gpui::Div {
+    div().flex().flex_row().items_center().flex_wrap().mt(t.s(ALBUM_META_GAP)).text_color(tint_dim).font_weight(FontWeight::MEDIUM)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::third_line;
+
+    #[test]
+    fn collapsed_text_stops_at_its_third_lines_break() {
+        assert_eq!(third_line(" Excluded by rating: 0\r\nExcluded for being recent: 57").as_ref(), "Excluded by rating: 0…");
+        assert_eq!(third_line("the last line, wrapped on").as_ref(), "the last line, wrapped on");
+    }
 }

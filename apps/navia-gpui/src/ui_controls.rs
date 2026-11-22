@@ -18,7 +18,6 @@ use crate::ui::{glass_edge, icon};
 
 pub const FILTER_FROM: usize = 9;
 
-/// The text field the keyboard is typing into.
 #[derive(Clone, PartialEq, Debug)]
 pub enum TextTarget {
     AccentHex,
@@ -31,6 +30,7 @@ pub enum TextTarget {
     EqPresetName,
     SmartName,
     NewPlaylistName,
+    NewPlaylistDescription,
     /// The Edit Details dialog's name and description.
     PlaylistName,
     PlaylistDescription,
@@ -43,7 +43,6 @@ pub enum TextTarget {
     ConnectAddress,
     ConnectUser,
     ConnectPassword,
-    /// The search field of the current page.
     Page,
     /// The filter of an open submenu, such as Add to Playlist.
     MenuFind,
@@ -117,7 +116,6 @@ pub struct ControlState {
 pub enum SliderLook {
     /// A fill grows from the origin in the accent color.
     Accent,
-    /// Just a track and a thumb.
     Plain,
     /// The accent hue, on a fixed rainbow track.
     Hue,
@@ -175,7 +173,6 @@ impl SliderSpec {
     }
 }
 
-/// The on/off switch.
 pub fn switch(t: &Theme, id: impl Into<SharedString>, on: bool, enabled: bool, cx: &mut Context<Shell>, handler: impl Fn(&mut Shell, &mut Context<Shell>) + 'static) -> gpui::Stateful<gpui::Div> {
     switch_look(t, on, 1.0)
         .id(gpui::ElementId::Name(id.into()))
@@ -227,50 +224,60 @@ pub fn with_invalid_ring(mut base: Vec<BoxShadow>) -> Vec<BoxShadow> {
 
 /// A glass pill of mutually exclusive choices.
 pub fn segmented_glass<T: Copy + PartialEq + 'static>(t: &Theme, id: &'static str, value: T, options: &[(T, &'static str)], cx: &mut Context<Shell>, handler: impl Fn(&mut Shell, T, &mut Context<Shell>) + Clone + 'static) -> gpui::Div {
-    let mut pill = div().flex().flex_row().items_center().flex_none().h(t.s(CONTROL_H)).p(t.s(3.0)).rounded_full().bg(t.glass_fill()).shadow(glass_edge());
-    for (i, (option, label)) in options.iter().enumerate() {
-        let on = *option == value;
-        let (option, handler) = (*option, handler.clone());
-        let ink = crate::ui::ink((id, i));
-        pill = pill.child(
-            div()
-                .id((id, i))
-                .flex()
-                .items_center()
-                .h(t.s(34.0))
-                .px(t.s(15.0))
-                .rounded_full()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(if on { t.t_em().into() } else { ink.color(t.t2(), t.hover_ink()) })
-                .when(on, |d| d.bg(t.glass_on()))
-                .when(!on, |d| d.child(crate::ui::hover_track((id, i))).opacity(ink.opacity(1.0)))
-                .stop(&t).on_click(cx.listener(move |this, _, _, cx| handler(this, option, cx)))
-                .child(*label),
-        );
-    }
-    pill
+    let options: Vec<_> = options.iter().map(|&(option, label)| (option, label, None)).collect();
+    segmented(t, SegmentedLook::Glass, id, value, &options, cx, handler)
 }
 
-/// Settings' segmented control, with an accent fill. An option with a reason is disabled and says why.
+/// an option with a reason is disabled and says why.
 pub fn segmented_settings<T: Copy + PartialEq + 'static>(t: &Theme, id: &'static str, value: T, options: &[(T, &'static str, Option<&'static str>)], cx: &mut Context<Shell>, handler: impl Fn(&mut Shell, T, &mut Context<Shell>) + Clone + 'static) -> gpui::Div {
-    let mut pill = div().flex().flex_row().items_center().flex_none().p(t.s(3.0)).rounded_full().bg(t.panel_2());
-    for (i, (option, label, reason)) in options.iter().enumerate() {
+    segmented(t, SegmentedLook::Settings, id, value, options, cx, handler)
+}
+
+/// `Glass`: page toolbars, the larger size.
+#[derive(Clone, Copy, PartialEq)]
+enum SegmentedLook {
+    Settings,
+    Glass,
+}
+
+/// equal segments, with a divider between two that aren't selected.
+fn segmented<T: Copy + PartialEq + 'static>(t: &Theme, look: SegmentedLook, id: &'static str, value: T, options: &[(T, &'static str, Option<&'static str>)], cx: &mut Context<Shell>, handler: impl Fn(&mut Shell, T, &mut Context<Shell>) + Clone + 'static) -> gpui::Div {
+    let (h, radius) = match look {
+        SegmentedLook::Settings => (t.s(SEGMENTED_H), t.s(SEGMENTED_R)),
+        SegmentedLook::Glass => (t.s(SEGMENTED_GLASS_H), t.s(SEGMENTED_GLASS_H) / 2.0),
+    };
+    let eased: Vec<(f32, AnyElement)> = options.iter().enumerate().map(|(i, (option, ..))| crate::ui::toggle_ease((id, i), *option == value)).collect();
+    let shown: Vec<f32> = eased.iter().map(|(shown, _)| *shown).collect();
+    let mut group = div().grid().grid_cols_min_content(options.len() as u16).flex_none().h(h).rounded(radius).bg(t.segmented_track());
+    for ((i, (option, label, reason)), (_, ticker)) in options.iter().enumerate().zip(eased) {
         let on = *option == value;
         let (option, handler, reason) = (*option, handler.clone(), *reason);
         let ink = crate::ui::ink((id, i));
-        pill = pill.child(
+        let rest: Hsla = if reason.is_some() { t.t3().into() } else { ink.color(t.t2(), t.hover_ink()) };
+        let divider = (i > 0).then(|| {
             div()
-                .id((id, i))
+                .absolute()
+                .left(t.s(-SEGMENTED_DIVIDER_W / 2.0))
+                .top(t.s(SEGMENTED_DIVIDER_INSET))
+                .bottom(t.s(SEGMENTED_DIVIDER_INSET))
+                .w(t.s(SEGMENTED_DIVIDER_W))
+                .bg(t.segmented_divider())
+                .opacity(1.0 - shown[i].max(shown[i - 1]))
+        });
+        let segment = div().id((id, i)).relative().child(ticker).children(divider);
+        group = group.child(
+            if reason.is_none() { crate::ui::pressable(segment, (id, i)) } else { segment }
                 .flex()
                 .items_center()
-                .h(t.s(30.0))
-                .px(t.s(14.0))
-                .rounded_full()
+                .justify_center()
+                .h_full()
+                .px(t.s(SEGMENTED_PAD_X))
+                .rounded(radius)
+                .whitespace_nowrap()
                 .text_size(t.text(TEXT_SM))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(if on { t.on_accent.hsla(1.0) } else if reason.is_some() { t.t3().into() } else { ink.color(t.t2(), t.hover_ink()) })
-                .when(on, |d| d.bg(t.accent_hsla()).shadow(crate::ui::button_edge()))
-                .when(reason.is_none() && !on, |d| d.child(crate::ui::hover_track((id, i))).opacity(ink.opacity(1.0)))
+                .text_color(crate::ui::mix_hsla(rest, t.on_accent.hsla(1.0), shown[i]))
+                .when(shown[i] > 0.0, |d| d.bg(t.accent_hsla().opacity(shown[i])))
+                .when(reason.is_none() && !on, |d| d.opacity(ink.opacity(1.0)))
                 .stop(&t).on_click(cx.listener(move |this, _, _, cx| match reason {
                     Some(r) => this.show_toast(r, cx),
                     None => handler(this, option, cx),
@@ -278,17 +285,18 @@ pub fn segmented_settings<T: Copy + PartialEq + 'static>(t: &Theme, id: &'static
                 .child(*label),
         );
     }
-    pill
+    group
 }
 
-/// A compact icon button on a round glass pill.
-pub fn round_button(t: &Theme, id: impl Into<gpui::ElementId>, name: &'static str) -> gpui::Stateful<gpui::Div> {
-    div().id(id).flex().items_center().justify_center().flex_none().size(t.s(CONTROL_H)).rounded_full().bg(t.glass_fill()).shadow(glass_edge()).child(crate::ui::hover_fill(crate::ui::HoverShape::Pill, t.glass_hover(), t.glass_press())).child(icon(t, name, 18.0, t.t1()))
+pub fn round_button(t: &Theme, id: impl Into<gpui::ElementId>, label: impl Into<gpui::SharedString>, name: &'static str) -> gpui::Stateful<gpui::Div> {
+    let id = id.into();
+    crate::ui::pressable(div().id(id.clone()).tooltip(crate::ui::tip(t, label)), id).flex().items_center().justify_center().flex_none().size(t.s(CONTROL_H)).rounded_full().bg(t.glass_fill()).shadow(glass_edge()).child(crate::ui::hover_fill(crate::ui::HoverShape::Pill, t.glass_hover(), t.glass_press())).child(icon(t, name, 18.0, t.t1()))
 }
 
 /// A glass text button, such as a dialog's secondary button.
 pub fn glass_action(t: &Theme, id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
-    div().id(id).flex().flex_row().items_center().justify_center().flex_none().gap(t.s(crate::theme::size::BUTTON_GAP)).h(t.s(CONTROL_H)).px(t.s(16.0)).rounded_full().bg(t.glass_fill()).shadow(glass_edge()).font_weight(FontWeight::MEDIUM).text_color(t.t1()).child(crate::ui::hover_fill(crate::ui::HoverShape::Pill, t.glass_hover(), t.glass_press()))
+    let id = id.into();
+    crate::ui::pressable(div().id(id.clone()), id).flex().flex_row().items_center().justify_center().flex_none().gap(t.s(crate::theme::size::BUTTON_GAP)).h(t.s(CONTROL_H)).px(t.s(BUTTON_PAD)).rounded_full().bg(t.glass_fill()).shadow(glass_edge()).font_weight(FontWeight::MEDIUM).text_color(t.t1()).child(crate::ui::hover_fill(crate::ui::HoverShape::Pill, t.glass_hover(), t.glass_press()))
 }
 
 /// Any action button at the small size: `BUTTON_SMALL_H` tall, `BUTTON_SMALL_PAD` padding, `TEXT_XS` text.
@@ -312,20 +320,22 @@ pub fn small_glass_action(t: &Theme, id: impl Into<gpui::ElementId>) -> gpui::St
 /// A filled action, such as a dialog's primary or danger button. When disabled the fill stays
 /// faintly visible under a legible secondary-text label.
 fn filled_action(t: &Theme, id: impl Into<gpui::ElementId>, enabled: bool, fill: Srgb, ink: Hsla) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
+    let id = id.into();
+    let button = div()
+        .id(id.clone())
         .flex()
         .items_center()
         .justify_center()
         .flex_none()
         .gap(t.s(crate::theme::size::BUTTON_GAP))
         .h(t.s(CONTROL_H))
-        .px(t.s(20.0))
+        .px(t.s(BUTTON_PAD))
         .rounded_full()
         .font_weight(FontWeight::SEMIBOLD)
         .bg(fill.hsla(if enabled { 1.0 } else { DISABLED_OPACITY }))
         .shadow(crate::ui::button_edge())
-        .text_color(if enabled { ink } else { t.t2().into() })
+        .text_color(if enabled { ink } else { t.t2().into() });
+    if enabled { crate::ui::pressable(button, id) } else { button }
 }
 
 pub fn danger_action(t: &Theme, id: impl Into<gpui::ElementId>, enabled: bool) -> gpui::Stateful<gpui::Div> {
@@ -341,17 +351,16 @@ pub enum DialogButton {
 }
 
 pub fn dialog_button(t: &Theme, id: impl Into<gpui::ElementId>, kind: DialogButton, enabled: bool) -> gpui::Stateful<gpui::Div> {
-    let button = match kind {
+    match kind {
         DialogButton::Ghost => glass_action(t, id).when(!enabled, |d| d.opacity(DISABLED_OPACITY)),
         DialogButton::Primary => primary_action(t, id, enabled),
         DialogButton::Danger => danger_action(t, id, enabled),
-    };
-    button.px(t.s(DIALOG_BUTTON_PAD))
+    }
 }
 
 /// An empty state's action, a glass text button a little below the message.
 pub fn empty_action(t: &Theme, id: impl Into<gpui::ElementId>) -> gpui::Stateful<gpui::Div> {
-    glass_action(t, id).mt(t.s(8.0)).px(t.s(18.0)).text_color(t.t1())
+    glass_action(t, id).mt(t.s(8.0)).text_color(t.t1())
 }
 
 pub fn primary_action(t: &Theme, id: impl Into<gpui::ElementId>, enabled: bool) -> gpui::Stateful<gpui::Div> {
@@ -432,7 +441,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Runs the current pointer drag's move handler.
     pub fn pointer_drag_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         if let Some(on_move) = self.controls.pointer.as_ref().map(|p| p.on_move.clone()) {
             on_move(self, position, cx);
@@ -445,7 +453,7 @@ impl Shell {
         }
     }
 
-    /// A select pill's trigger. Opens the shared glass list.
+    /// opens the shared glass list.
     #[allow(clippy::too_many_arguments)]
     pub fn select_pill(&mut self, key: &str, value: impl Into<SharedString>, options: Rc<Vec<SelectOption>>, placeholder: &'static str, width: Option<f32>, on_change: impl Fn(&mut Shell, SharedString, &mut Context<Shell>) + 'static, cx: &mut Context<Self>) -> AnyElement {
         self.select_pill_sized(key, value, options, placeholder, width.map_or(PillWidth::Full, PillWidth::Fixed), on_change, cx)
@@ -604,7 +612,7 @@ impl Shell {
         }
     }
 
-    /// The open select's floating list, drawn above everything.
+    /// drawn above everything.
     pub fn render_select(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = self.theme;
         let state = self.controls.select.as_ref()?;
@@ -615,9 +623,9 @@ impl Shell {
         let value = state.value.clone();
         let scroll = state.scroll.clone();
         let query = state.query.clone();
-        let row_h = f32::from(t.s(34.0));
-        let filter_h = if filtering { f32::from(t.s(38.0)) } else { 0.0 };
-        let padding = f32::from(t.s(12.0));
+        let row_h = f32::from(t.s(MENU_ROW_H));
+        let filter_h = if filtering { f32::from(t.s(MENU_FIND_H + MENU_FIND_GAP)) } else { 0.0 };
+        let padding = f32::from(t.s(MENU_PAD * 2.0));
         let rows_h = rows.len().max(1) as f32 * row_h;
         let natural = rows_h + filter_h + padding;
         let viewport = window.viewport_size();
@@ -631,7 +639,7 @@ impl Shell {
         let max_h = (if flip { above } else { below }).max(160.0);
         let height = natural.min(max_h);
         let y = if flip { (top - gap - height).max(top_limit) } else { bottom + gap };
-        let width = f32::from(anchor.size.width).max(f32::from(t.s(240.0))).min(f32::from(t.s(380.0)));
+        let width = f32::from(anchor.size.width).max(f32::from(t.s(MENU_MIN_W))).min(f32::from(t.s(MENU_MAX_W)));
         let left_limit = f32::from(self.edge.left) + 10.0;
         let right_limit = f32::from(viewport.width - self.edge.right) - 10.0;
         let x = f32::from(anchor.origin.x).min(right_limit - width).max(left_limit);
@@ -643,7 +651,7 @@ impl Shell {
             let Some(options) = this.controls.select.as_ref().map(|s| s.options.clone()) else { return Vec::new() };
             range
                 .map(|i| match &menu_rows[i] {
-                    SelectRow::Heading(label) => div().h(px(row_h)).px(t.s(11.0)).pt(t.s(10.0)).text_size(t.text(TEXT_XS)).font_weight(FontWeight::SEMIBOLD).text_color(t.t2()).child(label.clone()).into_any_element(),
+                    SelectRow::Heading(label) => div().flex().items_center().h(px(row_h)).px(t.s(MENU_ROW_PAD_X)).text_size(t.text(MENU_DETAIL_TEXT)).font_weight(FontWeight::SEMIBOLD).text_color(t.t2()).child(label.clone()).into_any_element(),
                     SelectRow::Option { index, position } => {
                         let (index, position) = (*index, *position);
                         let option = &options[index];
@@ -654,15 +662,15 @@ impl Shell {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(t.s(10.0))
+                            .gap(t.s(MENU_GAP))
                             .h(px(row_h))
-                            .px(t.s(11.0))
-                            .rounded(t.s(10.0))
+                            .px(t.s(MENU_ROW_PAD_X))
+                            .rounded(t.s(MENU_ROW_R))
                             .when(is_active, |d| d.bg(t.hover()))
                             .on_click(cx.listener(move |this, _, _, cx| this.select_choose(index, cx)))
                             .when(option.unavailable.is_some(), |d| d.text_color(t.t3()))
                             .child(div().flex_1().min_w(px(0.0)).truncate().child(option.label.clone()))
-                            .when(option.value == value, |d| d.child(icon(&t, "check-bold", 14.0, t.accent_hsla())))
+                            .when(option.value == value, |d| d.child(icon(&t, "check-bold", MENU_ICON, t.accent_hsla())))
                             .into_any_element()
                     }
                 })
@@ -670,13 +678,14 @@ impl Shell {
         }))
         .track_scroll(&scroll)
         .h(px(list_h));
-        let mut menu = crate::ui::float_panel(&t).w(px(width)).h(px(height)).p(t.s(6.0)).flex().flex_col().text_color(t.t1());
+        let mut menu = crate::ui::float_panel(&t).w(px(width)).h(px(height)).p(t.s(MENU_PAD)).flex().flex_col().text_size(t.text(MENU_TEXT)).text_color(t.t1());
         if filtering {
             let line = self.text_line(&TextTarget::SelectFilter, &query, tr("Filter"), "select-filter-text", window);
-            menu = menu.child(crate::ui::float_filter(&t, "select-filter", line));
+            let clear = self.search_clear(TextTarget::SelectFilter, "select-filter-clear", &query, SEARCH_CLEAR_SM, cx);
+            menu = menu.child(crate::ui::float_filter(&t, "select-filter", line, clear));
         }
         menu = menu.child(if count == 0 {
-            div().px(t.s(11.0)).py(t.s(12.0)).text_size(t.text(TEXT_SM)).text_color(t.t2()).child(tr("No matches")).into_any_element()
+            div().px(t.s(MENU_ROW_PAD_X)).py(t.s(MENU_EMPTY_PAD_Y)).text_color(t.t2()).child(tr("No matches")).into_any_element()
         } else {
             list.into_any_element()
         });
@@ -691,7 +700,6 @@ impl Shell {
         Some(deferred(scrim).with_priority(10).into_any_element())
     }
 
-    /// Gives a field the keyboard.
     pub fn focus_text(&mut self, target: TextTarget, cx: &mut Context<Self>) {
         self.focus_field(target, cx);
     }
@@ -739,6 +747,7 @@ impl Shell {
             TextTarget::EqPresetName => self.eq_ui.preset_name.clone(),
             TextTarget::SmartName => self.smart.name.clone(),
             TextTarget::NewPlaylistName => self.new_playlist.as_ref().map(|d| d.name.clone()).unwrap_or_default(),
+            TextTarget::NewPlaylistDescription => self.new_playlist.as_ref().map(|d| d.description.clone()).unwrap_or_default(),
             TextTarget::ShareDescription | TextTarget::ShareDate => self.share_text(target),
             TextTarget::PlaylistName | TextTarget::PlaylistDescription => self.edit_playlist_text(target),
             TextTarget::SmartLimit => self.smart.state.limit.clone(),
@@ -777,9 +786,9 @@ impl Shell {
                 self.eq_ui.preset_name = value.chars().take(crate::eq_model::NAME_MAX).collect();
                 cx.notify();
             }
-            TextTarget::NewPlaylistName => {
+            TextTarget::NewPlaylistName | TextTarget::NewPlaylistDescription => {
                 if let Some(dialog) = self.new_playlist.as_mut() {
-                    dialog.name = value;
+                    if *target == TextTarget::NewPlaylistName { dialog.name = value } else { dialog.description = value }
                     dialog.error = None;
                     cx.notify();
                 }
@@ -836,7 +845,7 @@ impl Shell {
                 self.connect_submit(cx);
                 true
             }
-            Some(TextTarget::NewPlaylistName) => {
+            Some(TextTarget::NewPlaylistName | TextTarget::NewPlaylistDescription) => {
                 self.new_playlist_submit(cx);
                 true
             }
@@ -890,7 +899,7 @@ impl Shell {
     }
 }
 
-/// Keeps an element's window position and size for pointer math, relative to its parent.
+/// relative to its parent, for pointer math.
 pub fn track_bounds(store: Rc<RefCell<Bounds<Pixels>>>) -> impl IntoElement {
     crate::view_topbar::track_bounds(store)
 }

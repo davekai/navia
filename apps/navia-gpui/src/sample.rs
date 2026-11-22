@@ -276,6 +276,7 @@ impl SqliteLibrary {
                     disc_titles: Vec::new(),
                     edition: None,
                     edition_on_card: false,
+                    release_day: None,
                 },
                 description: strip_html(&description).into(),
             });
@@ -426,6 +427,9 @@ impl Library for SqliteLibrary {
     fn lyrics(&self, song_id: &str) -> Vec<LyricLine> {
         read_lyrics(song_id).unwrap_or_default()
     }
+    fn lyrics_writers(&self, song_id: &str) -> Vec<String> {
+        read_writers(song_id).unwrap_or_default()
+    }
     fn albums(&self) -> Arc<Vec<Album>> {
         self.catalog.albums.clone()
     }
@@ -470,6 +474,18 @@ impl Library for SqliteLibrary {
     }
 }
 
+/// the song's lyricists, else its composers, from the database's participants.
+fn read_writers(song_id: &str) -> Option<Vec<String>> {
+    let home = std::env::var("HOME").ok()?;
+    let db = format!("file:{home}/.containers/navidrome/data/navidrome.db?mode=ro");
+    let c = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI).ok()?;
+    let text: String = c.query_row("select participants from media_file where id=?1", [song_id], |r| r.get(0)).ok()?;
+    let roles: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let names = |role: &str| roles[role].as_array().map(|a| a.iter().filter_map(|p| p["name"].as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+    let lyricists = names("lyricist");
+    Some(if lyricists.is_empty() { names("composer") } else { lyricists })
+}
+
 fn read_lyrics(song_id: &str) -> Option<Vec<LyricLine>> {
     let db = sample_db()?;
     let c = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI).ok()?;
@@ -478,7 +494,7 @@ fn read_lyrics(song_id: &str) -> Option<Vec<LyricLine>> {
     let lists: Vec<navia_core::client::StructuredLyrics> = serde_json::from_str(&text).ok()?;
     let found = navia_core::lyrics::from_structured(lists)?;
     let synced = found.synced;
-    Some(found.lines.into_iter().map(|l| LyricLine { start_ms: l.start_ms.unwrap_or(0), text: SharedString::from(l.text.trim().to_string()), synced, timed: None }).filter(|l| !l.text.is_empty()).collect())
+    Some(found.lines.into_iter().map(|l| LyricLine { start_ms: l.start_ms.unwrap_or(0), text: SharedString::from(l.text.trim().to_string()), synced, timed: None, backing: None, backing_first: false }).collect())
 }
 
 /// Deterministic generated library, for machines without a Navidrome database.

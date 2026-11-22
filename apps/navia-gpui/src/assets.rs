@@ -19,15 +19,16 @@ icons!(
     "stack-regular", "guitar-regular", "playlist-regular", "gear-regular", "caret-down-bold", "caret-up-fill", "caret-down-fill", "caret-right-bold", "caret-left-bold",
     "arrows-down-up-regular", "funnel-simple-regular", "funnel-simple-fill", "list-bullets-regular", "list-bullets-fill", "rows-regular", "rows-fill",
     "flame-regular", "flame-fill", "star-four-regular", "star-four-fill", "arrow-down-regular", "heart-regular", "heart-fill", "dots-three-bold", "dots-six-vertical-bold",
-    "play-fill", "laptop-regular", "rewind-fill", "fast-forward-fill", "pause-fill", "repeat-bold", "shuffle-bold", "broom-bold", "headphones-regular", "repeat-regular", "shuffle-regular",
-    "speaker-high-regular", "speaker-low-regular", "speaker-slash-regular", "x-regular", "minus-regular", "square-regular",
+    "play-fill", "play-regular", "pause-lines-regular", "laptop-regular", "rewind-fill", "fast-forward-fill", "pause-fill", "repeat-bold", "shuffle-bold", "broom-bold", "headphones-regular", "repeat-regular", "shuffle-regular",
+    "speaker-high-regular", "speaker-low-regular", "speaker-none-regular", "speaker-slash-regular", "x-regular", "minus-regular", "square-regular",
     "nv-win-close", "nv-win-min-line", "nv-win-max-square", "nv-win-restore-squares", "nv-win-min-chevron", "nv-win-max-chevron", "nv-win-restore-diamond",
     "nv-lyrics", "nv-expand", "nv-collapse", "nv-bar", "nv-dock", "nv-library", "nv-airplay",
     "picture-in-picture-regular", "app-window-regular", "arrows-in-simple-bold", "arrows-out-simple-bold",
-    "queue-regular", "quotes-regular", "plus-regular", "plus-fill", "caret-up-down-bold", "arrow-down-fill", "arrow-bend-up-right-regular", "list-plus-regular", "disc-regular", "radio-regular", "share-network-regular", "grid-four-regular", "grid-four-fill", "user-plus-regular", "pencil-simple-regular", "export-regular", "lightning-fill", "sparkle-regular", "image-regular", "upload-regular", "users-regular", "link-simple-regular", "eye-slash-regular", "cloud-slash-fill", "stop-regular", "waveform-regular", "music-notes-regular", "music-notes-fill", "clock-regular", "user-fill", "copy-regular", "check-bold", "info-regular", "music-note-bold", "floppy-disk-regular", "trash-regular", "arrow-counter-clockwise-regular", "warning-fill", "lock-regular",
+    "queue-regular", "quotes-regular", "plus-regular", "plus-fill", "caret-up-down-bold", "arrow-down-fill", "arrow-bend-up-right-regular", "list-plus-regular", "disc-regular", "radio-regular", "share-network-regular", "grid-four-regular", "grid-four-fill", "user-plus-regular", "pencil-simple-regular", "export-regular", "lightning-fill", "sparkle-regular", "image-regular", "upload-regular", "users-regular", "link-simple-regular", "eye-slash-regular", "cloud-slash-regular", "cloud-slash-fill", "stop-regular", "waveform-regular", "music-notes-regular", "music-notes-fill", "clock-regular", "user-fill", "copy-regular", "check-bold", "info-regular", "music-note-bold", "floppy-disk-regular", "trash-regular", "arrow-counter-clockwise-regular", "warning-fill", "lock-regular",
     "navidrome-logo", "eye-regular", "lock-key-open-fill", "check-circle-fill", "warning-circle-fill", "circle-notch-regular", "hard-drives-regular", "sign-out-regular", "lightning-regular",
-    "device-mobile-speaker-regular", "x-bold", "minus-circle-regular", "arrows-clockwise-bold",
+    "device-mobile-speaker-regular", "x-bold", "minus-circle-regular", "arrows-clockwise-bold", "arrows-clockwise-regular",
     "nv-brand-mark", "nv-brand-word", "paper-plane-tilt-regular", "key-regular", "plus-bold", "lightbulb-fill", "copy-simple-regular",
+    "push-pin-regular", "push-pin-slash-regular", "x-circle-fill", "columns-regular", "wave-sine-bold",
 );
 
 /// Width over height of `nv-brand-word.svg`, from its viewBox. A test checks they agree.
@@ -55,7 +56,7 @@ impl AssetSource for Assets {
     }
 }
 
-/// The SVG with its viewBox widened by `margin` of its size on every side.
+/// widened by `margin` of its size on every side.
 fn with_margin(svg: &[u8], margin: f32) -> Option<String> {
     let text = std::str::from_utf8(svg).ok()?;
     let start = text.find("viewBox=\"")? + "viewBox=\"".len();

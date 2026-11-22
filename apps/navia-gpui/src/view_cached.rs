@@ -17,13 +17,11 @@ use crate::view_connect::Confirm;
 use crate::view_downloads::{ListSong, format_size};
 use crate::view_menu::MenuRow;
 
-/// How Cached Songs is ordered.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum CacheSort {
     /// Most recently played or cached first. This is the reverse of eviction order.
     #[default]
     Recent,
-    /// Largest first.
     Size,
 }
 
@@ -206,8 +204,7 @@ impl Shell {
             Some((rowid, fraction)) => self.download_progress_badge(("cached-dl", ix), rowid, fraction, cx),
             None if entry.rowid.is_some_and(|r| !self.downloaded.contains(&r)) => {
                 let keep_entry = entry.clone();
-                crate::ui::ink_button(&t, "keep", "arrow-down-regular", 17.0, t.t2().into(), t.hover_ink())
-                    .tooltip(crate::ui::tip(&t, tr("Keep Offline")))
+                crate::ui::ink_button(&t, "keep", tr("Keep Offline"), "arrow-down-regular", 17.0, t.t2().into(), t.hover_ink())
                     .stop(&t)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -219,8 +216,7 @@ impl Shell {
             None => div().flex_none().w(t.s(ACTION_W)).into_any_element(),
         };
         let remove_entry = entry.clone();
-        let remove = crate::ui::ink_button(&t, "remove", "x-regular", 17.0, t.t2().into(), t.hover_ink())
-            .tooltip(crate::ui::tip(&t, tr("Remove from Cache")))
+        let remove = crate::ui::ink_button(&t, "remove", tr("Remove from Cache"), "x-regular", 17.0, t.t2().into(), t.hover_ink())
             .stop(&t)
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -270,7 +266,7 @@ impl Shell {
         let n = chosen.len();
         let mut rows = Vec::new();
         if n == 1 && chosen[0].rowid.is_some() {
-            rows.push(MenuRow::item(tr("Play"), "play-fill", move |this, cx| this.play_cached(ix, cx)));
+            rows.push(MenuRow::item(tr("Play"), "play-regular", move |this, cx| this.play_cached(ix, cx)));
         }
         if chosen.iter().any(|r| r.rowid.is_some()) {
             let keep = chosen.clone();

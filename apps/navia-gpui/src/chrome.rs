@@ -255,8 +255,7 @@ mod wayland {
         })
     }
 
-    /// False only when the compositor hangs up. A slow one still counts, so a busy desktop at
-    /// login can't be mistaken for no session.
+    /// false only when the compositor hangs up; a slow one still counts, so a busy desktop at login isn't mistaken for none.
     fn answers(mut stream: UnixStream) -> bool {
         if request(&mut stream, 1, 0, &[2]).is_err() {
             return false; // wl_display.sync -> wl_callback#2

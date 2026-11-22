@@ -14,7 +14,7 @@ use navia_core::queue_order::{self, ShuffleStyle};
 use crate::core_library::CoreLibrary;
 use crate::shell::Shell;
 
-/// Work for the player, in the order it was made.
+/// in the order it was made.
 pub(crate) enum EditJob {
     /// Edits. A `SetQueue` among them starts at `start_ms`, paused or not.
     Edits { edits: Vec<Edit<u32>>, start_ms: u64, paused: bool },
@@ -22,7 +22,7 @@ pub(crate) enum EditJob {
     Ack(u64),
 }
 
-/// Starts the thread that hands edits to the player. It ends when the sender is dropped.
+/// it ends when the sender is dropped.
 pub(crate) fn spawn_edit_worker(lib: Arc<CoreLibrary>, player: Arc<CorePlayer>) -> mpsc::Sender<EditJob> {
     let (tx, rx) = mpsc::channel::<EditJob>();
     std::thread::Builder::new()
@@ -70,7 +70,7 @@ fn player_items(lib: &CoreLibrary, rows: &[(u32, bool)]) -> Vec<QueueItem> {
 }
 
 impl Shell {
-    /// The model's queue, when there's a real player.
+    /// when there's a real player.
     pub(crate) fn pq(&self) -> Option<&PlayQueue<u32>> {
         self.core.as_ref().map(|c| &c.pq)
     }
@@ -93,7 +93,6 @@ impl Shell {
         self.mirror_queue();
     }
 
-    /// `Player`'s queue fields from the model.
     pub(crate) fn mirror_queue(&mut self) {
         let Some(pq) = self.pq() else { return };
         let (queue, pos, run, current_queued, tail, shuffle) = (pq.songs(), pq.pos(), pq.queued_run(), pq.current_queued(), pq.other_tail(), pq.shuffle());

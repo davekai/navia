@@ -16,7 +16,6 @@ use crate::row_drag::{DragList, Slide};
 use crate::shell::{Layout, Shell};
 use crate::theme::size::*;
 
-/// What songs carried out of their list would drop onto.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SongTarget {
     /// One of the user's own regular playlists. Songs are added, asking about duplicates.
@@ -50,7 +49,7 @@ pub struct QueueTake {
     /// rather than Next from.
     pub at: usize,
     pub queued: bool,
-    /// The slot's top in the window, while the pointer is over the queue.
+    /// in window coordinates, while over the queue.
     pub slot_y: Option<Pixels>,
     pub gap_h: Pixels,
     pub shifts: HashMap<usize, Slide>,
@@ -97,7 +96,7 @@ impl Shell {
         let area = |b: &Bounds<Pixels>| f32::from(b.size.width) * f32::from(b.size.height);
         let found = marks.values().filter(|(b, _)| b.size.width > px(0.0) && b.size.height > px(0.0) && b.contains(&p)).min_by(|a, b| area(&a.0).total_cmp(&area(&b.0)))?;
         match found.1 {
-            // The queue's own rows reorder inside it, and don't drop on its tab or button.
+            // the queue's rows reorder inside it, and don't drop on its tab or button.
             SongTarget::Queue if from == DragList::Queue => None,
             SongTarget::QueueEnd if from == DragList::Queue => Some(SongTarget::Surface),
             ref target => Some(target.clone()),
@@ -112,7 +111,7 @@ impl Shell {
         }
     }
 
-    /// The playlists that take songs, read once when songs lift.
+    /// read once when songs lift.
     pub fn song_takers(&self) -> HashSet<SharedString> {
         let targets: Vec<(SharedString, SharedString)> = match self.core.as_ref() {
             Some(core) => core.lib.playlist_targets(),
@@ -326,7 +325,9 @@ impl Shell {
         };
         let dups = core.lib.already_in_playlist(&id, &songs);
         if dups.is_empty() {
-            core.lib.add_to_playlist(id.to_string(), name.to_string(), songs, None);
+            core.lib.add_to_playlist(id.to_string(), name.to_string(), songs.clone(), None);
+            self.flash_rows(&songs);
+            cx.notify();
             return;
         }
         let first = songs.first().and_then(|s| self.song_at(*s)).map(|s| s.title).unwrap_or_default();
@@ -354,7 +355,8 @@ impl Shell {
         let add = move |this: &mut Shell, songs: Vec<u32>, toast: Option<String>, cx: &mut Context<Shell>| {
             this.confirm = None;
             if let Some(core) = this.core.as_ref() {
-                core.lib.add_to_playlist(id.to_string(), name.to_string(), songs, toast);
+                core.lib.add_to_playlist(id.to_string(), name.to_string(), songs.clone(), toast);
+                this.flash_rows(&songs);
             }
             cx.notify();
         };

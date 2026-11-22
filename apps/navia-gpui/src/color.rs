@@ -53,7 +53,7 @@ const APCA_LO_OFFSET: f32 = 0.027;
 const APCA_LO_CLIP: f32 = 0.1;
 const APCA_DELTA_Y_MIN: f32 = 0.0005;
 
-/// APCA's screen luminance of a color, with its soft clamp near black.
+/// with its soft clamp near black.
 fn apca_y(c: Srgb) -> f32 {
     let [r, g, b] = APCA_COEFFS;
     let y = r * c.r.powf(APCA_TRC) + g * c.g.powf(APCA_TRC) + b * c.b.powf(APCA_TRC);
@@ -151,7 +151,7 @@ pub fn player_fg_dim(tint: Srgb) -> Srgb {
     from_oklch(Oklch { l: 0.85, c: (o.c * 1.6).min(0.11), h: o.h })
 }
 
-/// The packed `0xrrggbb` a color rounds to, for tests.
+/// for tests.
 #[cfg(test)]
 pub fn to_hex(c: Srgb) -> u32 {
     let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -203,7 +203,49 @@ pub fn parse_hex(v: &str) -> Option<u32> {
     is_hex(v).then(|| u32::from_str_radix(&v[1..], 16).ok()).flatten()
 }
 
-/// The hue slider's saturation and lightness, taken from the default accent hsl(218 88.6% 65.7%).
+pub const DEFAULT_ACCENT: u32 = 0x5a93f5;
+pub const ACCENT_PRESETS: [u32; 7] = [DEFAULT_ACCENT, 0x50ffff, 0x8b7cf6, 0xe879a6, 0xf2685c, 0xf5a33d, 0x4cc38a];
+/// below this HSL saturation the system accent has no real hue (graphite, grey).
+pub const SYSTEM_ACCENT_MIN_S: f32 = 0.1;
+
+/// the system's accent with its hue and chroma kept and its lightness held to the presets' range, so it reads on
+/// Navia's surfaces like they do; chroma drops only as far as sRGB needs. the default without one or without a real hue.
+pub fn system_accent(system: Option<u32>) -> u32 {
+    let Some(rgb) = system else { return DEFAULT_ACCENT };
+    let c = Srgb::hex(rgb);
+    let (high, low) = (c.r.max(c.g).max(c.b), c.r.min(c.g).min(c.b));
+    let l = (high + low) / 2.0;
+    let s = if high == low { 0.0 } else { (high - low) / (1.0 - (2.0 * l - 1.0).abs()) };
+    if s < SYSTEM_ACCENT_MIN_S {
+        return DEFAULT_ACCENT;
+    }
+    let lightness = ACCENT_PRESETS.map(|p| to_oklch(Srgb::hex(p)).l);
+    let (lo, hi) = lightness.iter().fold((f32::MAX, f32::MIN), |(a, b), &l| (a.min(l), b.max(l)));
+    let o = to_oklch(c);
+    let mut held = Oklch { l: o.l.clamp(lo, hi), ..o };
+    if !in_srgb(held) {
+        let (mut fits, mut over) = (0.0, held.c);
+        for _ in 0..24 {
+            let mid = (fits + over) / 2.0;
+            if in_srgb(Oklch { c: mid, ..held }) { fits = mid } else { over = mid }
+        }
+        held.c = fits;
+    }
+    let out = from_oklch(held);
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (byte(out.r) << 16) | (byte(out.g) << 8) | byte(out.b)
+}
+
+/// whether the colour is inside sRGB before any clipping.
+fn in_srgb(c: Oklch) -> bool {
+    let (a, b) = (c.c * c.h.to_radians().cos(), c.c * c.h.to_radians().sin());
+    let (l_, m_, s_) = (c.l + 0.3963377774 * a + 0.2158037573 * b, c.l - 0.1055613458 * a - 0.0638541728 * b, c.l - 0.0894841775 * a - 1.2914855480 * b);
+    let (l, m, s) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+    let rgb = [4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s, -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s, -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s];
+    rgb.iter().all(|v| (-1e-4..=1.0 + 1e-4).contains(v))
+}
+
+/// the default accent's saturation and lightness, so it sits on the slider.
 pub const ACCENT_S: f32 = 0.886;
 pub const ACCENT_L: f32 = 0.657;
 
@@ -235,8 +277,31 @@ pub fn hex_to_hue(rgb: u32) -> f32 {
 mod player_tint_tests {
     use super::*;
 
-    // Reference values for the player tint, oklch with per-channel sRGB clipping as browsers draw it.
-    // Four cover tints, one of them gray, and the fallback.
+    #[test]
+    fn system_accents_keep_their_own_hue() {
+        let hue = |rgb: u32| to_oklch(Srgb::hex(rgb)).h;
+        let near = |a: f32, b: f32| ((a - b + 540.0) % 360.0 - 180.0).abs() < 4.0;
+        // a dark olive desktop accent stays olive, only lighter
+        for olive in [0x717339, 0x5a5b33] {
+            let out = system_accent(Some(olive));
+            assert!(near(hue(out), hue(olive)), "{olive:06x} -> {out:06x}");
+            assert!(to_oklch(Srgb::hex(out)).l > to_oklch(Srgb::hex(olive)).l);
+            assert!(!ACCENT_PRESETS.contains(&out), "{out:06x}");
+        }
+        // the platform's purple, pink, orange, yellow, green and red stay themselves
+        for system in [0x953d96, 0xf74f9e, 0xf7821b, 0xffc600, 0x62ba46, 0xff5257] {
+            let out = system_accent(Some(system));
+            assert!(near(hue(out), hue(system)), "{system:06x} -> {out:06x}");
+        }
+        // inside the presets' lightness it's the colour itself
+        assert_eq!(system_accent(Some(0x8b7cf6)), 0x8b7cf6);
+        // grey or none gives the default
+        assert_eq!(system_accent(Some(0x8c8c8c)), DEFAULT_ACCENT);
+        assert_eq!(system_accent(None), DEFAULT_ACCENT);
+    }
+
+    // reference values for the player tint, oklch with per-channel sRGB clipping as browsers draw it.
+    // four cover tints, one of them gray, and the fallback.
     const REFERENCE: [(u32, u32, u32, u32); 5] = [
         (0x29609e, 0xa0e3ff, 0x9bd2ff, 0x055aa9),
         (0x0c0f33, 0xc4d8ff, 0xb7c9ff, 0x1b2050),

@@ -135,6 +135,7 @@ pub fn derive_raw(songs: &[Song]) -> (Vec<RawAlbum>, Vec<RawArtist>) {
             disc_titles: Vec::new(),
             edition: None,
             edition_on_card: false,
+            release_day: None,
         });
         album.song_count += 1;
         album.duration_s += song.duration_s;
