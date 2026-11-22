@@ -18,6 +18,10 @@ pub enum Error {
     #[error("server error {code} from {endpoint}: {message}")]
     Subsonic { code: i32, endpoint: String, message: String },
 
+    /// not sent: the server limited or failed an earlier request of this kind, and its wait isn't over.
+    #[error("waiting {seconds} s before asking the server for {endpoint} again")]
+    Waiting { endpoint: String, seconds: u64 },
+
     /// The response was not what the protocol promises.
     #[error("could not understand the server's response to {endpoint}: {detail}")]
     Decode { endpoint: String, detail: String },
@@ -92,7 +96,7 @@ impl Error {
     /// True when the failure is one that a later retry could fix.
     pub fn is_transient(&self) -> bool {
         match self {
-            Error::Network(_) => true,
+            Error::Network(_) | Error::Waiting { .. } => true,
             Error::HttpStatus { status, .. } => *status >= 500 || *status == 429 || *status == 408,
             _ => false,
         }

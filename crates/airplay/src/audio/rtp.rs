@@ -42,26 +42,17 @@ pub mod payload_types {
 pub struct RtpHeader {
     /// Version (2 bits) - always 2.
     pub version: u8,
-    /// Padding flag.
     pub padding: bool,
-    /// Extension flag.
     pub extension: bool,
-    /// CSRC count.
     pub csrc_count: u8,
-    /// Marker bit.
     pub marker: bool,
-    /// Payload type.
     pub payload_type: u8,
-    /// Sequence number.
     pub sequence: u16,
-    /// Timestamp.
     pub timestamp: u32,
-    /// SSRC identifier.
     pub ssrc: u32,
 }
 
 impl RtpHeader {
-    /// Create new header with defaults.
     pub fn new(payload_type: u8, sequence: u16, timestamp: u32, ssrc: u32) -> Self {
         Self {
             version: 2,
@@ -76,13 +67,11 @@ impl RtpHeader {
         }
     }
 
-    /// Set marker bit.
     pub fn with_marker(mut self, marker: bool) -> Self {
         self.marker = marker;
         self
     }
 
-    /// Set extension flag.
     pub fn with_extension(mut self, extension: bool) -> Self {
         self.extension = extension;
         self
@@ -113,7 +102,6 @@ impl RtpHeader {
         buf
     }
 
-    /// Parse from bytes.
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 12 {
             return Err(Error::Parse(
@@ -135,7 +123,6 @@ impl RtpHeader {
     }
 }
 
-/// Complete RTP packet.
 #[derive(Debug, Clone)]
 pub struct RtpPacket {
     pub header: RtpHeader,
@@ -147,7 +134,6 @@ pub struct RtpPacket {
 }
 
 impl RtpPacket {
-    /// Create new packet.
     pub fn new(header: RtpHeader, payload: Vec<u8>) -> Self {
         Self {
             header,
@@ -245,7 +231,6 @@ impl RtpPacket {
         })
     }
 
-    /// Total size in bytes.
     pub fn size(&self) -> usize {
         12 + self.payload.len()
             + self.nonce.map(|_| 8).unwrap_or(0)
@@ -281,7 +266,6 @@ impl RetransmitRequest {
             ));
         }
 
-        // Verify payload type is 85
         let payload_type = data[1] & 0x7F;
         if payload_type != payload_types::RETRANSMIT_REQUEST {
             return Err(Error::Parse(
@@ -306,8 +290,6 @@ impl RetransmitRequest {
 /// Format: 4-byte header (sequence number + padding) followed by the
 /// original full RTP audio packet.
 pub fn build_retransmit_response(original_packet: &[u8]) -> Vec<u8> {
-    // Retransmit response: 4-byte retransmit header + original RTP packet
-    // The 4-byte header contains the original sequence number.
     let mut response = Vec::with_capacity(4 + original_packet.len());
 
     // Byte 0-1: RTP-like header with marker + PT 86
@@ -332,15 +314,12 @@ pub fn build_retransmit_response(original_packet: &[u8]) -> Vec<u8> {
 /// Maximum number of recent packets to retain for retransmission.
 const PACKET_HISTORY_SIZE: usize = 512;
 
-/// RTP sender over UDP.
 pub struct RtpSender {
     socket: Option<UdpSocket>,
     dest: SocketAddr,
     /// Separate destination for control/sync packets (if different from data port)
     control_dest: Option<SocketAddr>,
-    /// Separate socket for sending sync/control packets from our declared control port.
-    /// Without this, sync packets are sent from the data socket (wrong source port)
-    /// and the receiver ignores them.
+    /// sync packets must leave from our declared control port, or the receiver ignores them.
     control_socket: Option<UdpSocket>,
     sequence: u16,
     ssrc: u32,
@@ -354,9 +333,7 @@ pub struct RtpSender {
 }
 
 impl RtpSender {
-    /// Create new sender.
-    ///
-    /// Sequence starts at 0 to match what's advertised in RECORD RTP-Info header.
+    /// sequence starts at 0 to match the RECORD RTP-Info header.
     pub fn new(dest: SocketAddr, ssrc: u32) -> Self {
         let mut packet_history = Vec::with_capacity(PACKET_HISTORY_SIZE);
         packet_history.resize_with(PACKET_HISTORY_SIZE, || None);
@@ -387,16 +364,11 @@ impl RtpSender {
         self.control_dest = Some(dest);
     }
 
-    /// Set a separate socket for sending sync/control packets.
-    ///
-    /// This socket should be bound to our declared control port (from SETUP phase 2).
-    /// The receiver expects sync packets to arrive from this port, not from the
-    /// data socket's random port.
+    /// bound to our declared control port (SETUP phase 2); the receiver expects sync packets from it.
     pub fn set_control_socket(&mut self, socket: UdpSocket) {
         self.control_socket = Some(socket);
     }
 
-    /// Bind to local port.
     pub fn bind(&mut self, local_port: u16) -> Result<u16> {
         let socket = UdpSocket::bind(("0.0.0.0", local_port))?;
         set_socket_qos(&socket);
@@ -405,21 +377,15 @@ impl RtpSender {
         Ok(port)
     }
 
-    /// Set encryption cipher.
     pub fn set_cipher(&mut self, cipher: Box<dyn PacketCipher>) {
         self.cipher = Some(cipher);
     }
 
-    /// Reset sync state after FLUSH.
-    ///
-    /// Per the AirPlay spec, the extension bit must be set on the first sync
-    /// packet after RECORD or FLUSH. This resets the flag so the next sync
-    /// packet will have the extension bit set.
+    /// the first sync packet after RECORD or FLUSH must carry the extension bit; this re-arms it.
     pub fn reset_sync_state(&mut self) {
         self.first_sync_sent = false;
     }
 
-    /// Send a raw packet.
     pub fn send(&mut self, packet: &RtpPacket) -> Result<()> {
         let socket = self.socket.as_ref()
             .ok_or_else(|| Error::Streaming(
@@ -442,12 +408,10 @@ impl RtpSender {
         let header = RtpHeader::new(payload_type, self.sequence, timestamp, self.ssrc)
             .with_marker(marker);
 
-        // Encrypt if cipher is set, then build serialized packet
         let serialized = if let Some(cipher) = &self.cipher {
             let seq_before = self.sequence;
             let encrypted = cipher.encrypt_payload(payload, timestamp, self.ssrc, self.sequence)?;
 
-            // Debug: log nonce and tag for first few packets
             if seq_before % 500 == 0 {
                 if let (Some(nonce), Some(tag)) = (&encrypted.nonce, &encrypted.tag) {
                     tracing::info!(
@@ -479,7 +443,6 @@ impl RtpSender {
             packet.serialize()
         };
 
-        // Diagnostic: log first packet's wire format to verify structure
         if self.sequence == 0 {
             let has_cipher = self.cipher.is_some();
             tracing::info!(
@@ -491,18 +454,16 @@ impl RtpSender {
             );
         }
 
-        // Store serialized packet in history for retransmission (move instead of clone)
+        // kept for retransmission.
         let idx = self.sequence as usize % PACKET_HISTORY_SIZE;
         self.packet_history[idx] = Some(serialized);
 
         tracing::debug!("Audio packet prepared: seq={}, ts={}, len={}", self.sequence, timestamp, payload.len());
         self.sequence = self.sequence.wrapping_add(1);
 
-        // Return a reference to the stored copy (avoids clone since we just stored it)
         Ok(self.packet_history[idx].as_ref().unwrap().clone())
     }
 
-    /// Send encoded audio packet.
     pub fn send_audio(
         &mut self,
         payload_type: u8,
@@ -543,7 +504,6 @@ impl RtpSender {
     /// - Bytes 8-15: NTP timestamp (8 bytes BE - seconds + fraction)
     /// - Bytes 16-19: RTP timestamp (BE)
     pub fn send_sync(&mut self, rtp_timestamp: u32, ntp_timestamp: u64) -> Result<()> {
-        // Get the destination - control port if set, otherwise data port
         let dest = self.control_dest.unwrap_or(self.dest);
 
         // Skip sync packets if destination port is 0 (AirPlay 2 buffered doesn't use sync packets)
@@ -552,15 +512,13 @@ impl RtpSender {
             return Ok(());
         }
 
-        // Use control socket if available (sends from our declared control port),
-        // otherwise fall back to data socket.
+        // sync must leave from our declared control port when there is one.
         let socket = self.control_socket.as_ref()
             .or(self.socket.as_ref())
             .ok_or_else(|| Error::Streaming(
                 crate::base::error::StreamingError::Encoding("Socket not bound".into())
             ))?;
 
-        // Build owntone-style sync packet (20 bytes)
         let mut packet = [0u8; 20];
 
         // Byte 0: 0x90 for first sync (extension bit set), 0x80 for subsequent
@@ -583,7 +541,6 @@ impl RtpSender {
         packet[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
 
         socket.send_to(&packet, dest)?;
-        // Diagnostic: log first sync packet in detail
         if self.sync_sequence <= 2 {
             let ntp_secs = (ntp_timestamp >> 32) as u32;
             let ntp_frac = ntp_timestamp as u32;
@@ -678,11 +635,9 @@ impl RtpSender {
         // 0xD7 = marker (0x80) | PT 87 (0x57)
         packet[1] = 0xD7;
 
-        // Sequence
         packet[2..4].copy_from_slice(&self.sync_sequence.to_be_bytes());
         self.sync_sequence = self.sync_sequence.wrapping_add(1);
 
-        // Current RTP timestamp
         packet[4..8].copy_from_slice(&current_rtp_ts.to_be_bytes());
 
         // PTP time: seconds(32) + fraction(32)
@@ -692,10 +647,8 @@ impl RtpSender {
         packet[8..12].copy_from_slice(&ptp_secs.to_be_bytes());
         packet[12..16].copy_from_slice(&ptp_frac.to_be_bytes());
 
-        // Next RTP timestamp
         packet[16..20].copy_from_slice(&next_rtp_ts.to_be_bytes());
 
-        // Master clock ID
         packet[20..28].copy_from_slice(master_clock_id);
 
         if self.sync_sequence <= 2 {
@@ -750,25 +703,19 @@ impl RtpSender {
         }
     }
 
-    /// Get current sequence number.
     pub fn sequence(&self) -> u16 {
         self.sequence
     }
 
-    /// Get SSRC.
     pub fn ssrc(&self) -> u32 {
         self.ssrc
     }
 
-    /// Get local port (after bind).
     pub fn local_port(&self) -> Option<u16> {
         self.socket.as_ref().and_then(|s| s.local_addr().ok().map(|a| a.port()))
     }
 
-    /// Handle a retransmit request by resending the requested packets.
-    ///
-    /// Looks up the requested sequence numbers in the packet history
-    /// and sends retransmit responses (payload type 86) to the control port.
+    /// resends the requested packets from history as retransmit responses (PT 86) to the control port.
     /// Returns the number of packets successfully retransmitted.
     pub fn handle_retransmit(&self, request: &RetransmitRequest) -> Result<u16> {
         // Use control socket for retransmit responses (same port as sync)
@@ -825,12 +772,10 @@ pub struct RtpReceiver {
 }
 
 impl RtpReceiver {
-    /// Create new receiver.
     pub fn new() -> Self {
         Self { socket: None }
     }
 
-    /// Bind to local port.
     pub fn bind(&mut self, local_port: u16) -> Result<u16> {
         let socket = UdpSocket::bind(("0.0.0.0", local_port))?;
         set_socket_qos(&socket);
@@ -840,7 +785,6 @@ impl RtpReceiver {
         Ok(port)
     }
 
-    /// Receive packet with timeout.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<RtpPacket>> {
         let socket = self.socket.as_ref()
             .ok_or_else(|| Error::Streaming(
@@ -859,8 +803,6 @@ impl RtpReceiver {
     }
 
     /// Receive raw bytes with timeout (for packets that may not be standard RTP).
-    ///
-    /// Returns `Ok(Some((data, addr)))` on success, `Ok(None)` on timeout.
     pub fn recv_raw_timeout(&self, timeout: Duration) -> Result<Option<(Vec<u8>, std::net::SocketAddr)>> {
         let socket = self.socket.as_ref()
             .ok_or_else(|| Error::Streaming(
@@ -878,16 +820,11 @@ impl RtpReceiver {
         }
     }
 
-    /// Get local port (after bind).
     pub fn local_port(&self) -> Option<u16> {
         self.socket.as_ref().and_then(|s| s.local_addr().ok().map(|a| a.port()))
     }
 
-    /// Clone the underlying socket (for sharing with RtpSender for sync packets).
-    ///
-    /// The cloned socket shares the same underlying OS socket, so both handles
-    /// send from the same local port. This lets the RtpSender send sync packets
-    /// from our declared control port.
+    /// clones the socket so RtpSender can send sync packets from this same control port.
     pub fn try_clone_socket(&self) -> Result<Option<UdpSocket>> {
         match &self.socket {
             Some(s) => Ok(Some(s.try_clone()?)),
@@ -1103,17 +1040,11 @@ mod tests {
 
         #[test]
         fn sync_sent_from_control_socket_not_data_socket() {
-            // The receiver expects sync packets from our declared control port.
-            // This test verifies that when a control_socket is set, sync packets
-            // are sent from it (and thus from the correct source port), NOT from
-            // the data socket.
-
-            // Listener to receive the sync packet
+            // sync packets must come from the control socket's port, not the data socket's.
             let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
             let listener_addr = listener.local_addr().unwrap();
             listener.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
 
-            // Create sender with data socket on one port
             let mut sender = RtpSender::new(listener_addr, 0xABCD);
             sender.set_control_dest(listener_addr);
             let data_port = sender.bind(0).unwrap();
@@ -1124,10 +1055,8 @@ mod tests {
             assert_ne!(data_port, control_port, "ports must differ for this test");
             sender.set_control_socket(control_socket);
 
-            // Send a sync packet
             sender.send_sync(0, 0).unwrap();
 
-            // Receive it and check the source port
             let mut buf = [0u8; 64];
             let (_len, src_addr) = listener.recv_from(&mut buf).unwrap();
 
@@ -1205,13 +1134,11 @@ mod tests {
             sender.set_control_dest(listener_addr);
             sender.bind(0).unwrap();
 
-            // First sync
             sender.send_sync(0, 0).unwrap();
             let mut buf = [0u8; 64];
             listener.recv_from(&mut buf).unwrap();
             assert_eq!(buf[0], 0x90, "first sync should have extension bit");
 
-            // Second sync
             sender.send_sync(352, 1000).unwrap();
             listener.recv_from(&mut buf).unwrap();
             assert_eq!(buf[0], 0x80, "subsequent syncs should NOT have extension bit");
@@ -1260,26 +1187,21 @@ mod tests {
 
         #[test]
         fn cloned_socket_can_send_from_control_port() {
-            // This is the key integration test: verify that a cloned receiver socket
-            // can be used by the sender to send sync packets from the control port.
+            // a cloned receiver socket lets the sender send sync packets from the control port.
             let mut receiver = RtpReceiver::new();
             let control_port = receiver.bind(0).unwrap();
 
-            // Clone the socket for the sender
             let control_socket = receiver.try_clone_socket().unwrap().unwrap();
 
-            // Set up a listener to receive the sync
             let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
             let listener_addr = listener.local_addr().unwrap();
             listener.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
 
-            // Create sender and give it the cloned control socket
             let mut sender = RtpSender::new(listener_addr, 0x1234);
             sender.set_control_dest(listener_addr);
             sender.bind(0).unwrap();
             sender.set_control_socket(control_socket);
 
-            // Send sync
             sender.send_sync(0, 0).unwrap();
 
             // Verify it arrived from the control port
@@ -1379,7 +1301,6 @@ mod tests {
             // 4-byte retransmit header + original packet
             assert_eq!(response.len(), 4 + original_bytes.len());
 
-            // Check retransmit header
             assert_eq!(response[0], 0x80); // V=2
             assert_eq!(response[1], 0x80 | payload_types::RETRANSMIT_RESPONSE); // M=1, PT=86
 
@@ -1445,7 +1366,6 @@ mod tests {
 
             // Byte 1: 0xD7 = marker (0x80) | PT 87 (0x57)
             assert_eq!(buf[1], 0xD7);
-            // Verify PT extraction
             assert_eq!(buf[1] & 0x7F, payload_types::PTP_SYNC);
         }
 

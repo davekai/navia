@@ -1,7 +1,25 @@
-//! Bringing the local library in step with the server. A full sync pages `search3` per library,
-//! writing each page with its resume cursor so a crash loses at most one page. Removal waits until
-//! every page was seen and the server's scan state held still, since offset paging can skip rows.
+//! Bringing the local library in step with the server.
+//!
+//! A full sync pages `search3` with an empty query, per library, advancing by what the server
+//! actually sent and stopping on an empty page (Navidrome caps some lists silently). Each
+//! page is written in one transaction together with the resume cursor, so a crash at any point
+//! loses at most the page in flight and the next run carries on from there.
+//!
+//! Removal only happens once all pages for a library were seen, and only if the server's scan
+//! state didn't change mid-way, because offset paging over a changing list can skip rows.
+//!
+//! after a scan, a refresh usually reads only what changed: the album list, then `getAlbum` for
+//! each album that's new or whose entry differs from the stored one, then the artist list if any
+//! album came, went or changed. the Subsonic album entry has no change stamp, so the entry itself
+//! is the signal: a song added, removed or re-timed moves its album's `songCount` or `duration`, a
+//! new cover moves `coverArt`'s hash, a retag moves the album's tags. a song retagged or replaced
+//! in place without touching its album doesn't show there. on Navidrome, with
+//! [`SyncOptions::song_updates`], the pass also reads the songs whose `updatedAt` moved since the
+//! last pass (native API, newest first) and refetches their albums. a full sync still runs on the
+//! first sync, after a held removal, and once [`FULL_SYNC_EVERY`] has passed
+//! ([`FULL_SYNC_EVERY_WITH_UPDATES`] while song updates are being read).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -13,12 +31,24 @@ use crate::client::native::{LibraryTotals, PlaylistImageError, SmartSaveError, S
 use crate::smart_rules::{checked_criteria, checked_name};
 use crate::client::{Album, AlbumListOptions, Artist, Client, MusicFolder, Playlist, PlaylistDetails, SearchKind, Song};
 use crate::error::{Error, Result};
-use crate::library::{Library, LibraryCounts};
+use crate::client::native::SongUpdates;
+use crate::library::{Library, LibraryCounts, RefetchedAlbum};
 use crate::reporting::PlayReporter;
 
 const META_LAST_MARKER: &str = "last_scan_marker";
 const META_LAST_COMPLETED: &str = "last_completed_at";
 const META_NEEDS_RECONCILE: &str = "needs_reconcile";
+const META_LAST_FULL: &str = "last_full_sync_at";
+/// how long refreshes may read only what changed before one walks every song again.
+pub const FULL_SYNC_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// the same while song updates are read too, so only what neither signal shows waits this long.
+pub const FULL_SYNC_EVERY_WITH_UPDATES: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// per library: the newest song `updatedAt` the last pass saw.
+const META_SONG_MARK: &str = "song_update_mark";
+/// set while the last pass could read song updates for every library.
+const META_SONG_UPDATES_OK: &str = "song_updates_ok";
+/// updated songs one change pass follows; past this a full sync is cheaper.
+const SONG_UPDATES_MAX: usize = 5000;
 /// How long a sync waits for the server's library totals before it starts without them.
 const TOTALS_WAIT: Duration = Duration::from_secs(5);
 
@@ -91,11 +121,16 @@ pub struct SyncOptions {
     /// Ask Navidrome's native API for each library's totals, so the bar is determinate. It logs
     /// in, so it's off unless the app asks and test runs must leave it off.
     pub server_totals: bool,
+    /// on Navidrome, read which songs a scan updated (native API, newest `updatedAt` first), so a
+    /// song retagged in place is picked up without a full sync. it logs in (once per client), so
+    /// it's off unless the app asks, and test runs must leave it off. without it, or when the
+    /// server doesn't answer, the daily full sync covers those songs.
+    pub song_updates: bool,
 }
 
 impl Default for SyncOptions {
     fn default() -> Self {
-        Self { page_size: 500, page_delay: Duration::from_millis(20), cancel: Arc::new(AtomicBool::new(false)), play_history: false, synced_smart: true, watch: None, server_totals: false }
+        Self { page_size: 500, page_delay: Duration::from_millis(20), cancel: Arc::new(AtomicBool::new(false)), play_history: false, synced_smart: true, watch: None, server_totals: false, song_updates: false }
     }
 }
 
@@ -288,8 +323,18 @@ pub struct LibrarySyncResult {
     pub removal_held: Option<String>,
 }
 
+/// which kind of pass a sync was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncPass {
+    /// every artist, album and song page.
+    Full,
+    /// the album list, then only new and changed albums' songs.
+    Changes,
+}
+
 #[derive(Clone, Debug)]
 pub struct SyncOutcome {
+    pub pass: SyncPass,
     pub status: SyncStatus,
     pub libraries: Vec<LibrarySyncResult>,
     pub counts: LibraryCounts,
@@ -325,7 +370,7 @@ impl Syncer {
     /// A full sync, resuming any interrupted generation.
     pub async fn full_sync(&self, on_progress: &(dyn Fn(SyncProgress) + Send + Sync)) -> Result<SyncOutcome> {
         let _gate = self.library.sync_gate().await;
-        self.run(on_progress).await
+        self.run(SyncPass::Full, on_progress).await
     }
 
     /// Sync only if the server's library changed since the last complete sync, unless `force`.
@@ -342,10 +387,79 @@ impl Syncer {
         if status.as_ref().is_some_and(|s| s.scanning) {
             return Ok(RefreshOutcome::ServerScanning);
         }
-        if !force && self.is_current(status.as_ref().and_then(|s| s.last_scan.as_deref()))? {
+        let marker = status.as_ref().and_then(|s| s.last_scan.as_deref());
+        if !force && self.is_current(marker)? {
             return Ok(RefreshOutcome::Unchanged);
         }
-        Ok(RefreshOutcome::Synced(self.run(on_progress).await?))
+        let pass = if self.changes_suffice(marker)? { SyncPass::Changes } else { SyncPass::Full };
+        Ok(RefreshOutcome::Synced(self.run(pass, on_progress).await?))
+    }
+
+    /// whether reading only what changed is enough: a sync has finished, nothing was held back, the
+    /// server reports scans (so one during the pass holds removal), and the last full sync is
+    /// recent. a library whose full sync never finished gets one inside the pass anyway.
+    fn changes_suffice(&self, marker: Option<&str>) -> Result<bool> {
+        let lib = &self.library;
+        if marker.is_none() || lib.meta(META_NEEDS_RECONCILE)?.is_some() {
+            return Ok(false);
+        }
+        // libraries synced before change passes existed only ever finished full ones.
+        let last_full = lib.meta(META_LAST_FULL)?.or(lib.meta(META_LAST_COMPLETED)?).and_then(|s| s.parse::<u64>().ok());
+        let updates = self.options.song_updates && lib.meta(META_SONG_UPDATES_OK)?.is_some();
+        let every = if updates { FULL_SYNC_EVERY_WITH_UPDATES } else { FULL_SYNC_EVERY };
+        Ok(!full_sync_due(last_full, unix_seconds(), every))
+    }
+
+    /// the songs a scan updated in one library since the last pass, or `None` when they can't be read
+    /// (not asked for, not Navidrome, the login or request failed): the full sync covers them then.
+    async fn song_updates(&self, library_id: &str) -> Option<SongUpdates> {
+        if !self.options.song_updates {
+            return None;
+        }
+        let key = song_mark_key(library_id);
+        let mark = self.library.meta(&key).ok()?;
+        match self.client.songs_updated_since(library_id, mark.as_deref(), SONG_UPDATES_MAX).await {
+            Ok(updates) => Some(updates),
+            Err(e) => {
+                tracing::info!("song updates unavailable for library {library_id}: {e}");
+                None
+            }
+        }
+    }
+
+    /// where song updates start next time: each library's newest `updatedAt`, or `None` when any
+    /// can't be read.
+    async fn song_marks(&self, folders: &[MusicFolder]) -> Option<Vec<(String, Option<String>)>> {
+        if !self.options.song_updates {
+            return None;
+        }
+        let mut marks = Vec::with_capacity(folders.len());
+        for folder in folders {
+            match self.client.songs_updated_since(&folder.id, None, 0).await {
+                Ok(u) => marks.push((folder.id.clone(), u.newest)),
+                Err(e) => {
+                    tracing::info!("song updates unavailable: {e}");
+                    return None;
+                }
+            }
+        }
+        Some(marks)
+    }
+
+    async fn store_song_marks(&self, marks: Option<Vec<(String, Option<String>)>>) -> Result<()> {
+        self.library
+            .blocking(move |l| {
+                match &marks {
+                    Some(marks) => {
+                        for (library, mark) in marks {
+                            l.set_meta(&song_mark_key(library), mark.as_deref())?;
+                        }
+                        l.set_meta(META_SONG_UPDATES_OK, Some("1"))
+                    }
+                    None => l.set_meta(META_SONG_UPDATES_OK, None),
+                }
+            })
+            .await
     }
 
     fn is_current(&self, marker: Option<&str>) -> Result<bool> {
@@ -356,9 +470,9 @@ impl Syncer {
             && lib.meta(META_LAST_MARKER)?.as_deref() == marker)
     }
 
-    async fn run(&self, on_progress: &(dyn Fn(SyncProgress) + Send + Sync)) -> Result<SyncOutcome> {
+    async fn run(&self, pass: SyncPass, on_progress: &(dyn Fn(SyncProgress) + Send + Sync)) -> Result<SyncOutcome> {
         let Some(watch) = self.options.watch.clone() else {
-            return self.run_pages(on_progress).await;
+            return self.run_pass(pass, on_progress).await;
         };
         // First means no pass has ever finished here, even if an interrupted first sync resumes.
         let first = self.library.meta(META_LAST_COMPLETED).map(|m| m.is_none()).unwrap_or(false);
@@ -367,13 +481,20 @@ impl Syncer {
             watch.update(p.meter);
             on_progress(p);
         };
-        let result = self.run_pages(&shown).await;
+        let result = self.run_pass(pass, &shown).await;
         match &result {
             // The playlist pass that follows a first sync keeps the bar until it ends.
             Ok(outcome) if first && outcome.status == SyncStatus::Complete => watch.update(SyncMeter::new(SyncStage::Playlists, 0, None)),
             _ => watch.finish(),
         }
         result
+    }
+
+    async fn run_pass(&self, pass: SyncPass, on_progress: &(dyn Fn(SyncProgress) + Send + Sync)) -> Result<SyncOutcome> {
+        match pass {
+            SyncPass::Full => self.run_pages(on_progress).await,
+            SyncPass::Changes => self.run_changes(on_progress).await,
+        }
     }
 
     async fn run_pages(&self, on_progress: &(dyn Fn(SyncProgress) + Send + Sync)) -> Result<SyncOutcome> {
@@ -395,31 +516,219 @@ impl Syncer {
 
         let mut results = Vec::with_capacity(folders.len());
         let mut any_held = false;
+        // taken before the pages, so anything updated while they're read is still ahead of the mark.
+        let marks = self.song_marks(&folders).await;
         let libraries = self.library_totals(&folders).await;
         let mut tally = RunTally { songs_total: start_status.as_ref().and_then(|s| s.count).map(|c| c.min(u32::MAX as u64) as u32), libraries, ..Default::default() };
         for (index, folder) in folders.iter().enumerate() {
             let Some(result) = self.sync_library(folder, index, marker.as_deref(), scanning, &mut tally, on_progress).await? else {
-                return self.outcome(SyncStatus::Cancelled, results, started);
+                return self.outcome(SyncPass::Full, SyncStatus::Cancelled, results, started);
             };
             any_held |= result.removal_held.is_some();
             results.push(result);
         }
+        self.store_completed(SyncPass::Full, marker, any_held).await?;
+        if self.options.song_updates {
+            self.store_song_marks(marks).await?;
+        }
+        self.outcome(SyncPass::Full, SyncStatus::Complete, results, started)
+    }
 
-        let lib = self.library.clone();
-        let marker_to_store = marker.clone();
-        lib.blocking(move |l| {
-            l.set_meta(META_LAST_COMPLETED, Some(&unix_seconds().to_string()))?;
-            if any_held {
-                l.set_meta(META_NEEDS_RECONCILE, Some("1"))?;
-            } else {
-                l.set_meta(META_NEEDS_RECONCILE, None)?;
-                l.set_meta(META_LAST_MARKER, marker_to_store.as_deref())?;
+    /// records a pass that reached the end of every library. with `reconcile` (something was held
+    /// back or skipped) the scan marker isn't kept, so the next refresh runs, and runs in full.
+    async fn store_completed(&self, pass: SyncPass, marker: Option<String>, reconcile: bool) -> Result<()> {
+        self.library
+            .blocking(move |l| {
+                let now = unix_seconds().to_string();
+                l.set_meta(META_LAST_COMPLETED, Some(&now))?;
+                if pass == SyncPass::Full {
+                    l.set_meta(META_LAST_FULL, Some(&now))?;
+                }
+                if reconcile {
+                    l.set_meta(META_NEEDS_RECONCILE, Some("1"))?;
+                } else {
+                    l.set_meta(META_NEEDS_RECONCILE, None)?;
+                    l.set_meta(META_LAST_MARKER, marker.as_deref())?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// a pass over what changed since the last sync (see the module docs). a library that never
+    /// finished a full sync, or whose full sync was interrupted, gets or resumes one instead.
+    async fn run_changes(&self, on_progress: &(dyn Fn(SyncProgress) + Send + Sync)) -> Result<SyncOutcome> {
+        self.options.cancel.store(false, Ordering::Release);
+        let started = Instant::now();
+        let folders = self.client.music_folders().await?;
+        if folders.is_empty() {
+            return Err(Error::Sync("the server lists no music libraries for this user".to_string()));
+        }
+        let start_status = self.client.scan_status().await.ok();
+        let marker = start_status.as_ref().and_then(|s| s.last_scan.clone());
+        let scanning = start_status.as_ref().is_some_and(|s| s.scanning);
+        {
+            let f = folders.clone();
+            self.library.blocking(move |l| l.replace_libraries(&f)).await?;
+        }
+
+        let mut results = Vec::with_capacity(folders.len());
+        let mut any_held = false;
+        let mut tally = RunTally::default();
+        let mut marks = Some(Vec::with_capacity(folders.len()));
+        let mut full_due = false;
+        for (index, folder) in folders.iter().enumerate() {
+            let id = folder.id.clone();
+            let settled = self.library.blocking(move |l| l.settled_generation(&id)).await?;
+            let result = match settled {
+                Some(generation) => {
+                    let updates = self.song_updates(&folder.id).await;
+                    full_due |= updates.as_ref().is_some_and(|u| u.overflow);
+                    let newest = updates.as_ref().filter(|u| !u.overflow).map(|u| u.newest.clone());
+                    marks = marks.zip(newest).map(|(mut m, n)| {
+                        m.push((folder.id.clone(), n));
+                        m
+                    });
+                    self.changes_in_library(folder, generation, updates.filter(|u| !u.overflow), marker.as_deref(), scanning, &mut tally, on_progress).await?
+                }
+                None => {
+                    let newest = self.song_marks(std::slice::from_ref(folder)).await;
+                    marks = marks.zip(newest).map(|(mut m, n)| {
+                        m.extend(n);
+                        m
+                    });
+                    self.sync_library(folder, index, marker.as_deref(), scanning, &mut tally, on_progress).await?
+                }
+            };
+            let Some(result) = result else {
+                return self.outcome(SyncPass::Changes, SyncStatus::Cancelled, results, started);
+            };
+            any_held |= result.removal_held.is_some();
+            results.push(result);
+        }
+        // more songs changed than one pass follows: the next refresh walks everything.
+        self.store_completed(SyncPass::Changes, marker, any_held || full_due).await?;
+        if self.options.song_updates {
+            self.store_song_marks(marks).await?;
+        }
+        self.outcome(SyncPass::Changes, SyncStatus::Complete, results, started)
+    }
+
+    /// one library's change pass. returns `None` if cancelled: what was stored stays, and the next
+    /// pass still finds the rest changed.
+    #[allow(clippy::too_many_arguments)]
+    async fn changes_in_library(&self, folder: &MusicFolder, generation: i64, updates: Option<SongUpdates>, marker: Option<&str>, scanning: bool, tally: &mut RunTally, on_progress: &(dyn Fn(SyncProgress) + Send + Sync)) -> Result<Option<LibrarySyncResult>> {
+        let report = |phase: SyncPhase, offset: u32, meter: SyncMeter| {
+            on_progress(SyncProgress { library_id: folder.id.clone(), library_name: folder.name.clone(), phase, offset, meter });
+        };
+
+        let mut seen_albums = HashSet::new();
+        let mut changed: Vec<(Album, bool)> = Vec::new();
+        let mut offset = 0u32;
+        report(SyncPhase::Albums, 0, tally.meter(SyncPhase::Albums, 0));
+        loop {
+            if self.options.cancel.load(Ordering::Acquire) {
+                return Ok(None);
             }
-            Ok(())
-        })
-        .await?;
+            let page = self.client.search_page::<Album>(SearchKind::Album, Some(&folder.id), offset, self.options.page_size).await?;
+            if page.raw_count == 0 {
+                break;
+            }
+            offset += page.raw_count as u32;
+            seen_albums.extend(page.items.iter().map(|a| a.id.clone()));
+            let (id, items) = (folder.id.clone(), page.items);
+            changed.extend(self.library.blocking(move |l| l.apply_album_page(&id, generation, &items)).await?);
+            report(SyncPhase::Albums, offset, tally.meter(SyncPhase::Albums, offset));
+            self.pause().await;
+        }
+        tally.before[phase_index(SyncPhase::Albums)] += offset;
+        let vanished = {
+            let (id, seen) = (folder.id.clone(), seen_albums.clone());
+            self.library.blocking(move |l| l.albums_not_in(&id, &seen)).await?
+        };
 
-        self.outcome(SyncStatus::Complete, results, started)
+        // albums whose songs a scan updated without moving the album's entry: their songs are
+        // fetched again, their stored row stays.
+        let touched: Vec<String> = updates
+            .map(|u| u.album_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| seen_albums.contains(id) && !changed.iter().any(|(a, _)| &a.id == id))
+            .collect();
+        let mut work: Vec<(String, Option<(Album, bool)>)> = changed.into_iter().map(|(a, new)| (a.id.clone(), Some((a, new)))).collect();
+        work.extend(touched.into_iter().map(|id| (id, None)));
+
+        let songs_before = tally.before[phase_index(SyncPhase::Songs)];
+        let songs_expected = work.iter().filter_map(|(_, a)| a.as_ref()).map(|(a, _)| a.song_count.unwrap_or(0).max(0) as u32).fold(0u32, u32::saturating_add);
+        let mut songs_done = 0u32;
+        let mut refetched: Vec<RefetchedAlbum> = Vec::new();
+        let any_change = work.iter().any(|(_, a)| a.is_some()) || !vanished.is_empty();
+        for (album_id, entry) in work {
+            if self.options.cancel.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let full = match self.client.album(&album_id).await {
+                Ok(full) => full,
+                // gone since the list was read, so the next pass won't list it either.
+                Err(Error::Subsonic { .. }) => continue,
+                Err(e) => return Err(e),
+            };
+            let song_ids: Vec<String> = full.song.iter().map(|s| s.id.clone()).collect();
+            songs_done = songs_done.saturating_add(song_ids.len() as u32);
+            let new = entry.as_ref().is_some_and(|(_, new)| *new);
+            {
+                let (id, row, songs) = (folder.id.clone(), entry.as_ref().filter(|(_, new)| *new).map(|(a, _)| a.clone()), full.song);
+                self.library.blocking(move |l| l.apply_album_songs(&id, generation, row.as_ref(), &songs)).await?;
+            }
+            if !new {
+                refetched.push(RefetchedAlbum { id: album_id, row: entry.map(|(a, _)| a), song_ids });
+            }
+            let total = songs_before.saturating_add(songs_expected.max(songs_done));
+            report(SyncPhase::Songs, songs_done, SyncMeter::new(SyncStage::Songs, songs_before.saturating_add(songs_done), Some(total)));
+            self.pause().await;
+        }
+        tally.before[phase_index(SyncPhase::Songs)] += songs_done;
+
+        // artists only change with albums, so they're read only when an album came, went or changed.
+        let seen_artists = if any_change {
+            let mut seen = HashSet::new();
+            let mut offset = 0u32;
+            loop {
+                if self.options.cancel.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                let page = self.client.search_page::<Artist>(SearchKind::Artist, Some(&folder.id), offset, self.options.page_size).await?;
+                if page.raw_count == 0 {
+                    break;
+                }
+                offset += page.raw_count as u32;
+                seen.extend(page.items.iter().map(|a| a.id.clone()));
+                let (id, items) = (folder.id.clone(), page.items);
+                self.library.blocking(move |l| l.apply_artist_page(&id, generation, &items)).await?;
+                report(SyncPhase::Artists, offset, tally.meter(SyncPhase::Artists, offset));
+                self.pause().await;
+            }
+            tally.before[phase_index(SyncPhase::Artists)] += offset;
+            Some(seen)
+        } else {
+            None
+        };
+
+        let as_begun = SyncCursor { generation, active: true, phase: SyncPhase::Done, offset: 0, scan_marker: marker.map(str::to_string), hold_removal: scanning, pending_shrink: false };
+        let end_status = self.client.scan_status().await.ok();
+        let hold = removal_hold(&as_begun, end_status.as_ref());
+        let finish = {
+            let id = folder.id.clone();
+            let seen_count = seen_albums.len();
+            self.library.blocking(move |l| l.finish_changes(&id, generation, &refetched, &vanished, seen_count, seen_artists.as_ref(), hold)).await?
+        };
+        Ok(Some(LibrarySyncResult { library_id: folder.id.clone(), removed: finish.removed, removal_held: finish.held }))
+    }
+
+    async fn pause(&self) {
+        if !self.options.page_delay.is_zero() {
+            tokio::time::sleep(self.options.page_delay).await;
+        }
     }
 
     /// Each library's totals for the bar, or `None` when not asked for or any is unavailable.
@@ -450,8 +759,8 @@ impl Syncer {
         }
     }
 
-    fn outcome(&self, status: SyncStatus, libraries: Vec<LibrarySyncResult>, started: Instant) -> Result<SyncOutcome> {
-        Ok(SyncOutcome { status, libraries, counts: self.library.counts()?, elapsed: started.elapsed() })
+    fn outcome(&self, pass: SyncPass, status: SyncStatus, libraries: Vec<LibrarySyncResult>, started: Instant) -> Result<SyncOutcome> {
+        Ok(SyncOutcome { pass, status, libraries, counts: self.library.counts()?, elapsed: started.elapsed() })
     }
 
     /// Returns `None` if canceled.
@@ -539,9 +848,7 @@ impl Syncer {
             }
             offset = next_offset;
             on_progress(SyncProgress { library_id: folder.id.clone(), library_name: folder.name.clone(), phase, offset, meter: meter(offset) });
-            if !self.options.page_delay.is_zero() {
-                tokio::time::sleep(self.options.page_delay).await;
-            }
+            self.pause().await;
         }
     }
 }
@@ -567,6 +874,15 @@ fn removal_hold(cursor: &SyncCursor, end: Option<&crate::client::ScanStatus>) ->
     None
 }
 
+/// whether a full sync is due, given when the last one finished (Unix seconds).
+fn full_sync_due(last_full: Option<u64>, now: u64, every: Duration) -> bool {
+    last_full.is_none_or(|at| now.saturating_sub(at) >= every.as_secs())
+}
+
+fn song_mark_key(library_id: &str) -> String {
+    format!("{META_SONG_MARK}:{library_id}")
+}
+
 fn next_phase(phase: SyncPhase) -> SyncPhase {
     match phase {
         SyncPhase::Artists => SyncPhase::Albums,
@@ -584,7 +900,34 @@ fn unix_seconds() -> u64 {
 pub struct PlaylistSync {
     pub listed: usize,
     pub refetched: usize,
+    /// list entries that changed without their songs being fetched (a smart playlist, another
+    /// user's, a new cover).
+    pub updated: usize,
     pub removed: u64,
+}
+
+/// what [`Syncer::check_for_changes`] found.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Changes {
+    /// the server's library changed since the last sync, and was synced now.
+    pub library: bool,
+    /// the server is scanning; what it finds comes with a later check.
+    pub server_scanning: bool,
+    /// a sync was already running; it brings its own changes when it ends.
+    pub sync_running: bool,
+    /// playlists were added, removed or changed.
+    pub playlists: bool,
+    /// stars on songs, albums or artists changed.
+    pub stars: bool,
+    /// play counts changed.
+    pub plays: bool,
+}
+
+impl Changes {
+    /// whether anything stored changed, so pages built from the library should reload.
+    pub fn any(&self) -> bool {
+        self.library || self.playlists || self.stars || self.plays
+    }
 }
 
 /// What a play-count and stars refresh found.
@@ -594,6 +937,10 @@ pub struct AnnotationRefresh {
     pub albums_scanned: usize,
     pub albums_refetched: usize,
     pub songs_changed: u64,
+    /// the dated play history was fetched again.
+    pub history: bool,
+    /// the dated play history failed while the server asked to wait; worth asking again after this.
+    pub history_retry: Option<Duration>,
 }
 
 const META_ANNOTATION_MARK: &str = "annotation_played_mark";
@@ -645,8 +992,9 @@ impl Syncer {
     }
 
     async fn sync_playlist_list(&self, list: Vec<crate::client::models::Playlist>, listed: usize, report: &(dyn Fn(usize) + Send + Sync)) -> Result<PlaylistSync> {
-        let mut refetched = 0;
-        // Kept playlists need their songs even when smart or another user's, so downloads follow.
+        let (mut refetched, mut updated) = (0, 0);
+        // Kept (downloaded) playlists need their songs even when they're smart or another
+        // user's, so the downloads can follow them.
         let kept: std::collections::HashSet<String> = self
             .library
             .blocking(|l| l.synced_collections())
@@ -686,12 +1034,14 @@ impl Syncer {
                 if !same_cover {
                     let header = item.clone();
                     self.library.blocking(move |l| l.store_playlist_header(&header)).await?;
+                    updated += 1;
                 }
                 continue;
             }
             if item.valid_until.is_some() || item.readonly.unwrap_or(false) {
                 let header = item.clone();
                 self.library.blocking(move |l| l.store_playlist_header(&header)).await?;
+                updated += 1;
                 continue;
             }
             let full = self.client.playlist(&id).await?;
@@ -708,7 +1058,7 @@ impl Syncer {
             let current = self.client.playlists().await?;
             self.library.blocking(move |l| l.set_playlist_markers(&current)).await?;
         }
-        Ok(PlaylistSync { listed, refetched, removed })
+        Ok(PlaylistSync { listed, refetched, updated, removed })
     }
 
     /// Create a playlist on the server and store it, so it shows without a full sync. Returns
@@ -948,11 +1298,48 @@ impl Syncer {
             .await
     }
 
-    /// Fetch one playlist now, when it's opened. Smart playlists are only re-evaluated when
-    /// fetched, so their stored copy can lag.
+    /// delete a playlist on the server (owner or admin only), then the stored copy.
+    pub async fn delete_playlist(&self, id: &str) -> Result<()> {
+        self.client.delete_playlist(id).await?;
+        let id = id.to_string();
+        self.library.blocking(move |l| l.delete_playlist(&id)).await
+    }
+
+    /// Fetch one playlist now. Use when a playlist is opened: smart playlists are only
+    /// re-evaluated by the server when fetched, so their stored copy can lag behind.
     pub async fn refresh_playlist(&self, id: &str) -> Result<()> {
         let full = self.client.playlist(id).await?;
         self.library.blocking(move |l| l.store_playlist(&full)).await
+    }
+
+    /// asks the server what changed since the last look and brings only that in: the library
+    /// when the server's last scan moved (one `getScanStatus`, then a sync), playlists whose
+    /// `changed` stamp or count moved (one `getPlaylists`), stars (`getStarred2`) and play counts
+    /// (recently played albums down to the last checkpoint). all at once; with nothing changed it
+    /// is three small calls. for the refresh button; the background refresh does the same on a
+    /// schedule. a second check while one runs waits for it.
+    pub async fn check_for_changes(&self, on_progress: &(dyn Fn(SyncProgress) + Send + Sync)) -> Result<Changes> {
+        let _gate = self.library.check_gate().await;
+        // playlists stay off the sync meter, which belongs to a library sync running alongside.
+        let playlists = async {
+            let list = self.client.playlists().await?;
+            let listed = list.len();
+            self.sync_playlist_list(list, listed, &|_| {}).await
+        };
+        let (library, playlists, annotations) = tokio::join!(self.refresh(false, on_progress), playlists, self.refresh_annotations());
+        let mut out = Changes::default();
+        match library? {
+            RefreshOutcome::Unchanged => {}
+            RefreshOutcome::ServerScanning => out.server_scanning = true,
+            RefreshOutcome::AlreadyRunning => out.sync_running = true,
+            RefreshOutcome::Synced(_) => out.library = true,
+        }
+        let p = playlists?;
+        out.playlists = p.refetched + p.updated > 0 || p.removed > 0;
+        let a = annotations?;
+        out.stars = a.stars_changed > 0;
+        out.plays = a.songs_changed > 0 || a.albums_refetched > 0 || a.history;
+        Ok(out)
     }
 
     /// Update stars and play counts without a catalog sync. Costs one `getStarred2` plus a page
@@ -1004,12 +1391,21 @@ impl Syncer {
         {
             self.library.set_meta(META_ANNOTATION_MARK, Some(&n))?;
         }
-        if self.options.play_history
-            && let Err(e) = super::recent::refresh_play_history(&self.client, &self.library).await
-        {
-            tracing::warn!("play history refresh failed: {e}");
+        if self.options.play_history {
+            (out.history, out.history_retry) = self.refresh_play_history().await;
         }
         Ok(out)
+    }
+
+    /// whether the dated play history was fetched again, and when to ask again if the server asked to wait.
+    async fn refresh_play_history(&self) -> (bool, Option<Duration>) {
+        match super::recent::refresh_play_history(&self.client, &self.library).await {
+            Ok(outcome) => (matches!(outcome, super::recent::PlayHistoryRefresh::Stored(_)), None),
+            Err(e) => {
+                tracing::warn!("play history refresh failed: {e}");
+                (false, self.client.native_retry_in())
+            }
+        }
     }
 }
 
@@ -1027,24 +1423,35 @@ impl BackgroundRefresh {
     }
 
     /// Like [`Self::spawn`], also refreshing playlists and annotations, and retrying plays on
-    /// `reporter`. Failures in those extras are logged and retried on the next tick.
+    /// `reporter`. failures in those extras are logged and retried on the next tick, except the
+    /// play history after the server asked to wait: that alone is asked again once the wait is over.
     pub fn spawn_with(syncer: Syncer, interval: Duration, reporter: Option<Arc<PlayReporter>>) -> Self {
         let stop = Arc::new(Notify::new());
         let stopped = stop.clone();
         let (tx, results) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
+            let mut next_tick = tokio::time::Instant::now() + interval;
+            let mut history_at: Option<tokio::time::Instant> = None;
             loop {
+                let wake = history_at.map_or(next_tick, |at| at.min(next_tick));
                 tokio::select! {
                     _ = stopped.notified() => break,
-                    _ = tokio::time::sleep(interval) => {}
+                    _ = tokio::time::sleep_until(wake) => {}
                 }
+                if tokio::time::Instant::now() < next_tick {
+                    let (_, retry) = syncer.refresh_play_history().await;
+                    history_at = retry.map(|r| tokio::time::Instant::now() + r);
+                    continue;
+                }
+                next_tick = tokio::time::Instant::now() + interval;
                 let outcome = syncer.refresh(false, &|_| {}).await;
                 let done = tx.send(outcome).is_err();
                 if let Err(e) = syncer.sync_playlists().await {
                     tracing::warn!("playlist refresh failed: {e}");
                 }
-                if let Err(e) = syncer.refresh_annotations().await {
-                    tracing::warn!("annotation refresh failed: {e}");
+                match syncer.refresh_annotations().await {
+                    Ok(a) => history_at = a.history_retry.map(|r| tokio::time::Instant::now() + r),
+                    Err(e) => tracing::warn!("annotation refresh failed: {e}"),
                 }
                 if let Some(reporter) = &reporter {
                     let _ = reporter.flush().await;
@@ -1096,5 +1503,21 @@ impl From<Error> for PlaylistEditError {
             Error::WritesDisabled { .. } => Self::WritesDisabled,
             e => Self::Failed(e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_sync_is_due_without_one_or_once_the_interval_passed() {
+        let every = FULL_SYNC_EVERY.as_secs();
+        let now = 10 * every;
+        assert!(full_sync_due(None, now, FULL_SYNC_EVERY));
+        assert!(!full_sync_due(Some(now - every + 1), now, FULL_SYNC_EVERY));
+        assert!(full_sync_due(Some(now - every), now, FULL_SYNC_EVERY));
+        assert!(!full_sync_due(Some(now + 5), now, FULL_SYNC_EVERY), "a clock that went back doesn't force one");
+        assert!(!full_sync_due(Some(now - every), now, FULL_SYNC_EVERY_WITH_UPDATES));
     }
 }

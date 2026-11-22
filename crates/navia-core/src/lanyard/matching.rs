@@ -84,7 +84,9 @@ fn note(inner: &str) -> Note {
     if !markers.is_empty() {
         return Note::Recording(markers, remixers);
     }
-    if words.iter().all(|w| EDITION.contains(&w.as_str()) || is_year(w)) && words.iter().any(|w| !matches!(w.as_str(), "the" | "a" | "of")) {
+    // "25th Anniversary Edition".
+    let is_ordinal = |w: &str| w.is_ascii() && w.len() > 2 && w[..w.len() - 2].bytes().all(|b| b.is_ascii_digit()) && ["st", "nd", "rd", "th"].contains(&&w[w.len() - 2..]);
+    if words.iter().all(|w| EDITION.contains(&w.as_str()) || is_year(w) || is_ordinal(w)) && words.iter().any(|w| !matches!(w.as_str(), "the" | "a" | "of")) {
         return Note::Drop;
     }
     Note::Keep
@@ -146,8 +148,8 @@ impl Title {
     }
 }
 
-/// An album's name for comparing, without edition notes or " - Single" and " - EP".
-fn album_key(album: &str) -> String {
+/// An album's name for comparing: edition notes and " - Single" / " - EP" off.
+pub fn album_key(album: &str) -> String {
     let mut a = album.trim().to_string();
     for suffix in [" - Single", " - EP"] {
         if a.to_lowercase().ends_with(&suffix.to_lowercase()) {
@@ -157,13 +159,38 @@ fn album_key(album: &str) -> String {
     Title::parse(&a).core
 }
 
-/// Splits a credit into names, handling "feat.", "&", ",", ";" and Navidrome's "•".
+/// a song title for comparing: feature credits and edition notes off, as [`key`].
+pub fn title_key(title: &str) -> String {
+    Title::parse(title).core
+}
+
+/// Splits a credit into names: "A feat. B", "A & B", "A, B", "A; B", Navidrome's "A • B".
 pub fn names(credit: &str) -> Vec<String> {
     let mut parts = vec![credit.to_string()];
     for sep in [" • ", " · ", " feat. ", " feat ", " ft. ", " featuring ", " & ", " x ", " + ", ", ", "; ", ";", " / "] {
         parts = parts.into_iter().flat_map(|p| p.to_lowercase().split(sep).map(str::to_string).collect::<Vec<_>>()).collect();
     }
     parts.iter().map(|p| key(p)).filter(|p| !p.is_empty()).collect()
+}
+
+/// separators after a credit's first artist, matched in ASCII lowercase.
+const CREDIT_SEPARATORS: &[&str] = &[" feat. ", " feat ", " ft. ", " ft ", " featuring ", " with ", " & ", " x ", " • ", " · ", ", ", "; ", " / "];
+
+/// the first credited artist of a credit: "A feat. B", "A ft. B", "A with B", "A & B" and "A x B"
+/// give "A". for a retry after the whole credit found nothing.
+pub fn first_credited(credit: &str) -> &str {
+    let lower = credit.to_ascii_lowercase();
+    let cut = CREDIT_SEPARATORS.iter().filter_map(|sep| lower.find(sep)).filter(|at| *at > 0).min().unwrap_or(credit.len());
+    credit[..cut].trim()
+}
+
+/// a title without any bracketed or dashed suffix and without an unbracketed feature credit:
+/// "Song (Remastered)", "Song - 2011 Remaster", "Song (Live)" and "Song [Deluxe]" give "Song". for a
+/// retry after the title as given found nothing.
+pub fn bare_title(title: &str) -> &str {
+    let lower = title.to_ascii_lowercase();
+    let cut = ["(", "[", " - ", " – ", " — ", " feat. ", " feat ", " ft. ", " featuring "].iter().filter_map(|m| lower.find(m)).filter(|at| *at > 0).min().unwrap_or(title.len());
+    title[..cut].trim()
 }
 
 /// A library song's artists, first credited first.
@@ -194,6 +221,8 @@ struct Wanted {
     /// The album is a Dolby Atmos or other immersive mix ([`immersive`]).
     immersive: bool,
     duration_ms: Option<u64>,
+    /// matched on [`bare_title`]s, whatever the decorations say.
+    bare: bool,
 }
 
 /// Whether an album name says it's an immersive mix like Atmos or surround.
@@ -210,18 +239,29 @@ impl Wanted {
     }
 
     fn of(title: &str, artists: Vec<String>, album: &str, duration_ms: Option<u64>) -> Self {
-        Self { title: Title::parse(title).with_album(album), full: key(title), artists, album: album_key(album), immersive: immersive(album) || immersive(title), duration_ms }
+        Self { title: Title::parse(title).with_album(album), full: key(title), artists, album: album_key(album), immersive: immersive(album) || immersive(title), duration_ms, bare: false }
+    }
+
+    fn bare(title: &str, artist: String, album: &str, duration_ms: Option<u64>) -> Self {
+        let core = key(bare_title(title));
+        Self { title: Title { core, ..Default::default() }, full: key(title), artists: vec![artist], album: album_key(album), immersive: immersive(album) || immersive(title), duration_ms, bare: true }
     }
 
     /// How well a library song fits, or `None` when it isn't this recording.
     fn score(&self, song: &Song) -> Option<i64> {
         let album = song.album.as_deref().unwrap_or_default();
-        let title = Title::parse(&song.title).with_album(album);
-        if title.core != self.title.core || title.markers != self.title.markers {
-            return None;
-        }
-        if !self.title.remixers.is_empty() && !title.remixers.is_empty() && self.title.remixers != title.remixers {
-            return None;
+        if self.bare {
+            if key(bare_title(&song.title)) != self.title.core {
+                return None;
+            }
+        } else {
+            let title = Title::parse(&song.title).with_album(album);
+            if title.core != self.title.core || title.markers != self.title.markers {
+                return None;
+            }
+            if !self.title.remixers.is_empty() && !title.remixers.is_empty() && self.title.remixers != title.remixers {
+                return None;
+            }
         }
         let ours = song_artists(song);
         let (Some(their_first), Some(our_first)) = (self.artists.first(), ours.first()) else { return None };
@@ -267,6 +307,19 @@ pub fn find_named(library: &Library, title: &str, artists: &[&str], album: &str,
         }
     }
     find_wanted(library, Wanted::of(title, keys, album, duration_ms))
+}
+
+/// [`find_named`], and when that finds nothing, again with the [`bare_title`] and the
+/// [`first_credited`] artist only. the bare names only find the match: the song is still the
+/// library's own, whatever its title says (a remaster, a live take).
+pub fn find_named_or_bare(library: &Library, title: &str, artists: &[&str], album: &str, duration_ms: Option<u64>) -> Option<(u32, Song)> {
+    find_named(library, title, artists, album, duration_ms).or_else(|| {
+        let artist = key(first_credited(artists.first()?));
+        if artist.is_empty() {
+            return None;
+        }
+        find_wanted(library, Wanted::bare(title, artist, album, duration_ms))
+    })
 }
 
 fn find_wanted(library: &Library, wanted: Wanted) -> Option<(u32, Song)> {
@@ -363,6 +416,27 @@ mod tests {
         // Only the same remix by the same remixer matches.
         let remix = track("Song - Kygo Remix", "Main; Kygo", "Song (Remixes)", 200);
         assert_eq!(pick(&remix, vec![song("x", "Song (Other Remix)", "Main", "R", 200), song("k", "Song (Kygo Remix)", "Main", "R", 200)]).as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn bare_names_drop_credits_and_every_suffix() {
+        assert_eq!(first_credited("Beyoncé feat. JAY Z"), "Beyoncé");
+        assert_eq!(first_credited("Meduza with Goodboys"), "Meduza");
+        assert_eq!(first_credited("Shakira & Carlos Santana"), "Shakira");
+        assert_eq!(first_credited("Marshmello x Khalid"), "Marshmello");
+        assert_eq!(first_credited("Dr. Dre Ft. Snoop Dogg"), "Dr. Dre");
+        assert_eq!(first_credited("Oasis"), "Oasis");
+        assert_eq!(bare_title("Shakermaker (Remastered)"), "Shakermaker");
+        assert_eq!(bare_title("Song - 2011 Remaster"), "Song");
+        assert_eq!(bare_title("Song (Live)"), "Song");
+        assert_eq!(bare_title("Song [Deluxe]"), "Song");
+        assert_eq!(bare_title("Song feat. Guest"), "Song");
+        assert_eq!(bare_title("(I Can't Get No) Satisfaction"), "(I Can't Get No) Satisfaction");
+        let t = |title: &str, artist: &str| Wanted::bare(title, key(first_credited(artist)), "", Some(200_000));
+        // the bare retry finds the library's own song whatever its decorations.
+        assert_eq!(best(&t("Song (Live)", "Main with Guest"), vec![song("own", "Song - 2011 Remaster", "Main", "A", 201)]).map(|(_, s)| s.id).as_deref(), Some("own"));
+        assert_eq!(best(&t("Song", "Main"), vec![song("x", "Song", "Someone Else", "A", 200)]), None, "still the same artist");
+        assert_eq!(best(&t("Song", "Main"), vec![song("y", "Song", "Main", "A", 290)]), None, "still the same length");
     }
 
     #[test]

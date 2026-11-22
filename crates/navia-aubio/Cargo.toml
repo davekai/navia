@@ -1,0 +1,11 @@
+[package]
+name = "navia-aubio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "aubio's tempo, beat and onset detection, built from vendored C source and linked statically."
+links = "aubio"
+
+[build-dependencies]
+cc = "1.2"

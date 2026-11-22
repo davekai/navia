@@ -49,7 +49,6 @@ pub trait ArtSource: Send + Sync {
     }
 }
 
-/// A found cover.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Art {
     pub url: String,

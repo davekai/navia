@@ -91,6 +91,8 @@ pub enum SourceLink {
     Album(String),
     Playlist(String),
     Artist(String),
+    /// an artist's Top Songs page, by artist id.
+    ArtistTop(String),
     Genre(String),
     Mix(String),
     Liked,

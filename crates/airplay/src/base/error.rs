@@ -2,7 +2,6 @@
 
 use thiserror::Error;
 
-/// Primary error type for all AirPlay operations.
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Discovery error: {0}")]
@@ -36,7 +35,6 @@ pub enum Error {
     Timeout,
 }
 
-/// Errors during mDNS service discovery.
 #[derive(Error, Debug)]
 pub enum DiscoveryError {
     #[error("mDNS daemon error: {0}")]
@@ -89,7 +87,6 @@ pub enum PairingError {
     Protocol(String),
 }
 
-/// Errors during RTSP communication.
 #[derive(Error, Debug)]
 pub enum RtspError {
     #[error("Connection refused")]
@@ -114,7 +111,6 @@ pub enum RtspError {
     SetupFailed(String),
 }
 
-/// Errors during audio streaming.
 #[derive(Error, Debug)]
 pub enum StreamingError {
     #[error("Encoding error: {0}")]
@@ -136,7 +132,6 @@ pub enum StreamingError {
     InvalidFormat(String),
 }
 
-/// Cryptographic operation errors.
 #[derive(Error, Debug)]
 pub enum CryptoError {
     #[error("Encryption failed: {0}")]
@@ -155,7 +150,6 @@ pub enum CryptoError {
     AuthTagMismatch,
 }
 
-/// Parsing errors for various formats.
 #[derive(Error, Debug)]
 pub enum ParseError {
     #[error("Invalid format: {0}")]
@@ -171,7 +165,6 @@ pub enum ParseError {
     InvalidValue(String),
 }
 
-/// Convenience Result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
@@ -180,7 +173,6 @@ mod tests {
 
     #[test]
     fn error_display_formats() {
-        // Verify error messages are human-readable
         let discovery_err = Error::Discovery(DiscoveryError::NoDevicesFound);
         assert!(discovery_err.to_string().contains("Discovery error"));
         assert!(discovery_err.to_string().contains("No devices found"));
@@ -203,7 +195,6 @@ mod tests {
 
     #[test]
     fn error_source_chain() {
-        // Verify error source chain works correctly
         use std::error::Error as StdError;
 
         let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test");
@@ -218,7 +209,6 @@ mod tests {
 
     #[test]
     fn error_conversions() {
-        // Verify From implementations work
         let discovery_err = DiscoveryError::NoDevicesFound;
         let err: Error = discovery_err.into();
         assert!(matches!(err, Error::Discovery(_)));

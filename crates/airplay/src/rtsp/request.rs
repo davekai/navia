@@ -68,18 +68,15 @@ impl RtspRequest {
     pub fn serialize(&self, cseq: u32) -> Vec<u8> {
         let mut out = Vec::new();
 
-        // Request line - RTSP uses CRLF
         write!(&mut out, "{} {} RTSP/1.0\r\n", self.method.as_str(), self.uri).unwrap();
 
-        // CSeq header (required)
         write!(&mut out, "CSeq: {}\r\n", cseq).unwrap();
 
-        // Content-Length if body present
         if let Some(ref body) = self.body {
             write!(&mut out, "Content-Length: {}\r\n", body.len()).unwrap();
         }
 
-        // Other headers (sorted for consistent output in tests)
+        // sorted for consistent output in tests.
         let mut sorted_headers: Vec<_> = self.headers.iter().collect();
         sorted_headers.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -87,10 +84,8 @@ impl RtspRequest {
             write!(&mut out, "{}: {}\r\n", key, value).unwrap();
         }
 
-        // Blank line ending headers
         out.extend_from_slice(b"\r\n");
 
-        // Body if present
         if let Some(ref body) = self.body {
             out.extend_from_slice(body);
         }
@@ -199,10 +194,7 @@ impl RtspRequest {
             .header("RTP-Info", format!("seq={};rtptime={}", seq, rtptime))
     }
 
-    /// Create a pair-setup request with the required headers for transient pairing.
-    ///
-    /// The `device_id` should be in MAC format (e.g., "AA:BB:CC:DD:EE:FF").
-    /// `hkp` is the HomeKit Pairing version (typically 4 for transient pairing).
+    /// `device_id` is a MAC string ("AA:BB:CC:DD:EE:FF"); `hkp` is the HomeKit pairing version (4 for transient).
     pub fn pair_setup(body: Vec<u8>, device_id: &str, hkp: u8) -> Self {
         let dacp_id = device_id.replace(":", "");
         Self::new(RtspMethod::Post, "/pair-setup")
@@ -222,19 +214,14 @@ impl RtspRequest {
             .body(body)
     }
 
-    /// Create a fruit pair-setup request (Apple TV pairing protocol).
-    ///
-    /// Uses binary plist content type. The body should be a binary plist dictionary.
+    /// Apple TV pair-setup with a binary plist body.
     pub fn fruit_pair_setup(body: Vec<u8>) -> Self {
         Self::new(RtspMethod::Post, "/pair-setup")
             .header("Content-Type", "application/x-apple-binary-plist")
             .body(body)
     }
 
-    /// Create a fruit pair-verify request (Apple TV pairing protocol).
-    ///
-    /// Uses raw binary format (no TLV8). M1 is 32-byte ECDH public key,
-    /// M3 is 64-byte encrypted signature.
+    /// Apple TV pair-verify, raw binary: M1 is a 32-byte ECDH key, M3 a 64-byte encrypted signature.
     pub fn fruit_pair_verify(body: Vec<u8>) -> Self {
         Self::new(RtspMethod::Post, "/pair-verify")
             .header("Content-Type", "application/octet-stream")
@@ -247,27 +234,19 @@ impl RtspRequest {
             .body(body)
     }
 
-    /// Create a feedback request (keepalive/progress).
-    ///
-    /// AirPlay 2 receivers expect periodic feedback requests (~every 2 seconds).
-    /// The response contains timing and buffer status from the receiver.
+    /// keepalive: AirPlay 2 receivers expect one about every 2 seconds.
     pub fn feedback(uri: impl Into<String>) -> Self {
         Self::new(RtspMethod::Post, format!("{}/feedback", uri.into()))
             .content_type_bplist()
     }
 
-    /// Create OPTIONS request with Apple-Challenge header (RAOP handshake).
-    ///
-    /// The challenge is a 16-byte random value, Base64-encoded (no padding).
+    /// OPTIONS with Apple-Challenge (RAOP): a 16-byte random value, Base64 without padding.
     pub fn options_with_challenge(challenge: &str) -> Self {
         Self::new(RtspMethod::Options, "*")
             .header("Apple-Challenge", challenge)
     }
 
-    /// Create RAOP-style SETUP request with Transport header.
-    ///
-    /// Unlike AirPlay 2 which uses binary plist for SETUP, RAOP uses a
-    /// Transport header to negotiate UDP ports:
+    /// RAOP SETUP negotiates UDP ports with a transport header, not a binary plist:
     /// `Transport: RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=N;timing_port=M`
     pub fn setup_raop(uri: impl Into<String>, transport_header: &str) -> Self {
         Self::new(RtspMethod::Setup, uri)

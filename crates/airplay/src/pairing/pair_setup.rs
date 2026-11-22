@@ -1,7 +1,6 @@
 //! HomeKit pair-setup protocol (M1-M6).
 //!
-//! This implements the SRP-6a based pairing flow for HomeKit transient pairing.
-//! The protocol establishes a shared secret using the device's PIN.
+//! SRP-6a pairing for HomeKit transient pairing: a shared secret from the device's PIN.
 
 use crate::base::error::{Error, PairingError, Result};
 use crate::crypto::{
@@ -56,7 +55,6 @@ impl PairSetup {
         }
     }
 
-    /// Create new pair-setup with PIN.
     pub fn new(pin: &str) -> Self {
         Self {
             state: PairSetupState::Initial,
@@ -70,11 +68,7 @@ impl PairSetup {
         }
     }
 
-    /// Create new pair-setup for transient mode with PIN "3939".
-    ///
-    /// Transient mode uses Flags=0x10 (kPairingFlag_Transient) as 4-byte LE in M1
-    /// and stops at M4 (no M5/M6 needed). This is the recommended mode for HomePod
-    /// and other AirPlay 2 devices that support feature bit 51 (SupportsUnifiedPairSetupAndMFi).
+    /// transient mode: PIN "3939", flags=0x10 (kPairingFlag_Transient, 4-byte LE) in M1, stop at M4.
     pub fn new_transient() -> Self {
         Self {
             state: PairSetupState::Initial,
@@ -102,7 +96,6 @@ impl PairSetup {
         }
     }
 
-    /// Check if this is transient mode.
     pub fn is_transient(&self) -> bool {
         self.transient_mode
     }
@@ -134,7 +127,6 @@ impl PairSetup {
         // Create SRP client with "Pair-Setup" identity and PIN as password
         self.srp_client = Some(SrpClient::new(b"Pair-Setup", self.pin.as_bytes()));
 
-        // Build M1 TLV
         let tlv = if with_flags {
             Tlv8::pair_setup_m1_with_flags()
         } else {
@@ -161,7 +153,6 @@ impl PairSetup {
             Error::Pairing(PairingError::Protocol(format!("Failed to parse M2: {}", e)))
         })?;
 
-        // Check for error
         if let Some(_error_code) = tlv.error() {
             self.state = PairSetupState::Failed;
             return Err(Error::Pairing(PairingError::Protocol(
@@ -169,7 +160,6 @@ impl PairSetup {
             )));
         }
 
-        // Verify state is 2
         if tlv.state() != Some(0x02) {
             self.state = PairSetupState::Failed;
             return Err(Error::Pairing(PairingError::Protocol(
@@ -177,7 +167,6 @@ impl PairSetup {
             )));
         }
 
-        // Extract salt
         let salt = tlv
             .get(TlvType::Salt)
             .ok_or_else(|| {
@@ -193,7 +182,6 @@ impl PairSetup {
             ))));
         }
 
-        // Extract server public key
         let server_pk_raw = tlv
             .get(TlvType::PublicKey)
             .ok_or_else(|| {
@@ -267,7 +255,6 @@ impl PairSetup {
             Error::Pairing(PairingError::Protocol("SRP proof not computed".to_string()))
         })?;
 
-        // Build M3 TLV
         let mut tlv = Tlv8::new();
         tlv.set(TlvType::State, vec![0x03]);
         tlv.set(TlvType::PublicKey, srp_client.public_key());
@@ -293,7 +280,6 @@ impl PairSetup {
             Error::Pairing(PairingError::Protocol(format!("Failed to parse M4: {}", e)))
         })?;
 
-        // Check for error
         if let Some(_error_code) = tlv.error() {
             self.state = PairSetupState::Failed;
             return Err(Error::Pairing(PairingError::Protocol(
@@ -301,7 +287,6 @@ impl PairSetup {
             )));
         }
 
-        // Verify state is 4
         if tlv.state() != Some(0x04) {
             self.state = PairSetupState::Failed;
             return Err(Error::Pairing(PairingError::Protocol(
@@ -309,7 +294,6 @@ impl PairSetup {
             )));
         }
 
-        // Extract and verify server proof
         let server_proof = tlv
             .get(TlvType::Proof)
             .ok_or_else(|| {
@@ -334,7 +318,6 @@ impl PairSetup {
             )));
         }
 
-        // Derive session key from SRP shared secret
         let session_key = hkdf::derive_pair_setup_key(&proof.shared_secret).map_err(|e| {
             self.state = PairSetupState::Failed;
             Error::Pairing(PairingError::Protocol(format!(
@@ -350,10 +333,7 @@ impl PairSetup {
 
     /// Complete transient pairing after M4.
     ///
-    /// In transient mode, M5/M6 are not needed. After M4 is processed,
-    /// call this method to get the shared secret derived from SRP.
-    ///
-    /// Returns the shared secret that can be used to derive session keys.
+    /// M5/M6 aren't needed; returns the SRP shared secret for deriving session keys.
     pub fn complete_transient(&mut self) -> Result<SharedSecret> {
         if self.state != PairSetupState::M4Received {
             self.state = PairSetupState::Failed;
@@ -379,9 +359,7 @@ impl PairSetup {
 
     /// Generate M5 request with encrypted identity using ControllerIdentity.
     ///
-    /// This is the recommended method that uses a stable UUID identifier.
-    /// The same identifier must be used in pair-verify M3 for the device
-    /// to recognize this controller.
+    /// the same identifier must be used in pair-verify M3 for the device to recognize this controller.
     ///
     /// M5: {State=0x05, EncryptedData}
     /// EncryptedData contains TLV: {Identifier, PublicKey(Ed25519), Signature}
@@ -391,14 +369,11 @@ impl PairSetup {
 
     /// Generate M5 request with encrypted identity (legacy API).
     ///
-    /// NOTE: This method uses "Pair-Setup" as the identifier, which may not
-    /// match what pair-verify uses. For consistent pairing, use
-    /// `generate_m5_with_controller()` instead.
+    /// its identifier may not match what pair-verify uses; prefer `generate_m5_with_controller()`.
     ///
     /// M5: {State=0x05, EncryptedData}
     /// EncryptedData contains TLV: {Identifier, PublicKey(Ed25519), Signature}
     pub fn generate_m5(&mut self, identity: &IdentityKeyPair) -> Result<Vec<u8>> {
-        // For backward compatibility, derive identifier from public key
         let pk = identity.public_key();
         let id = format!(
             "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
@@ -450,10 +425,8 @@ impl PairSetup {
         message.extend_from_slice(pairing_id);
         message.extend_from_slice(&identity.public_key());
 
-        // Sign the message
         let signature = identity.sign(&message);
 
-        // Build inner TLV for encrypted data
         let mut inner_tlv = Tlv8::new();
         inner_tlv.set(TlvType::Identifier, pairing_id.to_vec());
         inner_tlv.set(TlvType::PublicKey, identity.public_key().to_vec());
@@ -468,7 +441,6 @@ impl PairSetup {
             Error::Pairing(PairingError::Protocol(format!("Failed to encrypt M5: {}", e)))
         })?;
 
-        // Build M5 TLV
         let mut tlv = Tlv8::new();
         tlv.set(TlvType::State, vec![0x05]);
         tlv.set(TlvType::EncryptedData, encrypted);
@@ -494,7 +466,6 @@ impl PairSetup {
             Error::Pairing(PairingError::Protocol(format!("Failed to parse M6: {}", e)))
         })?;
 
-        // Check for error
         if let Some(_error_code) = tlv.error() {
             self.state = PairSetupState::Failed;
             return Err(Error::Pairing(PairingError::Protocol(
@@ -502,7 +473,6 @@ impl PairSetup {
             )));
         }
 
-        // Verify state is 6
         if tlv.state() != Some(0x06) {
             self.state = PairSetupState::Failed;
             return Err(Error::Pairing(PairingError::Protocol(
@@ -536,7 +506,6 @@ impl PairSetup {
             Error::Pairing(PairingError::Protocol(format!("Failed to decrypt M6: {}", e)))
         })?;
 
-        // Parse inner TLV
         let inner_tlv = Tlv8::parse(&decrypted).map_err(|e| {
             self.state = PairSetupState::Failed;
             Error::Pairing(PairingError::Protocol(format!(
@@ -626,11 +595,9 @@ impl PairSetup {
         self.server_ltpk = Some(server_pk_arr);
         self.state = PairSetupState::Complete;
 
-        // Return the SRP shared secret
         Ok(SharedSecret::new(proof.shared_secret.clone()))
     }
 
-    /// Get current state.
     pub fn state(&self) -> &'static str {
         match self.state {
             PairSetupState::Initial => "initial",
@@ -644,7 +611,6 @@ impl PairSetup {
         }
     }
 
-    /// Check if pairing completed successfully.
     pub fn is_complete(&self) -> bool {
         self.state == PairSetupState::Complete
     }
@@ -673,20 +639,7 @@ enum TransientState {
     Failed,
 }
 
-/// Transient pair-setup protocol (DEPRECATED).
-///
-/// **DEPRECATED:** This implementation is incorrect. Transient pairing actually
-/// uses standard SRP pair-setup (M1-M4) with:
-/// - Flags=0x10 (kPairingFlag_Transient) as 4-byte little-endian
-/// - PIN "3939" (hardcoded for transient mode)
-/// - Stop at M4 - no M5/M6 identity exchange needed
-///
-/// Use [`PairSetup::new_transient()`] instead, which correctly implements
-/// transient pairing as SRP M1-M4 with the transient flag.
-///
-/// This struct incorrectly implements Ed25519 key exchange, which HomePod
-/// does not accept - it responds with an SRP challenge (384-byte public key)
-/// instead of a 32-byte Ed25519 key.
+/// deprecated: HomePod rejects this Ed25519 exchange with an SRP challenge; transient pairing is SRP M1-M4 with flags=0x10 and PIN "3939" ([`PairSetup::new_transient()`]).
 #[deprecated(
     since = "0.1.0",
     note = "Use PairSetup::new_transient() instead. This implementation incorrectly uses Ed25519 key exchange; transient pairing actually uses SRP with Flags=0x10."
@@ -699,7 +652,6 @@ pub struct TransientPairSetup {
 }
 
 impl TransientPairSetup {
-    /// Create a new transient pair-setup with the given Ed25519 identity.
     pub fn new(identity: IdentityKeyPair) -> Self {
         Self {
             state: TransientState::Initial,
@@ -794,7 +746,6 @@ impl TransientPairSetup {
         self.shared_secret = Some(shared_secret);
         self.state = TransientState::Complete;
 
-        // Return the raw shared secret (32 bytes)
         // The caller can use HKDF to derive session keys as needed
         Ok(SharedSecret::new(shared_secret.to_vec()))
     }
@@ -803,7 +754,6 @@ impl TransientPairSetup {
     fn extract_server_public_key(&self, response: &[u8]) -> Result<Vec<u8>> {
         // Try TLV8 format first
         if let Ok(tlv) = Tlv8::parse(response) {
-            // Check for error
             if let Some(error_code) = tlv.error() {
                 return Err(Error::Pairing(PairingError::Protocol(format!(
                     "Server returned error in M2: 0x{:02x}",
@@ -821,7 +771,6 @@ impl TransientPairSetup {
                 }
             }
 
-            // Extract public key
             if let Some(pk) = tlv.get(TlvType::PublicKey) {
                 return Ok(pk.to_vec());
             }
@@ -838,7 +787,6 @@ impl TransientPairSetup {
         ))))
     }
 
-    /// Get current state as string.
     pub fn state(&self) -> &'static str {
         match self.state {
             TransientState::Initial => "initial",
@@ -848,7 +796,6 @@ impl TransientPairSetup {
         }
     }
 
-    /// Check if transient pairing completed successfully.
     pub fn is_complete(&self) -> bool {
         self.state == TransientState::Complete
     }
@@ -963,18 +910,13 @@ impl MockSrpServer {
         hasher.update(&s_padded);
         let shared_secret = hasher.finalize().to_vec();
 
-        // Compute server proof M2
-        // M2 = H(PAD(A) || M1 || K)
-        // But we need M1 from client first, so we compute it here
-
         // First compute M1 = H(H(N) XOR H(g) || H(I) || salt || PAD(A) || PAD(B) || K)
         let n_bytes = pad_to_n(&self.params.n);
         let mut hasher = Sha512::new();
         hasher.update(&n_bytes);
         let h_n = hasher.finalize();
 
-        // IMPORTANT: Apple expects H(g) over the raw generator bytes (e.g., 0x05),
-        // NOT H(PAD(g)). This must match the client's compute_m1() implementation.
+        // Apple expects H(g) over the raw generator bytes (0x05), not H(PAD(g)); must match the client's compute_m1().
         let g_bytes = self.params.g.to_bytes_be();
         let mut hasher = Sha512::new();
         hasher.update(&g_bytes);
@@ -1068,7 +1010,6 @@ impl MockSetupServer {
 
         let (shared_secret, server_proof) = self.srp_server.compute_session(client_pk);
 
-        // Derive session key
         let session_key = hkdf::derive_pair_setup_key(&shared_secret).map_err(|e| {
             Error::Pairing(PairingError::Protocol(format!(
                 "Failed to derive session key: {}",
@@ -1077,7 +1018,6 @@ impl MockSetupServer {
         })?;
         self.session_key = Some(session_key);
 
-        // Build M4
         let mut tlv = Tlv8::new();
         tlv.set(TlvType::State, vec![0x04]);
         tlv.set(TlvType::Proof, server_proof);
@@ -1101,7 +1041,6 @@ impl MockSetupServer {
             Error::Pairing(PairingError::Protocol("Session key not derived".to_string()))
         })?;
 
-        // Decrypt M5
         let nonce = nonce_from_string(PS_MSG05_NONCE);
         let _decrypted = decrypt_with_nonce(session_key, &nonce, encrypted_data).map_err(|e| {
             Error::Pairing(PairingError::Protocol(format!("Failed to decrypt M5: {}", e)))
@@ -1126,7 +1065,6 @@ impl MockSetupServer {
             )))
         })?;
 
-        // Build server identity response
         let server_id = b"AirPlay-Server";
         let mut message = Vec::new();
         message.extend_from_slice(&accessory_x);
@@ -1135,7 +1073,6 @@ impl MockSetupServer {
 
         let signature = self.identity.sign(&message);
 
-        // Build inner TLV
         let mut inner_tlv = Tlv8::new();
         inner_tlv.set(TlvType::Identifier, server_id.to_vec());
         inner_tlv.set(TlvType::PublicKey, self.identity.public_key().to_vec());
@@ -1143,13 +1080,11 @@ impl MockSetupServer {
 
         let inner_data = inner_tlv.encode();
 
-        // Encrypt response
         let nonce = nonce_from_string(PS_MSG06_NONCE);
         let encrypted = encrypt_with_nonce(session_key, &nonce, &inner_data).map_err(|e| {
             Error::Pairing(PairingError::Protocol(format!("Failed to encrypt M6: {}", e)))
         })?;
 
-        // Build M6
         let mut tlv = Tlv8::new();
         tlv.set(TlvType::State, vec![0x06]);
         tlv.set(TlvType::EncryptedData, encrypted);
@@ -1217,7 +1152,6 @@ mod tests {
             let mut setup = PairSetup::new("1234");
             let _ = setup.generate_m1().unwrap();
 
-            // Try to process invalid M2
             let result = setup.process_m2(&[0x00, 0x01, 0x02]); // Invalid TLV
             assert!(result.is_err());
             assert_eq!(setup.state(), "failed");
@@ -1861,7 +1795,6 @@ mod tests {
             let client_identity = IdentityKeyPair::generate();
             let server_identity = IdentityKeyPair::generate();
 
-            // Client side
             let mut client_setup = TransientPairSetup::new(client_identity.clone());
             let _ = client_setup.generate_m1().unwrap();
             let m2 = server_identity.public_key().to_vec();
@@ -1870,7 +1803,6 @@ mod tests {
             // Server side would do the same
             let server_secret = server_identity.x25519_dh(&client_identity.public_key()).unwrap();
 
-            // Both should derive the same shared secret
             assert_eq!(client_secret.as_bytes(), &server_secret);
         }
 
@@ -1983,7 +1915,6 @@ mod tests {
             let client_identity = IdentityKeyPair::generate();
             let server_identity = IdentityKeyPair::generate();
 
-            // Client generates M1
             let mut client = TransientPairSetup::new(client_identity.clone());
             let m1 = client.generate_m1().unwrap();
 
@@ -1999,7 +1930,6 @@ mod tests {
             m2_tlv.set(TlvType::PublicKey, server_identity.public_key().to_vec());
             let m2 = m2_tlv.encode();
 
-            // Client processes M2
             let client_secret = client.process_m2(&m2).unwrap();
             assert!(client.is_complete());
 
@@ -2008,25 +1938,19 @@ mod tests {
             client_pk_arr.copy_from_slice(client_pk);
             let server_secret = server_identity.x25519_dh(&client_pk_arr).unwrap();
 
-            // Both should have the same shared secret
             assert_eq!(client_secret.as_bytes(), &server_secret);
         }
     }
 
-    /// Tests for the correct transient pairing implementation using SRP.
-    ///
-    /// This tests `PairSetup::new_transient()` which uses SRP M1-M4 with
-    /// transient flags, as opposed to the deprecated `TransientPairSetup`
-    /// which incorrectly used Ed25519 key exchange.
+    /// `PairSetup::new_transient()`: SRP M1-M4 with the transient flag.
     mod transient_srp_pair_setup {
         use super::*;
 
         #[test]
         fn new_transient_uses_pin_3939() {
-            // Create transient setup and verify PIN is "3939"
+            // the PIN is private; the mock-server tests below check it.
             let setup = PairSetup::new_transient();
             assert!(setup.is_transient());
-            // PIN is private, but we can verify behavior by testing with mock server
         }
 
         #[test]
@@ -2098,7 +2022,6 @@ mod tests {
             let mut setup = PairSetup::new_transient();
             let mut server = MockSetupServer::new("3939");
 
-            // Complete M1-M4 flow
             let _ = setup.generate_m1().unwrap();
             let m2 = server.generate_m2();
             setup.process_m2(&m2).unwrap();
@@ -2106,7 +2029,6 @@ mod tests {
             let m4 = server.process_m3(&m3).unwrap();
             setup.process_m4(&m4).unwrap();
 
-            // complete_transient should return the shared secret
             let shared_secret = setup.complete_transient().unwrap();
 
             // Shared secret from SRP should be 64 bytes (SHA-512 output)
@@ -2123,7 +2045,6 @@ mod tests {
             let m1 = setup.generate_m1().unwrap();
             assert!(!m1.is_empty());
 
-            // Verify M1 has transient flag
             let m1_tlv = Tlv8::parse(&m1).unwrap();
             assert_eq!(m1_tlv.get(TlvType::Flags), Some(&[0x10, 0x00, 0x00, 0x00][..]));
 
@@ -2140,7 +2061,6 @@ mod tests {
             let m4 = server.process_m3(&m3).unwrap();
             setup.process_m4(&m4).unwrap();
 
-            // Complete transient pairing
             let shared_secret = setup.complete_transient().unwrap();
             assert!(setup.is_complete());
             assert_eq!(shared_secret.as_bytes().len(), 64);
@@ -2179,7 +2099,6 @@ mod tests {
             let shared_secret = setup.complete_transient();
             assert!(shared_secret.is_ok());
 
-            // State should be "complete" now
             assert!(setup.is_complete());
         }
 

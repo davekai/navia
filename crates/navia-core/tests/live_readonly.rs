@@ -280,3 +280,52 @@ fn best_lag(a: &[f32], b: &[f32], max_shift: i64, window: usize) -> (i64, f32) {
     }
     (best.0, best.1)
 }
+
+/// an album's copyright tags from the native API (`NAVIA_PROBE_ALBUM`, an album id). logs in once.
+#[tokio::test]
+#[ignore]
+async fn real_server_album_copyrights() {
+    let Ok(album) = std::env::var("NAVIA_PROBE_ALBUM") else { return };
+    let values = client().album_copyrights(&album).await.unwrap();
+    let lines = navia_core::library::copyright::footer(&values, &[]).map(|f| f.lines).unwrap_or_default();
+    println!("{} tag values -> {lines:?}", values.len());
+}
+
+/// one animated cover, decoded twice: the first call fetches and decodes, the second reads the
+/// cache. `NAVIA_ANIM_COVER=<coverArt id>`; GETs only.
+#[tokio::test]
+#[ignore]
+async fn animated_cover() {
+    use navia_core::artwork::{ArtworkCache, ArtworkConfig};
+    let id = std::env::var("NAVIA_ANIM_COVER").expect("NAVIA_ANIM_COVER");
+    let dir = tempfile::tempdir().unwrap();
+    let cache = ArtworkCache::new(client(), ArtworkConfig { dir: dir.path().to_path_buf(), max_bytes: 1 << 30 }).unwrap();
+    for size in [600u32, 300] {
+        let start = Instant::now();
+        let art = cache.animated_artwork(&id, size).await.unwrap().expect("animated");
+        let first = start.elapsed();
+        let start = Instant::now();
+        let again = cache.animated_artwork(&id, size).await.unwrap().unwrap();
+        let frames = again.frames().unwrap();
+        println!(
+            "size {size}: {}x{} {} frames, {} ms loop, opaque {}, file {} KB, decoded {} KB; first {:?}, cached + all frames {:?}",
+            art.width,
+            art.height,
+            art.frame_count(),
+            art.delays_ms.iter().sum::<u32>(),
+            art.opaque,
+            std::fs::metadata(&art.path).unwrap().len() / 1024,
+            art.decoded_bytes() / 1024,
+            first,
+            start.elapsed()
+        );
+        assert_eq!(frames.len(), art.frame_count());
+    }
+    assert_eq!(cache.is_animated(&id), Some(true));
+    if let Ok(still) = std::env::var("NAVIA_STILL_COVER") {
+        let start = Instant::now();
+        assert!(cache.animated_artwork(&still, 600).await.unwrap().is_none());
+        println!("still cover checked in {:?}", start.elapsed());
+        assert_eq!(cache.is_animated(&still), Some(false));
+    }
+}

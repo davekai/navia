@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-/// One recorded request.
 #[derive(Clone, Debug)]
 pub struct Req {
     pub id: String,
@@ -18,6 +17,10 @@ pub struct Req {
     pub range: Option<String>,
     /// The endpoint, like `stream`.
     pub endpoint: String,
+    pub method: String,
+    /// the parameter names in the URL and in a form body.
+    pub query_keys: Vec<String>,
+    pub body_keys: Vec<String>,
 }
 
 #[derive(Default)]
@@ -61,6 +64,10 @@ pub struct ServerState {
     failures: Mutex<u32>,
     /// While set, connections are dropped as if the server were gone.
     pub down: AtomicBool,
+    /// every connection and request that reached the fake, whatever its endpoint.
+    pub seen: std::sync::atomic::AtomicUsize,
+    /// list `formPost`, and read parameters from a POST form too.
+    pub form_post: AtomicBool,
 }
 
 pub struct TestServer {
@@ -72,11 +79,12 @@ impl TestServer {
     pub fn start(library: Library, faults: Faults) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let state = Arc::new(ServerState { library: Mutex::new(library), faults: Mutex::new(faults), requests: Mutex::new(Vec::new()), extension: Mutex::new(None), decisions: Mutex::new(Vec::new()), failures: Mutex::new(0), down: AtomicBool::new(false) });
+        let state = Arc::new(ServerState { library: Mutex::new(library), faults: Mutex::new(faults), requests: Mutex::new(Vec::new()), extension: Mutex::new(None), decisions: Mutex::new(Vec::new()), failures: Mutex::new(0), down: AtomicBool::new(false), seen: Default::default(), form_post: AtomicBool::new(false) });
         let st = state.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(conn) = conn else { continue };
+                st.seen.fetch_add(1, Ordering::AcqRel);
                 if st.down.load(Ordering::Acquire) {
                     continue;
                 }
@@ -87,6 +95,10 @@ impl TestServer {
             }
         });
         Self { url, state }
+    }
+
+    pub fn seen(&self) -> usize {
+        self.state.seen.load(Ordering::Acquire)
     }
 
     /// Simulates the server going away, and coming back.
@@ -111,6 +123,8 @@ fn handle(mut conn: TcpStream, st: Arc<ServerState>) -> std::io::Result<()> {
         if reader.read_line(&mut line)? == 0 || st.down.load(Ordering::Acquire) {
             return Ok(());
         }
+        st.seen.fetch_add(1, Ordering::AcqRel);
+        let method = line.split_whitespace().next().unwrap_or("GET").to_string();
         let target = line.split_whitespace().nth(1).unwrap_or("/").to_string();
         let mut range = None;
         let mut content_length = 0usize;
@@ -129,10 +143,16 @@ fn handle(mut conn: TcpStream, st: Arc<ServerState>) -> std::io::Result<()> {
         }
         let path = target.split('?').next().unwrap_or("");
         let endpoint = path.rsplit('/').next().unwrap_or("").to_string();
-        let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let url_query = target.split_once('?').map(|(_, q)| q).unwrap_or("").to_string();
         if endpoint == "getOpenSubsonicExtensions" {
-            let names = if st.extension.lock().unwrap().is_some() { r#"[{"name":"transcoding","versions":[1]}]"# } else { "[]" };
-            let body = format!(r#"{{"subsonic-response":{{"status":"ok","openSubsonicExtensions":{names}}}}}"#);
+            let mut names = Vec::new();
+            if st.extension.lock().unwrap().is_some() {
+                names.push(r#"{"name":"transcoding","versions":[1]}"#);
+            }
+            if st.form_post.load(Ordering::Acquire) {
+                names.push(r#"{"name":"formPost","versions":[1]}"#);
+            }
+            let body = format!(r#"{{"subsonic-response":{{"status":"ok","openSubsonicExtensions":[{}]}}}}"#, names.join(","));
             write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len())?;
             continue;
         }
@@ -147,15 +167,24 @@ fn handle(mut conn: TcpStream, st: Arc<ServerState>) -> std::io::Result<()> {
             write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len())?;
             continue;
         }
+        let mut form = String::new();
+        if method == "POST" && content_length > 0 {
+            let mut raw = vec![0u8; content_length];
+            std::io::Read::read_exact(&mut reader, &mut raw)?;
+            form = String::from_utf8_lossy(&raw).to_string();
+        }
+        let keys = |q: &str| url::form_urlencoded::parse(q.as_bytes()).map(|(k, _)| k.into_owned()).collect::<Vec<_>>();
+        let (query_keys, body_keys) = (keys(&url_query), keys(&form));
+        let joined = if form.is_empty() { url_query.clone() } else { format!("{url_query}&{form}") };
+        let query = joined.as_str();
         let id = param(query, "id").or_else(|| param(query, "mediaId")).unwrap_or_default();
         // A decision's token is the fake's format.
         let format = param(query, "format").or_else(|| param(query, "transcodeParams"));
         let time_offset = param(query, "timeOffset").or_else(|| param(query, "offset")).and_then(|v| v.parse().ok());
         let max_bit_rate = param(query, "maxBitRate").and_then(|v| v.parse().ok());
-        st.requests.lock().unwrap().push(Req { id: id.clone(), format: format.clone(), time_offset, max_bit_rate, range: range.clone(), endpoint });
+        st.requests.lock().unwrap().push(Req { id: id.clone(), format: format.clone(), time_offset, max_bit_rate, range: range.clone(), endpoint, method, query_keys, body_keys });
         let faults = *st.faults.lock().unwrap();
 
-        // Raw or transcoded?
         let transcode = format.as_deref().filter(|f| *f != "raw").map(|f| f.to_string());
         if let Some(fmt) = transcode {
             let lib = st.library.lock().unwrap();

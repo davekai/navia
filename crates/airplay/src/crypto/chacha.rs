@@ -8,10 +8,7 @@ use chacha20poly1305::{
 use rand::{rngs::OsRng, RngCore};
 use zeroize::ZeroizeOnDrop;
 
-/// Control channel cipher with auto-incrementing nonce.
-///
-/// PERFORMANCE: ChaCha20Poly1305 ciphers are cached for both directions
-/// to avoid expensive re-initialization (15-20% speedup for RTSP control).
+/// control channel cipher with an auto-incrementing nonce; both directions' ciphers are cached.
 #[derive(ZeroizeOnDrop)]
 pub struct ControlCipher {
     write_key: [u8; 32],
@@ -26,10 +23,7 @@ pub struct ControlCipher {
     decrypt_counter: u64,
 }
 
-/// Audio packet cipher with explicit nonce.
-///
-/// PERFORMANCE: The ChaCha20Poly1305 cipher is cached to avoid expensive
-/// re-initialization on every packet (20-35% speedup for audio encryption).
+/// audio packet cipher with an explicit nonce, cached rather than rebuilt per packet.
 #[derive(ZeroizeOnDrop)]
 pub struct AudioCipher {
     key: [u8; 32],
@@ -38,7 +32,6 @@ pub struct AudioCipher {
 }
 
 impl ControlCipher {
-    /// Create cipher with separate write/read keys.
     pub fn new(write_key: [u8; 32], read_key: [u8; 32]) -> Self {
         let write_cipher = ChaCha20Poly1305::new(&write_key.into());
         let read_cipher = ChaCha20Poly1305::new(&read_key.into());
@@ -52,14 +45,11 @@ impl ControlCipher {
         }
     }
 
-    /// Create cipher with a single key for both directions.
     pub fn new_unidirectional(key: [u8; 32]) -> Self {
         Self::new(key, key)
     }
 
-    /// Encrypt plaintext with HomeKit framing.
-    ///
-    /// Each block is: [u16_le len][ciphertext][16-byte tag], with AAD=len.
+    /// HomeKit framing: each block is [u16_le len][ciphertext][16-byte tag], with AAD=len.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         const MAX_BLOCK: usize = 0x400;
         if plaintext.is_empty() {
@@ -78,12 +68,10 @@ impl ControlCipher {
             let nonce = Nonce::from_slice(&nonce);
             let payload = Payload { msg: block, aad: &aad };
 
-            // Use cached write_cipher (15-20% faster)
             let ciphertext_with_tag = self.write_cipher
                 .encrypt(nonce, payload)
                 .map_err(|e| CryptoError::Encryption(format!("Encryption failed: {}", e)))?;
 
-            // Append directly to output buffer
             out.extend_from_slice(&aad);
             out.extend_from_slice(&ciphertext_with_tag);
 
@@ -110,7 +98,6 @@ impl ControlCipher {
             aad: &aad,
         };
 
-        // Use cached read_cipher
         let plaintext = self.read_cipher
             .decrypt(nonce, payload)
             .map_err(|_| CryptoError::Decryption("Decryption/authentication failed".to_string()))?;
@@ -131,9 +118,7 @@ impl ControlCipher {
         self.decrypt_block(ciphertext_with_tag, block_len)
     }
 
-    /// Decrypt HomeKit-framed data (with length prefix).
-    ///
-    /// Format: [u16_le len][ciphertext][16-byte tag] repeated for each block.
+    /// decrypt HomeKit-framed data: [u16_le len][ciphertext][16-byte tag] per block.
     pub fn decrypt(&mut self, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if data.len() < 18 {
             return Err(CryptoError::Decryption(
@@ -171,17 +156,14 @@ impl ControlCipher {
         Ok(out)
     }
 
-    /// Get current encryption nonce counter.
     pub fn encrypt_counter(&self) -> u64 {
         self.encrypt_counter
     }
 
-    /// Get current decryption nonce counter.
     pub fn decrypt_counter(&self) -> u64 {
         self.decrypt_counter
     }
 
-    /// Reset counters (e.g., for new session).
     pub fn reset_counters(&mut self) {
         self.encrypt_counter = 0;
         self.decrypt_counter = 0;
@@ -195,9 +177,7 @@ impl AudioCipher {
         Self { key, cipher }
     }
 
-    /// Encrypt audio data with explicit nonce and AAD.
-    ///
-    /// AAD is constructed from RTP timestamp and SSRC.
+    /// encrypt with a random nonce; AAD is the RTP timestamp and SSRC.
     /// Returns (ciphertext, 8-byte nonce, 16-byte tag).
     pub fn encrypt(
         &self,
@@ -205,26 +185,14 @@ impl AudioCipher {
         rtp_timestamp: u32,
         ssrc: u32,
     ) -> Result<(Vec<u8>, [u8; 8], [u8; 16]), CryptoError> {
-        // Use random nonce (legacy method)
         let mut nonce_8 = [0u8; 8];
         OsRng.fill_bytes(&mut nonce_8);
         self.encrypt_with_nonce(audio_data, rtp_timestamp, ssrc, nonce_8)
     }
 
-    /// Encrypt audio data using sequence number in nonce.
-    ///
-    /// The 12-byte ChaCha20 nonce is constructed as:
-    /// ```text
-    /// nonce[0..3] = 0x00000000        # First 4 bytes are zero
-    /// nonce[4..5] = sequence_number   # RTP sequence number (2 bytes, host/LE byte order)
-    /// nonce[6..11] = 0x000000000000   # Remaining 6 bytes are zero
-    /// ```
-    /// Only nonce[4..11] (8 bytes) is transmitted in the packet trailer.
-    ///
-    /// This matches owntone's `packet_encrypt()` which uses `memcpy(nonce + 4, &pkt->seqnum, sizeof(pkt->seqnum))`
-    /// where seqnum is a uint16_t in host byte order.
-    ///
-    /// Returns (ciphertext, 8-byte nonce, 16-byte tag).
+    /// encrypt with the RTP sequence number as the nonce: [0, 0, 0, 0, seq_lo, seq_hi, 0, 0, 0, 0, 0, 0],
+    /// the u16 in host (LE) order. only nonce[4..12] is sent
+    /// in the packet trailer. returns (ciphertext, 8-byte nonce, 16-byte tag).
     pub fn encrypt_with_seq(
         &self,
         audio_data: &[u8],
@@ -232,14 +200,10 @@ impl AudioCipher {
         ssrc: u32,
         seqnum: u16,
     ) -> Result<(Vec<u8>, [u8; 8], [u8; 16]), CryptoError> {
-        // Build 12-byte nonce with u16 sequence at offset 4 (host/LE byte order)
-        // Format: [0, 0, 0, 0, seq_lo, seq_hi, 0, 0, 0, 0, 0, 0]
-        // Matches owntone: memcpy(nonce + nonce_offset, &pkt->seqnum, sizeof(pkt->seqnum))
         let mut nonce_12 = [0u8; 12];
         nonce_12[4..6].copy_from_slice(&seqnum.to_le_bytes());
         let nonce = Nonce::from_slice(&nonce_12);
 
-        // Build AAD from RTP timestamp and SSRC (inline for better performance)
         let aad = build_aad(rtp_timestamp, ssrc);
 
         let payload = Payload {
@@ -247,12 +211,10 @@ impl AudioCipher {
             aad: &aad,
         };
 
-        // Use cached cipher (20-35% faster than re-initialization)
         let mut ciphertext_with_tag = self.cipher
             .encrypt(nonce, payload)
             .map_err(|e| CryptoError::Encryption(format!("Encryption failed: {}", e)))?;
 
-        // Split ciphertext and tag more efficiently (reduce allocations)
         let tag_start = ciphertext_with_tag.len() - 16;
         let tag = ciphertext_with_tag.split_off(tag_start);
         let mut tag_array = [0u8; 16];
@@ -265,7 +227,6 @@ impl AudioCipher {
         Ok((ciphertext_with_tag, nonce_8, tag_array))
     }
 
-    /// Internal encrypt with explicit 8-byte nonce.
     fn encrypt_with_nonce(
         &self,
         audio_data: &[u8],
@@ -273,11 +234,9 @@ impl AudioCipher {
         ssrc: u32,
         nonce_8: [u8; 8],
     ) -> Result<(Vec<u8>, [u8; 8], [u8; 16]), CryptoError> {
-        // Build 12-byte nonce (8-byte nonce + 4-byte zeros)
         let nonce_12 = build_nonce_12(&nonce_8);
         let nonce = Nonce::from_slice(&nonce_12);
 
-        // Build AAD from RTP timestamp and SSRC
         let aad = build_aad(rtp_timestamp, ssrc);
 
         let payload = Payload {
@@ -285,12 +244,10 @@ impl AudioCipher {
             aad: &aad,
         };
 
-        // Use cached cipher
         let mut ciphertext_with_tag = self.cipher
             .encrypt(nonce, payload)
             .map_err(|e| CryptoError::Encryption(format!("Encryption failed: {}", e)))?;
 
-        // Split ciphertext and tag more efficiently
         let tag_start = ciphertext_with_tag.len() - 16;
         let tag = ciphertext_with_tag.split_off(tag_start);
         let mut tag_array = [0u8; 16];
@@ -308,14 +265,11 @@ impl AudioCipher {
         rtp_timestamp: u32,
         ssrc: u32,
     ) -> Result<Vec<u8>, CryptoError> {
-        // Build 12-byte nonce
         let nonce_12 = build_nonce_12(nonce);
         let nonce = Nonce::from_slice(&nonce_12);
 
-        // Build AAD from RTP timestamp and SSRC
         let aad = build_aad(rtp_timestamp, ssrc);
 
-        // Concatenate ciphertext and tag for decryption
         let mut ciphertext_with_tag = ciphertext.to_vec();
         ciphertext_with_tag.extend_from_slice(tag);
 
@@ -324,33 +278,27 @@ impl AudioCipher {
             aad: &aad,
         };
 
-        // Use cached cipher
         self.cipher
             .decrypt(nonce, payload)
             .map_err(|_| CryptoError::Decryption("Decryption/authentication failed".to_string()))
     }
 }
 
-/// Build 12-byte nonce from 8-byte explicit nonce.
-///
-/// The 8-byte nonce is placed at bytes 4-11, with bytes 0-3 as zeros.
-/// This matches the owntone/AirPlay format where:
-/// - nonce[0..3] = 0x00000000
-/// - nonce[4..11] = 8-byte packet nonce
+/// the 8-byte packet nonce goes at bytes 4..12; bytes 0..4 are zero.
 fn build_nonce_12(nonce_8: &[u8; 8]) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[4..12].copy_from_slice(nonce_8);
     nonce
 }
 
-/// Build 12-byte nonce from counter.
+/// the counter goes at bytes 4..12, little-endian; bytes 0..4 are zero.
 fn build_nonce_from_counter(counter: u64) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[4..12].copy_from_slice(&counter.to_le_bytes());
     nonce
 }
 
-/// Build AAD from RTP header fields.
+/// RTP timestamp then SSRC, big-endian.
 fn build_aad(rtp_timestamp: u32, ssrc: u32) -> [u8; 8] {
     let mut aad = [0u8; 8];
     aad[0..4].copy_from_slice(&rtp_timestamp.to_be_bytes());
@@ -358,9 +306,7 @@ fn build_aad(rtp_timestamp: u32, ssrc: u32) -> [u8; 8] {
     aad
 }
 
-/// Encrypt with explicit 12-byte nonce (for pairing protocols).
-///
-/// Returns ciphertext with 16-byte auth tag appended.
+/// encrypt with an explicit 12-byte nonce (pairing); the 16-byte tag is appended.
 pub fn encrypt_with_nonce(
     key: &[u8; 32],
     nonce: &[u8; 12],
@@ -376,9 +322,7 @@ pub fn encrypt_with_nonce(
         .map_err(|e| CryptoError::Encryption(format!("Encryption failed: {}", e)))
 }
 
-/// Decrypt with explicit 12-byte nonce (for pairing protocols).
-///
-/// Expects ciphertext with 16-byte auth tag appended.
+/// decrypt with an explicit 12-byte nonce (pairing); expects the 16-byte tag appended.
 pub fn decrypt_with_nonce(
     key: &[u8; 32],
     nonce: &[u8; 12],
@@ -400,14 +344,11 @@ pub fn decrypt_with_nonce(
         .map_err(|_| CryptoError::Decryption("Decryption/authentication failed".to_string()))
 }
 
-/// Create a 12-byte nonce from a string (right-aligned, left-padded with zeros).
-///
-/// HomeKit nonces like "PV-Msg02" become: `\x00\x00\x00\x00PV-Msg02`
-/// The string is placed at the END of the 12-byte buffer.
+/// `s` right-aligned in 12 zero bytes: "PV-Msg02" becomes `\x00\x00\x00\x00PV-Msg02`.
 pub fn nonce_from_string(s: &[u8]) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     let len = s.len().min(12);
-    let start = 12 - len; // Right-align the string
+    let start = 12 - len;
     nonce[start..].copy_from_slice(&s[..len]);
     nonce
 }
@@ -461,9 +402,7 @@ mod tests {
             let plaintext = b"hello";
             let ciphertext = cipher.encrypt(plaintext).unwrap();
             // HomeKit frame: 2-byte length prefix + ciphertext + 16-byte tag
-            // For 5-byte plaintext: 2 + 5 + 16 = 23 bytes
             assert_eq!(ciphertext.len(), 2 + plaintext.len() + 16);
-            // Verify length prefix
             let len = u16::from_le_bytes([ciphertext[0], ciphertext[1]]);
             assert_eq!(len, plaintext.len() as u16);
         }
@@ -527,12 +466,10 @@ mod tests {
             let mut cipher1 = ControlCipher::new_unidirectional(key);
             let mut cipher2 = ControlCipher::new_unidirectional(key);
 
-            // First encryption with counter 0
             let ct1 = cipher1.encrypt(b"same").unwrap();
 
             // Advance cipher2's counter
             let _ = cipher2.encrypt(b"dummy").unwrap();
-            // Now encrypt with counter 1
             let ct2 = cipher2.encrypt(b"same").unwrap();
 
             // Same plaintext, different nonces = different ciphertext
@@ -662,7 +599,6 @@ mod tests {
 
             // First 4 bytes should be zero (matching owntone format)
             assert_eq!(nonce_12[0..4], [0, 0, 0, 0]);
-            // Nonce at bytes 4-11
             assert_eq!(nonce_12[4..12], nonce_8);
         }
 
@@ -681,7 +617,6 @@ mod tests {
             let counter = 1u64;
             let nonce = build_nonce_from_counter(counter);
 
-            // First 4 bytes should be zero
             assert_eq!(nonce[0..4], [0, 0, 0, 0]);
             // Counter value (1) in little-endian at bytes 4-11
             assert_eq!(nonce[4], 1); // LSB
@@ -693,7 +628,6 @@ mod tests {
             // HomeKit pair-verify nonces are right-aligned with zero padding
             let nonce = nonce_from_string(b"PV-Msg02");
 
-            // Should be: 4 zeros + "PV-Msg02" (8 bytes)
             assert_eq!(&nonce[0..4], &[0, 0, 0, 0]);
             assert_eq!(&nonce[4..12], b"PV-Msg02");
         }
@@ -702,7 +636,6 @@ mod tests {
         fn nonce_from_string_pv_msg03() {
             let nonce = nonce_from_string(b"PV-Msg03");
 
-            // Should be: 4 zeros + "PV-Msg03"
             assert_eq!(&nonce[0..4], &[0, 0, 0, 0]);
             assert_eq!(&nonce[4..12], b"PV-Msg03");
         }
@@ -721,7 +654,6 @@ mod tests {
             // Short inputs get more zero padding
             let nonce = nonce_from_string(b"test");
 
-            // 8 zeros + "test" (4 bytes)
             assert_eq!(&nonce[0..8], &[0, 0, 0, 0, 0, 0, 0, 0]);
             assert_eq!(&nonce[8..12], b"test");
         }
@@ -739,17 +671,14 @@ mod tests {
 
         #[test]
         fn key_zeroized_on_drop() {
-            // Create cipher, drop it, verify memory is cleared
-            // This is verified by the ZeroizeOnDrop derive
+            // ZeroizeOnDrop clears the key; this only checks that dropping works.
             let cipher = ControlCipher::new_unidirectional([0x42u8; 32]);
             drop(cipher);
-            // The ZeroizeOnDrop derive ensures the key is cleared
         }
 
         #[test]
         fn constant_time_tag_comparison() {
-            // ChaCha20Poly1305 uses constant-time comparison internally
-            // We just verify that authentication works
+            // the tag comparison is constant-time inside ChaCha20Poly1305; this checks authentication.
             let key = [0x42u8; 32];
             let mut encrypt_cipher = ControlCipher::new_unidirectional(key);
             let mut decrypt_cipher = ControlCipher::new_unidirectional(key);
@@ -788,7 +717,6 @@ mod tests {
 
             let result = cipher.encrypt(nonce_arr, payload).unwrap();
 
-            // Result is ciphertext + tag
             let ciphertext = &result[..result.len() - 16];
             let tag = &result[result.len() - 16..];
 

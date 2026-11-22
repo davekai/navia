@@ -372,3 +372,65 @@ fn crossfade_through_the_resampler_matches_an_independent_mix() {
     assert!(worst < 1e-4, "worst difference {worst}");
     assert_eq!(p.snapshot().underrun_frames, 0, "{:?}", p.snapshot());
 }
+
+/// a stream whose reader took the last byte and let go before the worker noticed the file was whole
+/// still hands every byte over: the file is all on disk, so it's kept.
+#[test]
+fn a_whole_stream_dropped_right_after_its_last_byte_is_still_kept() {
+    use navia_core::audio::stream::{CompleteSink, HttpFetcher, HttpStream, StreamConfig};
+    use navia_core::client::StreamOptions;
+    use navia_core::songcache::Spool;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Count(AtomicU64);
+    impl CompleteSink for Count {
+        fn complete(&self, spool: &dyn Spool, len: u64, _: Option<&str>) {
+            let mut last = [0u8; 1];
+            spool.read_at(len - 1, &mut last).unwrap();
+            self.0.store(len, Ordering::Release);
+        }
+    }
+
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let mut files = Library::default();
+    files.raw.insert("s1".into(), data.clone());
+    let server = TestServer::start(files, Faults::default());
+    let client = Client::new(ClientConfig::new(server.url.clone(), Credentials::new("t".to_string(), "t".to_string()))).unwrap();
+    let fetcher = HttpFetcher::new().unwrap();
+    let url = client.stream_url("s1", &StreamOptions { format: Some("raw".into()), ..Default::default() }).unwrap();
+    // busy threads preempt the stream's worker between its last write and its last look
+    let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let burners: Vec<_> = (0..std::thread::available_parallelism().map_or(4, |n| n.get()))
+        .map(|_| {
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                while busy.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            })
+        })
+        .collect();
+    for round in 0..300 {
+        let stream = HttpStream::open(&fetcher, url.clone(), StreamConfig::default()).unwrap();
+        let sink = Arc::new(Count(AtomicU64::new(0)));
+        stream.keep_when_complete(sink.clone());
+        let mut got = Vec::new();
+        stream.reader().read_to_end(&mut got).unwrap();
+        assert_eq!(got.len(), data.len());
+        drop(stream);
+        let start = Instant::now();
+        while sink.0.load(Ordering::Acquire) == 0 && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let kept = sink.0.load(Ordering::Acquire);
+        if kept != data.len() as u64 {
+            busy.store(false, Ordering::Relaxed);
+            panic!("round {round}: a whole file wasn't kept ({kept})");
+        }
+    }
+    busy.store(false, Ordering::Relaxed);
+    for b in burners {
+        b.join().unwrap();
+    }
+}

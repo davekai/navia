@@ -29,31 +29,26 @@ pub struct FairPlayStreamKeys {
 }
 
 impl SharedSecret {
-    /// Create from raw bytes.
     pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
 
-    /// Get raw bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
 
 impl EncryptionKey {
-    /// Create from raw bytes.
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    /// Get raw bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
 
 impl SessionKeys {
-    /// Derive session keys for control channel encryption.
     pub fn derive_control_keys(shared_secret: &SharedSecret) -> Result<Self, CryptoError> {
         let write_key = hkdf::derive_control_write_key(shared_secret.as_bytes())?;
         let read_key = hkdf::derive_control_read_key(shared_secret.as_bytes())?;
@@ -64,7 +59,6 @@ impl SessionKeys {
         })
     }
 
-    /// Derive session keys for pair-setup encryption.
     pub fn derive_pair_setup_keys(
         shared_secret: &SharedSecret,
     ) -> Result<EncryptionKey, CryptoError> {
@@ -72,7 +66,6 @@ impl SessionKeys {
         Ok(EncryptionKey(key))
     }
 
-    /// Derive session keys for pair-verify encryption.
     pub fn derive_pair_verify_keys(
         shared_secret: &SharedSecret,
     ) -> Result<EncryptionKey, CryptoError> {
@@ -81,10 +74,7 @@ impl SessionKeys {
     }
 }
 
-/// Derive stream keys from a FairPlay session key.
-///
-/// NOTE: This is a placeholder derivation using HKDF and does NOT implement
-/// Apple’s real FairPlay key schedule.
+/// a placeholder HKDF derivation, not Apple's real FairPlay key schedule.
 pub fn derive_fairplay_stream_keys(session_key: &[u8; 32]) -> Result<FairPlayStreamKeys, CryptoError> {
     let ekey = hkdf::derive_key(
         session_key,
@@ -132,11 +122,9 @@ mod tests {
 
         #[test]
         fn zeroized_on_drop() {
-            // Create a secret, drop it, and verify zeroize is called
-            // This is verified by the ZeroizeOnDrop derive
+            // clearing comes from the ZeroizeOnDrop derive; this only exercises the drop.
             let secret = SharedSecret::new(vec![0x42u8; 32]);
             drop(secret);
-            // The ZeroizeOnDrop derive ensures the bytes are cleared
         }
 
         #[test]
@@ -159,11 +147,9 @@ mod tests {
 
         #[test]
         fn zeroized_on_drop() {
-            // Create a key, drop it, and verify zeroize is called
-            // This is verified by the ZeroizeOnDrop derive
+            // clearing comes from the ZeroizeOnDrop derive; this only exercises the drop.
             let key = EncryptionKey::new([0x42u8; 32]);
             drop(key);
-            // The ZeroizeOnDrop derive ensures the bytes are cleared
         }
 
         #[test]
@@ -182,7 +168,6 @@ mod tests {
             let shared_secret = SharedSecret::new(vec![0xABu8; 32]);
             let session_keys = SessionKeys::derive_control_keys(&shared_secret).unwrap();
 
-            // Write and read keys should be different
             assert_ne!(
                 session_keys.write_key.as_bytes(),
                 session_keys.read_key.as_bytes()
@@ -211,12 +196,10 @@ mod tests {
 
         #[test]
         fn keys_zeroized_on_drop() {
-            // Create session keys, drop them, and verify zeroize is called
-            // This is verified by the ZeroizeOnDrop derive
+            // clearing comes from the ZeroizeOnDrop derive; this only exercises the drop.
             let shared_secret = SharedSecret::new(vec![0xABu8; 32]);
             let session_keys = SessionKeys::derive_control_keys(&shared_secret).unwrap();
             drop(session_keys);
-            // The ZeroizeOnDrop derive ensures the keys are cleared
         }
 
         #[test]

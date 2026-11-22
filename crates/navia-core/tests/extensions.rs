@@ -158,14 +158,14 @@ async fn queue_saves_by_index_and_offers_another_devices_queue() {
     assert!(qs.remote_offer().await.unwrap().is_none());
 
     // Another client's newer queue is offered, once.
-    fake.state.lock().unwrap().canned.insert("getPlayQueueByIndex".into(), json!({"playQueueByIndex": {"currentIndex": 1, "position": 42000, "changed": "2099-01-01T00:00:00Z", "changedBy": "Feishin", "entry": entries(&["x", "y", "z"])}}));
+    fake.state.lock().unwrap().canned.insert("getPlayQueueByIndex".into(), json!({"playQueueByIndex": {"currentIndex": 1, "position": 42000, "changed": "2099-01-01T00:00:00Z", "changedBy": "Other Client", "entry": entries(&["x", "y", "z"])}}));
     let offer = qs.remote_offer().await.unwrap().expect("offered");
-    assert_eq!((offer.changed_by.as_str(), offer.index, offer.position_ms, offer.songs.len()), ("Feishin", 1, 42000, 3));
+    assert_eq!((offer.changed_by.as_str(), offer.index, offer.position_ms, offer.songs.len()), ("Other Client", 1, 42000, 3));
     qs.answered(&offer);
     assert!(qs.remote_offer().await.unwrap().is_none());
 
     // An older queue than this device's own isn't.
-    fake.state.lock().unwrap().canned.insert("getPlayQueueByIndex".into(), json!({"playQueueByIndex": {"currentIndex": 0, "changed": "2001-01-01T00:00:00Z", "changedBy": "Feishin", "entry": entries(&["q"])}}));
+    fake.state.lock().unwrap().canned.insert("getPlayQueueByIndex".into(), json!({"playQueueByIndex": {"currentIndex": 0, "changed": "2001-01-01T00:00:00Z", "changedBy": "Other Client", "entry": entries(&["q"])}}));
     assert!(qs.remote_offer().await.unwrap().is_none());
     // Nor an empty one with Navidrome's zero time.
     fake.state.lock().unwrap().canned.insert("getPlayQueueByIndex".into(), json!({"playQueueByIndex": {"changed": "0001-01-01T00:00:00Z", "changedBy": ""}}));
@@ -178,8 +178,8 @@ async fn an_offered_queue_is_not_overwritten_until_answered() {
     let (_dir, lib) = library();
     let client = fake.client();
     let qs = sync(&client, &lib, Arc::new(PlayReporter::new(Arc::new(client.clone()))), features(&[("indexBasedQueue", &[1])]));
-    fake.state.lock().unwrap().canned.insert("getPlayQueueByIndex".into(), json!({"playQueueByIndex": {"currentIndex": 0, "position": 9000, "changed": "2099-01-01T00:00:00Z", "changedBy": "Feishin", "entry": [{"id": "x", "title": "x"}]}}));
-    // The restored local queue, then the offer showing, so nothing goes to the server.
+    fake.state.lock().unwrap().canned.insert("getPlayQueueByIndex".into(), json!({"playQueueByIndex": {"currentIndex": 0, "position": 9000, "changed": "2099-01-01T00:00:00Z", "changedBy": "Other Client", "entry": [{"id": "x", "title": "x"}]}}));
+    // The restored local queue, then the offer showing: nothing goes to the server.
     qs.note(queue(&["a", "b"], 0, 1000));
     let offer = qs.remote_offer().await.unwrap().expect("offered");
     qs.note(queue(&["a", "b"], 0, 3000));
@@ -212,9 +212,9 @@ async fn queue_without_index_extension_uses_save_play_queue() {
     assert!(requests(&fake, "savePlayQueueByIndex").await.is_empty());
 
     // The offer reads getPlayQueue instead, and finds the current song by id.
-    fake.state.lock().unwrap().canned.insert("getPlayQueue".into(), json!({"playQueue": {"current": "y", "position": 7, "changed": "2099-01-01T00:00:00Z", "changedBy": "DSub", "entry": [{"id": "x", "title": "x"}, {"id": "y", "title": "y"}]}}));
+    fake.state.lock().unwrap().canned.insert("getPlayQueue".into(), json!({"playQueue": {"current": "y", "position": 7, "changed": "2099-01-01T00:00:00Z", "changedBy": "other-client", "entry": [{"id": "x", "title": "x"}, {"id": "y", "title": "y"}]}}));
     let offer = qs.remote_offer().await.unwrap().expect("offered");
-    assert_eq!((offer.index, offer.changed_by.as_str()), (1, "DSub"));
+    assert_eq!((offer.index, offer.changed_by.as_str()), (1, "other-client"));
     assert_eq!(fake.calls("getPlayQueueByIndex"), 0);
 
     // A read-only client saves nothing.
@@ -393,7 +393,8 @@ async fn sharing_marks_only_playback_reports() {
     reporter.advance(std::time::Duration::from_secs(150)).await;
     let marked = format!("{CLIENT_NAME}{SHARE_MARK}");
     let reports: Vec<(String, String)> = requests(&fake, "reportPlayback").await.iter().map(|p| (get(p, "state").unwrap().to_string(), get(p, "c").unwrap().to_string())).collect();
-    let want = [("starting", CLIENT_NAME), ("playing", CLIENT_NAME), ("stopped", CLIENT_NAME), ("starting", marked.as_str()), ("playing", marked.as_str())];
+    // the marked session starts before the plain one stops, so a follower never sees it gone
+    let want = [("starting", CLIENT_NAME), ("playing", CLIENT_NAME), ("starting", marked.as_str()), ("playing", marked.as_str()), ("stopped", CLIENT_NAME)];
     assert_eq!(reports, want.map(|(a, b)| (a.to_string(), b.to_string())));
     let scrobbles: Vec<(String, String)> = requests(&fake, "scrobble").await.iter().map(|p| (get(p, "submission").unwrap().to_string(), get(p, "c").unwrap().to_string())).collect();
     assert_eq!(scrobbles, vec![("false".to_string(), marked.clone()), ("true".to_string(), CLIENT_NAME.to_string())], "now-playing marked, the play itself not");

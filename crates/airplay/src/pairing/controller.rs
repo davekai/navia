@@ -1,19 +1,11 @@
-//! Controller identity for consistent pairing identifiers.
-//!
-//! The `ControllerIdentity` struct holds both an Ed25519 keypair and a stable UUID
-//! identifier that must be used consistently across pair-setup M5 and pair-verify M3.
+//! the controller's identity: an Ed25519 key pair and the UUID that pair-setup M5 and
+//! pair-verify M3 both send.
 
 use crate::crypto::ed25519::IdentityKeyPair;
 use std::path::Path;
 
-/// Controller identity for AirPlay pairing.
-///
-/// This struct holds both the Ed25519 keypair (LTSK/LTPK) and a stable UUID identifier.
-/// The same identifier must be used in both:
-/// - pair-setup M5 (when registering with the device)
-/// - pair-verify M3 (when authenticating in subsequent sessions)
-///
-/// If the identifiers don't match, the device will reject the pairing.
+/// the same identifier must be sent in pair-setup M5 and pair-verify M3, or the device rejects
+/// the pairing.
 #[derive(Clone)]
 pub struct ControllerIdentity {
     /// Stable UUID identifier (e.g., "12345678-ABCD-1234-ABCD-123456789ABC")
@@ -23,19 +15,13 @@ pub struct ControllerIdentity {
 }
 
 impl ControllerIdentity {
-    /// Generate a new identity with a random UUID derived from the public key.
-    ///
-    /// The UUID is derived from the first 16 bytes of the Ed25519 public key
-    /// to ensure it's stable for a given keypair.
+    /// a new key pair, with the UUID taken from the first 16 bytes of its public key.
     pub fn generate() -> Self {
         let keypair = IdentityKeyPair::generate();
         Self::from_keypair(keypair)
     }
 
-    /// Create from an existing keypair with a UUID derived from the public key.
-    ///
-    /// The UUID format is: `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`
-    /// where X is derived from the public key bytes.
+    /// the UUID comes from the public key's bytes, as `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`.
     pub fn from_keypair(keypair: IdentityKeyPair) -> Self {
         let pk = keypair.public_key();
         let id = format!(
@@ -49,10 +35,7 @@ impl ControllerIdentity {
         Self { id, keypair }
     }
 
-    /// Create from an existing keypair with a custom identifier.
-    ///
-    /// Use this when you need to specify a particular identifier format,
-    /// such as when interoperating with other implementations.
+    /// with a given identifier, for interoperating with other implementations.
     pub fn with_id(keypair: IdentityKeyPair, id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -60,37 +43,28 @@ impl ControllerIdentity {
         }
     }
 
-    /// Get the stable identifier.
-    ///
-    /// This identifier must be used consistently in both pair-setup M5
-    /// and pair-verify M3 to match what the device expects.
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    /// Get the identifier as bytes for TLV encoding.
+    /// for TLV encoding.
     pub fn id_bytes(&self) -> Vec<u8> {
         self.id.as_bytes().to_vec()
     }
 
-    /// Get the Ed25519 keypair.
     pub fn keypair(&self) -> &IdentityKeyPair {
         &self.keypair
     }
 
-    /// Get the Ed25519 public key (LTPK).
     pub fn public_key(&self) -> [u8; 32] {
         self.keypair.public_key()
     }
 
-    /// Sign a message with the Ed25519 private key.
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.keypair.sign(message)
     }
 
-    /// Load identity from persistent storage.
-    ///
-    /// File format: Line 1 = UUID, Line 2 = hex-encoded Ed25519 seed (32 bytes)
+    /// file format: line 1 the UUID, line 2 the hex-encoded 32-byte Ed25519 seed.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let mut lines = contents.lines();
@@ -122,18 +96,13 @@ impl ControllerIdentity {
         Ok(Self { id, keypair })
     }
 
-    /// Save identity to persistent storage.
-    ///
-    /// File format: Line 1 = UUID, Line 2 = hex-encoded Ed25519 seed (32 bytes)
+    /// same format as [`Self::load`].
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let seed_hex = hex_encode(&self.keypair.seed());
         let contents = format!("{}\n{}\n", self.id, seed_hex);
         std::fs::write(path, contents)
     }
 
-    /// Load or generate identity.
-    ///
-    /// If the file exists, load from it. Otherwise, generate a new identity and save it.
     pub fn load_or_generate(path: &Path) -> std::io::Result<Self> {
         if path.exists() {
             Self::load(path)
@@ -176,7 +145,6 @@ mod tests {
         assert_eq!(identity.id().len(), 36);
         assert!(identity.id().contains('-'));
 
-        // Public key should be 32 bytes
         assert_eq!(identity.public_key().len(), 32);
     }
 
@@ -188,10 +156,8 @@ mod tests {
         let identity1 = ControllerIdentity::from_keypair(keypair.clone());
         let identity2 = ControllerIdentity::from_keypair(keypair);
 
-        // Same keypair should produce same ID
         assert_eq!(identity1.id(), identity2.id());
 
-        // ID should be derived from public key
         assert!(identity1.id().starts_with(&format!("{:02X}{:02X}", pk[0], pk[1])));
     }
 
@@ -221,10 +187,8 @@ mod tests {
 
         let signature = identity.sign(message);
 
-        // Signature should be 64 bytes (Ed25519)
         assert_eq!(signature.len(), 64);
 
-        // Verify with the public key
         crate::crypto::ed25519::verify(&identity.public_key(), message, &signature).unwrap();
     }
 

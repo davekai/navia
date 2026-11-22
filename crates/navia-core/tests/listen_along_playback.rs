@@ -486,3 +486,26 @@ fn the_crossfade_comes_back_after_following() {
         rig.player.shutdown();
     }
 }
+
+/// a host waiting on a listener's session song: the queue ends after the playing song, so its own
+/// next song isn't started; Next then plays it. in every mode, since a crossfade holds a tail.
+#[test]
+fn holding_after_the_current_song_ends_the_queue_there() {
+    for mode in [Mode::Gapless, Mode::Crossfade, Mode::Smart] {
+        let rig = Rig::new(mode);
+        rig.player.set_queue(vec![QueueItem::new("s0".into(), Some(SONG_S as u64 * 1000)), QueueItem::new("s1".into(), Some(SONG_S as u64 * 1000))], 0, 9_000, false);
+        rig.wait_position(10_000);
+        rig.player.set_hold_after_current(true);
+        let limit = Instant::now() + Duration::from_secs(60);
+        while rig.player.snapshot().status != PlayerStatus::Stopped {
+            assert!(Instant::now() < limit, "{mode:?}: the queue never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let start = rig.now_ms();
+        assert!(rig.heard_from(0).iter().all(|(_, h)| !matches!(h, Heard::Song(1, _) | Heard::Mix)), "{mode:?}: the next song was heard while held");
+        rig.player.set_hold_after_current(false);
+        rig.player.next();
+        rig.wait_until(start + 1_500);
+        assert!(matches!(rig.first_audio_after(start), Some((_, Heard::Song(1, _)))), "{mode:?}: Next didn't move on");
+    }
+}

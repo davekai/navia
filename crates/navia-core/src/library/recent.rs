@@ -67,6 +67,9 @@ pub async fn refresh_play_history(client: &Client, library: &Library) -> Result<
     refresh_play_history_at(client, library, now_unix()).await
 }
 
+/// a failure while the server has asked the client to wait (it limited or failed the request) is
+/// left unstamped, so it's retried once that wait is over ([`Client::native_retry_in`]); any other
+/// failure waits for the slow schedule, like a server without the history.
 pub async fn refresh_play_history_at(client: &Client, library: &Library, now: i64) -> Result<PlayHistoryRefresh> {
     let fetched: Option<i64> = library.meta(META_FETCHED_AT)?.and_then(|v| v.parse().ok());
     let mark = library.newest_played()?;
@@ -75,19 +78,30 @@ pub async fn refresh_play_history_at(client: &Client, library: &Library, now: i6
     {
         return Ok(PlayHistoryRefresh::Skipped);
     }
-    // Stamped before asking, so a failing server is retried on the slow schedule too.
+    let outcome = match fetch_window(client, library, now).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            if client.native_retry_in().is_none() {
+                library.set_meta(META_FETCHED_AT, Some(&now.to_string()))?;
+            }
+            return Err(e);
+        }
+    };
     library.set_meta(META_FETCHED_AT, Some(&now.to_string()))?;
-    let outcome = if client.has_scrobble_history().await? {
+    library.set_meta(META_PLAYED_MARK, mark.as_deref())?;
+    Ok(outcome)
+}
+
+async fn fetch_window(client: &Client, library: &Library, now: i64) -> Result<PlayHistoryRefresh> {
+    if client.has_scrobble_history().await? {
         let plays = client.scrobbles_since(now - HISTORY_SECS, MAX_HISTORY_ROWS).await?;
         let stored = plays.len();
         library.blocking(move |l| l.replace_recent_plays(&plays)).await?;
-        PlayHistoryRefresh::Stored(stored)
+        Ok(PlayHistoryRefresh::Stored(stored))
     } else {
         library.blocking(|l| l.replace_recent_plays(&[])).await?;
-        PlayHistoryRefresh::Unsupported
-    };
-    library.set_meta(META_PLAYED_MARK, mark.as_deref())?;
-    Ok(outcome)
+        Ok(PlayHistoryRefresh::Unsupported)
+    }
 }
 
 #[cfg(test)]

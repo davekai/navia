@@ -8,10 +8,7 @@ use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::ZeroizeOnDrop;
 
-/// Long-term Ed25519 identity key pair.
-///
-/// Note: Clone is implemented to allow sharing identity between pairing phases.
-/// Both copies will zeroize on drop.
+/// Long-term Ed25519 identity key pair. Clone shares it between pairing phases; every copy zeroizes.
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct IdentityKeyPair {
     #[zeroize(skip)]
@@ -20,7 +17,6 @@ pub struct IdentityKeyPair {
 }
 
 impl IdentityKeyPair {
-    /// Generate a new random identity key pair.
     pub fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut OsRng);
         let public = signing_key.verifying_key().to_bytes();
@@ -28,7 +24,7 @@ impl IdentityKeyPair {
         Self { public, secret }
     }
 
-    /// Create from seed bytes (32 bytes).
+    /// from a 32-byte seed.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(seed);
         let public = signing_key.verifying_key().to_bytes();
@@ -38,10 +34,7 @@ impl IdentityKeyPair {
         }
     }
 
-    /// Load from expanded secret key (64 bytes).
-    ///
-    /// The 64-byte format is: seed (32 bytes) || public_key (32 bytes).
-    /// This validates that the public key matches the seed.
+    /// from the 64-byte form, seed || public key; the public key must match the seed.
     pub fn from_secret(secret: &[u8; 64]) -> Result<Self, CryptoError> {
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&secret[..32]);
@@ -49,7 +42,6 @@ impl IdentityKeyPair {
         let signing_key = SigningKey::from_bytes(&seed);
         let derived_public = signing_key.verifying_key().to_bytes();
 
-        // Validate the provided public key matches
         let provided_public = &secret[32..64];
         if derived_public != provided_public {
             return Err(CryptoError::KeyDerivation(
@@ -63,25 +55,22 @@ impl IdentityKeyPair {
         })
     }
 
-    /// Get the public key (32 bytes).
     pub fn public_key(&self) -> [u8; 32] {
         self.public
     }
 
-    /// Sign a message, returning 64-byte signature.
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         let signing_key = SigningKey::from_bytes(&self.secret);
         let signature = signing_key.sign(message);
         signature.to_bytes()
     }
 
-    /// Export the seed for storage (32 bytes).
+    /// the seed, for storage.
     pub fn seed(&self) -> [u8; 32] {
         self.secret
     }
 }
 
-/// Verify an Ed25519 signature.
 pub fn verify(
     public_key: &[u8; 32],
     message: &[u8],
@@ -97,7 +86,7 @@ pub fn verify(
         .map_err(|_| CryptoError::Encryption("Signature verification failed".to_string()))
 }
 
-/// Verify signature with strict validation (rejects non-canonical signatures).
+/// rejects non-canonical signatures.
 pub fn verify_strict(
     public_key: &[u8; 32],
     message: &[u8],
@@ -113,12 +102,8 @@ pub fn verify_strict(
         .map_err(|_| CryptoError::Encryption("Strict signature verification failed".to_string()))
 }
 
-/// Convert an Ed25519 seed (private key) to an X25519 private key.
-///
-/// The conversion involves:
-/// 1. Hash the Ed25519 seed with SHA-512 to get 64 bytes
-/// 2. Take the first 32 bytes
-/// 3. "Clamp" them for X25519: clear bottom 3 bits, clear top bit, set second-highest bit
+/// SHA-512 of the seed, first 32 bytes, clamped for X25519 (bottom 3 bits and top bit clear,
+/// second-highest set).
 pub fn ed25519_seed_to_x25519_secret(seed: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha512::new();
     hasher.update(seed);
@@ -127,7 +112,7 @@ pub fn ed25519_seed_to_x25519_secret(seed: &[u8; 32]) -> [u8; 32] {
     let mut x25519_secret = [0u8; 32];
     x25519_secret.copy_from_slice(&hash[..32]);
 
-    // Clamp for X25519 (this is what x25519-dalek does internally too)
+    // the same clamping x25519-dalek does internally.
     x25519_secret[0] &= 248;
     x25519_secret[31] &= 127;
     x25519_secret[31] |= 64;
@@ -135,51 +120,33 @@ pub fn ed25519_seed_to_x25519_secret(seed: &[u8; 32]) -> [u8; 32] {
     x25519_secret
 }
 
-/// Convert an Ed25519 public key to an X25519 public key.
-///
-/// This performs the birational map from twisted Edwards curve (Ed25519)
-/// to Montgomery curve (X25519): x_mont = (1 + y) / (1 - y)
+/// the birational map from Edwards to Montgomery form: x_mont = (1 + y) / (1 - y).
 pub fn ed25519_public_to_x25519_public(ed25519_pk: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
-    // Decompress the Ed25519 point
     let compressed = CompressedEdwardsY(*ed25519_pk);
     let edwards_point = compressed.decompress().ok_or_else(|| {
         CryptoError::KeyDerivation("Invalid Ed25519 public key: failed to decompress".to_string())
     })?;
 
-    // Convert to Montgomery form (X25519)
     let montgomery_point = edwards_point.to_montgomery();
 
     Ok(montgomery_point.to_bytes())
 }
 
-/// Perform ECDH key exchange using Ed25519 keys converted to X25519.
-///
-/// This is used for transient pairing where both parties have Ed25519 keys
-/// but need to derive a shared secret via X25519 ECDH.
-///
-/// # Arguments
-/// * `our_ed25519_seed` - Our Ed25519 private key (32-byte seed)
-/// * `their_ed25519_pk` - Their Ed25519 public key (32 bytes)
-///
-/// # Returns
-/// The 32-byte shared secret from X25519 ECDH
+/// X25519 ECDH from Ed25519 keys, for transient pairing. returns the 32-byte shared secret.
 pub fn ed25519_to_x25519_dh(
     our_ed25519_seed: &[u8; 32],
     their_ed25519_pk: &[u8; 32],
 ) -> Result<[u8; 32], CryptoError> {
-    // Convert our Ed25519 seed to X25519 private key
     let x25519_secret_bytes = ed25519_seed_to_x25519_secret(our_ed25519_seed);
     let x25519_secret = X25519StaticSecret::from(x25519_secret_bytes);
 
-    // Convert their Ed25519 public key to X25519 public key
     let x25519_pk_bytes = ed25519_public_to_x25519_public(their_ed25519_pk)?;
     let x25519_public = X25519PublicKey::from(x25519_pk_bytes);
 
-    // Perform ECDH
     let shared_secret = x25519_secret.diffie_hellman(&x25519_public);
     let shared_bytes = shared_secret.to_bytes();
 
-    // Check for weak shared secret (all zeros indicates low-order point attack)
+    // an all-zero secret means a low-order point.
     if shared_bytes.iter().all(|&b| b == 0) {
         return Err(CryptoError::KeyDerivation(
             "ECDH failed: shared secret is all zeros".to_string(),
@@ -190,18 +157,12 @@ pub fn ed25519_to_x25519_dh(
 }
 
 impl IdentityKeyPair {
-    /// Convert this Ed25519 keypair to X25519 and derive shared secret with peer.
-    ///
-    /// Used for transient pairing where we exchange Ed25519 public keys
-    /// and derive a shared secret via X25519 ECDH.
+    /// [`ed25519_to_x25519_dh`] with this key pair, for transient pairing.
     pub fn x25519_dh(&self, their_ed25519_pk: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
         ed25519_to_x25519_dh(&self.secret, their_ed25519_pk)
     }
 
-    /// Get our X25519 public key derived from our Ed25519 identity.
-    ///
-    /// This is the Montgomery-curve representation of our public key,
-    /// useful when the protocol requires X25519 format.
+    /// our public key in X25519 (Montgomery) form.
     pub fn x25519_public_key(&self) -> Result<[u8; 32], CryptoError> {
         ed25519_public_to_x25519_public(&self.public)
     }
@@ -262,7 +223,6 @@ mod tests {
 
         #[test]
         fn from_secret_validates_public_key() {
-            // Create valid 64-byte secret (seed || public_key)
             let seed = [0x42u8; 32];
             let kp = IdentityKeyPair::from_seed(&seed);
             let mut secret = [0u8; 64];
@@ -397,17 +357,15 @@ mod tests {
 
         #[test]
         fn secret_key_zeroized_on_drop() {
-            // Create keypair, drop it, verify memory is cleared
-            // This is verified by the ZeroizeOnDrop derive
+            // ZeroizeOnDrop clears the secret; this only checks that dropping works.
             let kp = IdentityKeyPair::generate();
             let _public = kp.public_key();
             drop(kp);
-            // The ZeroizeOnDrop derive ensures the secret is cleared
         }
 
         #[test]
         fn secret_key_not_in_debug_output() {
-            // IdentityKeyPair doesn't derive Debug, so this is enforced at compile time
+            // IdentityKeyPair has no Debug, so this is enforced at compile time.
             let kp = IdentityKeyPair::generate();
             let _pub = kp.public_key();
         }
@@ -440,7 +398,6 @@ mod tests {
             let signature = kp.sign(message);
             assert_eq!(signature.to_vec(), expected_signature);
 
-            // Verify the signature
             let mut sig_arr = [0u8; 64];
             sig_arr.copy_from_slice(&expected_signature);
             let mut pub_arr = [0u8; 32];
@@ -515,7 +472,6 @@ mod tests {
             let seed = [0xFFu8; 32];
             let x25519 = ed25519_seed_to_x25519_secret(&seed);
 
-            // Check clamping: bottom 3 bits clear, top bit clear, second-highest set
             assert_eq!(x25519[0] & 0x07, 0); // Bottom 3 bits clear
             assert_eq!(x25519[31] & 0x80, 0); // Top bit clear
             assert_eq!(x25519[31] & 0x40, 0x40); // Second-highest bit set
@@ -552,7 +508,6 @@ mod tests {
 
         #[test]
         fn ecdh_different_parties_get_same_secret() {
-            // Generate two Ed25519 keypairs
             let seed_a = [0x11u8; 32];
             let seed_b = [0x22u8; 32];
 
@@ -571,7 +526,6 @@ mod tests {
             let alice = IdentityKeyPair::generate();
             let bob = IdentityKeyPair::generate();
 
-            // Use the method on IdentityKeyPair
             let shared_a = alice.x25519_dh(&bob.public_key()).unwrap();
             let shared_b = bob.x25519_dh(&alice.public_key()).unwrap();
 
@@ -603,13 +557,11 @@ mod tests {
         #[test]
         fn rejects_invalid_public_key() {
             let seed = [0x42u8; 32];
-            // All zeros is not a valid Ed25519 public key (identity point)
-            // but curve25519-dalek accepts it - instead test with a clearly invalid point
+            // curve25519-dalek accepts all zeros (the identity point), so use one that isn't a valid point.
             let invalid_pk = [0xFFu8; 32]; // Not a valid compressed Edwards point
 
             let result = ed25519_to_x25519_dh(&seed, &invalid_pk);
-            // This may or may not fail depending on whether it decompresses
-            // The important thing is it doesn't panic
+            // it may or may not fail to decompress; it must not panic.
             let _ = result;
         }
     }

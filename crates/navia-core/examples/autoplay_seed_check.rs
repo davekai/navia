@@ -62,7 +62,7 @@ impl Ctx {
             let anchors: Vec<Song> = seeds.iter().filter_map(|id| self.db.song(id).ok().flatten()).collect();
             let similar = seeds.iter().map(|s| self.similar(s)).collect();
             let found = self.deezer(&anchors);
-            a.finish_answers(seeds, Answers { similar, deezer: found });
+            a.finish_answers(seeds, Answers { similar, deezer: found, ..Default::default() });
         }
     }
 }
@@ -189,7 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let anchors = [seed.clone()];
             let sims = [similar.clone()];
             let none = HashSet::new();
-            let inputs = plan::Inputs { anchors: &anchors, similar: &sims, deezer: found.as_ref(), recent: &none, fatigue: &Default::default(), day: 0, provisional: false };
+            let inputs = plan::Inputs { anchors: &anchors, similar: &sims, deezer: found.as_ref(), listenbrainz: &[], recent: &none, fatigue: &Default::default(), day: 0, provisional: false };
             let tiers: HashMap<String, (plan::Source, f32)> = plan::candidates(Some(&db), &inputs, &|_, _| false).into_iter().map(|p| (p.song.id.clone(), (p.tier, p.related))).collect();
             let why_line = |s: &Song| format!("{} {:?} {:.2}", line(s), tiers.get(&s.id).map(|t| t.0), tiers.get(&s.id).map_or(0.0, |t| t.1));
             // After an unrelated session of 5 much-played songs.

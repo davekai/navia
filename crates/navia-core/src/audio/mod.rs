@@ -7,6 +7,7 @@ pub mod airplay;
 pub mod capture;
 pub mod decode;
 pub mod device_watch;
+pub mod edges;
 pub mod engine;
 pub mod live;
 pub mod mp4;
@@ -20,6 +21,7 @@ pub mod pulse;
 pub mod render;
 pub mod resample;
 pub mod stream;
+pub mod transition;
 
 pub use decode::{Decoder, GaplessSource, TrackSource};
 pub use engine::{EngineConfig, EngineControl, EngineEvent, EngineOutput, EngineParts, OutputMode, TrackFeed, TrackOpener, TrackRequest, spawn, spawn_feed};

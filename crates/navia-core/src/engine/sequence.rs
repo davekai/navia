@@ -7,15 +7,18 @@ use crate::recommend::artist_key;
 
 /// Another artist not again within this many songs.
 pub const ARTIST_GAP: usize = 2;
-/// At most [`ARTIST_MAX`] songs of one artist in any run of this many.
+/// at most [`ARTIST_MAX`] songs of one artist in any run of this many ([`respace`])
 pub const ARTIST_WINDOW: usize = 10;
+/// a plan's run: the songs the queue shows
+pub const SPREAD_WINDOW: usize = crate::autoplay::SHOWN;
 pub const ARTIST_MAX: usize = 2;
 /// No album again within this many songs.
 pub const ALBUM_GAP: usize = 3;
-/// At most this many seed-artist songs in the first 5 picks.
-pub const SEED_FIRST5: usize = 2;
-/// At most this many seed-artist songs in the first 10, and in any run of 10 after.
-pub const SEED_FIRST10: usize = 3;
+/// the seed artist: at most [`SEED_FIRST10`] in the first this many picks...
+pub const SEED_SPAN: usize = 10;
+pub const SEED_FIRST10: usize = 2;
+/// ...and [`SEED_WINDOW`] in any run of [`SEED_SPAN`] after
+pub const SEED_WINDOW: usize = 3;
 
 /// What spacing looks at.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,12 +34,16 @@ impl Item {
     }
 }
 
-/// How strictly a song must fit.
+/// how strictly a song must fit, from every rule to none
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Strict {
     All,
-    /// Only "not back to back" and the seed artist's caps.
+    /// a third song of an artist in the window, never back to back, and the seed artist's caps
+    Third,
+    /// any number of an artist's songs, never back to back, and the seed artist's caps
     Gap,
+    /// only the seed artist's caps.
+    Seed,
     Any,
 }
 
@@ -45,13 +52,20 @@ pub struct Spacer<'a> {
     recent: Vec<Item>,
     /// Songs placed, not counting the history.
     placed: usize,
+    /// the run of songs another artist's cap counts in
+    window: usize,
     seed_artists: &'a [String],
     seed_placed: Vec<bool>,
 }
 
+impl Strict {
+    /// each level in the order the rules give way
+    pub const LOOSENING: [Strict; 5] = [Strict::All, Strict::Third, Strict::Gap, Strict::Seed, Strict::Any];
+}
+
 impl<'a> Spacer<'a> {
-    pub fn new(history: &[Item], seed_artists: &'a [String]) -> Self {
-        Self { recent: history.to_vec(), placed: 0, seed_artists, seed_placed: Vec::new() }
+    pub fn new(history: &[Item], seed_artists: &'a [String], window: usize) -> Self {
+        Self { recent: history.to_vec(), placed: 0, window, seed_artists, seed_placed: Vec::new() }
     }
 
     fn is_seed(&self, artist: &str) -> bool {
@@ -65,25 +79,31 @@ impl<'a> Spacer<'a> {
         }
         let artist = !item.artist.is_empty();
         let last = self.recent.last();
-        if artist && last.is_some_and(|r| r.artist == item.artist) {
+        if strict < Strict::Seed && artist && last.is_some_and(|r| r.artist == item.artist) {
             return false;
         }
         if self.is_seed(&item.artist) {
             let seeds_in = |n: usize| self.seed_placed.iter().rev().take(n).filter(|s| **s).count();
-            let (cap, window) = if self.placed < 5 { (SEED_FIRST5, 5) } else { (SEED_FIRST10, ARTIST_WINDOW - 1) };
+            let (cap, window) = if self.placed < SEED_SPAN { (SEED_FIRST10, SEED_SPAN) } else { (SEED_WINDOW, SEED_SPAN - 1) };
             return seeds_in(window) < cap;
         }
-        if strict == Strict::Gap {
+        if strict >= Strict::Gap {
             return true;
         }
         let tail = |n: usize| self.recent.iter().rev().take(n);
-        if artist && tail(ARTIST_GAP).any(|r| r.artist == item.artist) {
+        if strict == Strict::All && artist && tail(ARTIST_GAP).any(|r| r.artist == item.artist) {
             return false;
         }
-        if artist && tail(ARTIST_WINDOW - 1).filter(|r| r.artist == item.artist).count() >= ARTIST_MAX {
+        let cap = if strict == Strict::All { ARTIST_MAX } else { ARTIST_MAX + 1 };
+        if artist && self.in_window(item) >= cap {
             return false;
         }
-        !(!item.album.is_empty() && tail(ALBUM_GAP).any(|r| r.album == item.album))
+        !(strict == Strict::All && !item.album.is_empty() && tail(ALBUM_GAP).any(|r| r.album == item.album))
+    }
+
+    /// how many of `item`'s artist's songs the window holds among those placed
+    pub fn in_window(&self, item: &Item) -> usize {
+        self.recent.iter().rev().take(self.placed.min(self.window - 1)).filter(|r| r.artist == item.artist).count()
     }
 
     pub fn place(&mut self, item: &Item) {
@@ -97,10 +117,10 @@ impl<'a> Spacer<'a> {
 /// taken, ignoring seed-artist rules.
 pub fn respace(items: &[Item], history: &[Item], limit: usize) -> Vec<usize> {
     let mut used = vec![false; items.len()];
-    let mut spacer = Spacer::new(history, &[]);
+    let mut spacer = Spacer::new(history, &[], ARTIST_WINDOW);
     let mut out = Vec::new();
     while out.len() < limit.min(items.len()) {
-        let pick = [Strict::All, Strict::Gap, Strict::Any].into_iter().find_map(|strict| (0..items.len()).find(|&i| !used[i] && spacer.fits(&items[i], strict))).expect("an unused item");
+        let pick = Strict::LOOSENING.into_iter().find_map(|strict| (0..items.len()).find(|&i| !used[i] && spacer.fits(&items[i], strict))).expect("an unused item");
         used[pick] = true;
         spacer.place(&items[pick]);
         out.push(pick);
@@ -135,7 +155,7 @@ mod tests {
         let seed = vec!["S".to_string()];
         // Many seed-artist songs ranked first, then others.
         let items: Vec<Item> = (0..10).map(|i| item("S", &format!("S{i}"))).chain((0..20).map(|i| item(&format!("O{i}"), &format!("L{i}")))).collect();
-        let mut spacer = Spacer::new(&[item("S", "S-anchor")], &seed);
+        let mut spacer = Spacer::new(&[item("S", "S-anchor")], &seed, ARTIST_WINDOW);
         let mut used = vec![false; items.len()];
         let mut order = Vec::new();
         for _ in 0..20 {
@@ -145,9 +165,9 @@ mod tests {
             order.push(items[pick].artist.as_str());
         }
         assert_ne!(order[0], "S", "not right after the anchor");
-        assert!(order[..5].iter().filter(|a| **a == "S").count() <= SEED_FIRST5, "{order:?}");
         assert!(order[..5].iter().filter(|a| **a == "S").count() >= 1, "allowed early: {order:?}");
         assert!(order[..10].iter().filter(|a| **a == "S").count() <= SEED_FIRST10, "{order:?}");
+        assert!(order[10..20].iter().filter(|a| **a == "S").count() <= SEED_WINDOW, "{order:?}");
         assert!(order.windows(2).all(|w| !(w[0] == "S" && w[1] == "S")), "{order:?}");
     }
 

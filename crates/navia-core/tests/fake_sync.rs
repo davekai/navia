@@ -10,7 +10,7 @@ use navia_core::Error;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use navia_core::library::sync::{RefreshOutcome, SyncMeter, SyncOptions, SyncStage, SyncStatus, SyncWatch, Syncer};
+use navia_core::library::sync::{RefreshOutcome, SyncMeter, SyncOptions, SyncOutcome, SyncPass, SyncStage, SyncStatus, SyncWatch, Syncer};
 use navia_core::library::{Library, LibraryConfig};
 
 fn state(songs: Vec<common::FakeSong>, folders: &[(&str, &str)]) -> State {
@@ -274,6 +274,7 @@ async fn refresh_handles_additions_and_removals() {
     }
     match s.refresh(false, &|_| {}).await.unwrap() {
         RefreshOutcome::Synced(o) => {
+            assert_eq!(o.pass, SyncPass::Changes);
             assert_eq!(o.counts.songs, 59);
             assert_eq!(o.libraries[0].removed.songs, 2);
         }
@@ -286,6 +287,287 @@ async fn refresh_handles_additions_and_removals() {
     let before = server.calls("search3");
     assert!(matches!(s.refresh(false, &|_| {}).await.unwrap(), RefreshOutcome::Unchanged));
     assert_eq!(server.calls("search3"), before);
+}
+
+fn new_scan(server: &FakeServer, marker: &str) {
+    server.state.lock().unwrap().last_scan = Some(marker.into());
+}
+
+async fn refreshed(s: &Syncer) -> SyncOutcome {
+    match s.refresh(false, &|_| {}).await.unwrap() {
+        RefreshOutcome::Synced(o) => o,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn album_calls(server: &FakeServer) -> Vec<String> {
+    let mut calls = server.state.lock().unwrap().album_calls.clone();
+    calls.sort();
+    calls
+}
+
+/// after a scan only the album list is read, then `getAlbum` for the albums that are new or whose
+/// entry moved; no song pages. songs dropped from a changed album and albums that left the list go.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_after_a_scan_fetches_only_the_albums_that_changed() {
+    let server = FakeServer::start(state(many(60, "1", "a"), &[("1", "Main")])).await;
+    let fx = fixture();
+    let s = syncer(&server, &fx.library);
+    s.full_sync(&|_| {}).await.unwrap();
+    let song_pages = server.state.lock().unwrap().song_pages;
+    {
+        let mut st = server.state.lock().unwrap();
+        st.songs.retain(|x| x.id != "a0" && x.album != "Album 5");
+        let after_album_2 = st.songs.iter().rposition(|x| x.album == "Album 2").unwrap() + 1;
+        st.songs.insert(after_album_2, song("a2x", "Extra Track", "Artist 2", "Album 2", "1"));
+        st.songs.push(song("new1", "Brand New", "Newcomer", "Fresh", "1"));
+    }
+    new_scan(&server, "2026-02-02T00:00:00Z");
+
+    let o = refreshed(&s).await;
+    assert_eq!(o.pass, SyncPass::Changes);
+    assert_eq!(album_calls(&server), ["al-Album 0", "al-Album 2", "al-Fresh"]);
+    assert_eq!(server.state.lock().unwrap().song_pages, song_pages, "no song pages");
+    assert_eq!(o.counts.songs, 51);
+    assert_eq!((o.libraries[0].removed.songs, o.libraries[0].removed.albums), (11, 1));
+    assert!(fx.library.song("a0").unwrap().is_none());
+    assert!(fx.library.album("al-Album 5").unwrap().is_none());
+    assert_eq!(fx.library.album_songs("al-Album 2").unwrap().len(), 11);
+    assert_eq!(fx.library.search("brand", 5, None).unwrap().songs[0].id, "new1");
+    assert!(fx.library.artist("ar-Newcomer").unwrap().is_some());
+    assert!(matches!(s.refresh(false, &|_| {}).await.unwrap(), RefreshOutcome::Unchanged));
+}
+
+/// a song moved to another album is re-pointed in place, so apps holding its row still find it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_song_that_moves_album_keeps_its_row() {
+    let server = FakeServer::start(state(many(60, "1", "a"), &[("1", "Main")])).await;
+    let fx = fixture();
+    let s = syncer(&server, &fx.library);
+    s.full_sync(&|_| {}).await.unwrap();
+    let before = fx.library.song_rowids(&["a9".to_string()]).unwrap();
+    {
+        let mut st = server.state.lock().unwrap();
+        st.songs[9].album = "Album 0b".into();
+        st.songs[9].album_id = "al-Album 0b".into();
+    }
+    new_scan(&server, "2026-02-02T00:00:00Z");
+    let o = refreshed(&s).await;
+    assert_eq!(o.pass, SyncPass::Changes);
+    assert_eq!(o.libraries[0].removed.songs, 0);
+    assert_eq!(fx.library.song_rowids(&["a9".to_string()]).unwrap(), before);
+    assert_eq!(fx.library.song("a9").unwrap().unwrap().album_id.as_deref(), Some("al-Album 0b"));
+    assert_eq!(fx.library.album_songs("al-Album 0").unwrap().len(), 9);
+}
+
+/// plays and stars on an album entry aren't a catalog change: the row is updated, nothing is fetched.
+#[tokio::test(flavor = "multi_thread")]
+async fn plays_alone_dont_fetch_an_album() {
+    let server = FakeServer::start(state(many(60, "1", "a"), &[("1", "Main")])).await;
+    let fx = fixture();
+    let s = syncer(&server, &fx.library);
+    s.full_sync(&|_| {}).await.unwrap();
+    server.state.lock().unwrap().album_extra.insert("al-Album 1".into(), serde_json::json!({"playCount": 3, "played": "2026-02-01T00:00:00Z"}));
+    new_scan(&server, "2026-02-02T00:00:00Z");
+    let o = refreshed(&s).await;
+    assert_eq!(o.pass, SyncPass::Changes);
+    assert!(album_calls(&server).is_empty());
+    assert_eq!(fx.library.album("al-Album 1").unwrap().unwrap().play_count, Some(3));
+}
+
+/// what the album list can't show (a song retagged in place) waits for the next full sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_song_retagged_in_place_is_caught_by_the_full_sync() {
+    let server = FakeServer::start(state(many(60, "1", "a"), &[("1", "Main")])).await;
+    let fx = fixture();
+    let s = syncer(&server, &fx.library);
+    s.full_sync(&|_| {}).await.unwrap();
+    server.state.lock().unwrap().songs[3].title = "Renamed".into();
+    new_scan(&server, "2026-02-02T00:00:00Z");
+    assert_eq!(refreshed(&s).await.pass, SyncPass::Changes);
+    assert_eq!(fx.library.song("a3").unwrap().unwrap().title, "Song 3");
+    s.full_sync(&|_| {}).await.unwrap();
+    assert_eq!(fx.library.song("a3").unwrap().unwrap().title, "Renamed");
+}
+
+/// most albums gone at once looks like a server problem: nothing is removed, and the next refresh
+/// is a full sync, with its own two-pass confirmation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mass_vanishing_holds_removal_and_the_next_refresh_is_full() {
+    let server = FakeServer::start(state(many(600, "1", "a"), &[("1", "Main")])).await;
+    let fx = fixture();
+    let s = syncer(&server, &fx.library);
+    s.full_sync(&|_| {}).await.unwrap();
+    server.state.lock().unwrap().songs.truncate(50);
+    new_scan(&server, "2026-02-02T00:00:00Z");
+    let o = refreshed(&s).await;
+    assert_eq!(o.pass, SyncPass::Changes);
+    assert!(o.libraries[0].removal_held.is_some());
+    assert_eq!(fx.library.counts().unwrap().songs, 600);
+    assert_eq!(refreshed(&s).await.pass, SyncPass::Full);
+}
+
+/// a change pass stopped part-way keeps what it stored. a changed album's row is only written at the
+/// end, so the next pass still sees it changed and fetches it again, and nothing is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_change_pass_leaves_the_rest_for_the_next() {
+    let server = FakeServer::start(state(many(60, "1", "a"), &[("1", "Main")])).await;
+    let fx = fixture();
+    let s = syncer(&server, &fx.library);
+    s.full_sync(&|_| {}).await.unwrap();
+    {
+        let mut st = server.state.lock().unwrap();
+        for k in (0..6).rev() {
+            st.songs.insert((k + 1) * 10, song(&format!("x{k}"), "Added", &format!("Artist {k}"), &format!("Album {k}"), "1"));
+        }
+    }
+    new_scan(&server, "2026-02-02T00:00:00Z");
+    let flag = s.cancel_flag();
+    let first = s.refresh(false, &|p| if p.phase == navia_core::library::sync::SyncPhase::Songs && p.offset > 0 { flag.store(true, Ordering::Release) }).await.unwrap();
+    let RefreshOutcome::Synced(first) = first else { panic!("{first:?}") };
+    assert_eq!(first.status, SyncStatus::Cancelled);
+    let fetched = album_calls(&server).len();
+    assert!(fetched < 6, "{fetched}");
+
+    let o = refreshed(&s).await;
+    assert_eq!((o.pass, o.status), (SyncPass::Changes, SyncStatus::Complete));
+    assert_eq!(album_calls(&server).len(), fetched + 6);
+    assert_eq!(o.counts.songs, 66);
+    assert!(matches!(s.refresh(false, &|_| {}).await.unwrap(), RefreshOutcome::Unchanged));
+}
+
+/// songs as Navidrome's native `/api/song` lists them: (id, album id, library id, updatedAt).
+type NativeSongs = Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>;
+
+/// answers the native login and `/api/song?library_id=&_sort=updated_at&_order=DESC` paging, from `songs`.
+async fn mount_song_updates(server: &FakeServer, songs: NativeSongs) -> Arc<AtomicUsize> {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, Request, ResponseTemplate};
+    let logins = Arc::new(AtomicUsize::new(0));
+    let seen = logins.clone();
+    Mock::given(method("POST")).and(path("/auth/login")).respond_with(move |_: &Request| {
+        seen.fetch_add(1, Ordering::Relaxed);
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "jwt"}))
+    }).mount(&server.server).await;
+    Mock::given(method("GET")).and(path("/api/song")).respond_with(move |r: &Request| {
+        if r.headers.get("x-nd-authorization").and_then(|v| v.to_str().ok()) != Some("Bearer jwt") {
+            return ResponseTemplate::new(401);
+        }
+        let q: std::collections::HashMap<String, String> = r.url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        assert_eq!((q.get("_sort").map(String::as_str), q.get("_order").map(String::as_str)), (Some("updated_at"), Some("DESC")));
+        let (start, end): (usize, usize) = (q["_start"].parse().unwrap(), q["_end"].parse().unwrap());
+        let mut rows: Vec<(String, String, String, String)> = songs.lock().unwrap().iter().filter(|s| q.get("library_id").is_none_or(|l| *l == s.2)).cloned().collect();
+        rows.sort_by(|a, b| b.3.cmp(&a.3));
+        let page: Vec<serde_json::Value> = rows.into_iter().skip(start).take(end - start).map(|(id, album, library, at)| serde_json::json!({"id": id, "albumId": album, "libraryId": library.parse::<i64>().unwrap(), "updatedAt": at})).collect();
+        ResponseTemplate::new(200).set_body_json(page)
+    }).mount(&server.server).await;
+    logins
+}
+
+fn with_song_updates(server: &FakeServer, library: &Library) -> Syncer {
+    Syncer::new(server.read_only_client(), library.clone(), SyncOptions { page_size: 25, page_delay: Duration::ZERO, song_updates: true, ..Default::default() })
+}
+
+fn native_songs(songs: &[common::FakeSong], at: &str) -> NativeSongs {
+    Arc::new(std::sync::Mutex::new(songs.iter().map(|s| (s.id.clone(), s.album_id.clone(), s.library.clone(), at.to_string())).collect()))
+}
+
+/// on Navidrome a song retagged in place moves its `updatedAt`, so a change pass refetches just
+/// its album, with one login for the whole run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_song_retagged_in_place_is_picked_up_from_its_updated_time() {
+    let songs = many(60, "1", "a");
+    let native = native_songs(&songs, "2026-01-01T00:00:00Z");
+    let server = FakeServer::start(state(songs, &[("1", "Main")])).await;
+    let logins = mount_song_updates(&server, native.clone()).await;
+    let fx = fixture();
+    let s = with_song_updates(&server, &fx.library);
+    s.full_sync(&|_| {}).await.unwrap();
+
+    server.state.lock().unwrap().songs[13].title = "Renamed".into();
+    native.lock().unwrap()[13].3 = "2026-02-02T10:00:00.5Z".into();
+    new_scan(&server, "2026-02-02T00:00:00Z");
+    let o = refreshed(&s).await;
+    assert_eq!(o.pass, SyncPass::Changes);
+    assert_eq!(album_calls(&server), ["al-Album 1"]);
+    assert_eq!(fx.library.song("a13").unwrap().unwrap().title, "Renamed");
+    assert_eq!(o.counts.songs, 60);
+
+    // the mark moved: nothing updated since, so the next pass fetches no album.
+    new_scan(&server, "2026-02-03T00:00:00Z");
+    refreshed(&s).await;
+    assert_eq!(album_calls(&server).len(), 1);
+    assert_eq!(logins.load(Ordering::Relaxed), 1, "one login, the token is kept");
+}
+
+/// a song the scan marked missing moves its `updatedAt` too; its album no longer lists it, so it goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_song_marked_missing_is_dropped_from_its_album() {
+    let songs = many(60, "1", "a");
+    let native = native_songs(&songs, "2026-01-01T00:00:00Z");
+    let server = FakeServer::start(state(songs, &[("1", "Main")])).await;
+    mount_song_updates(&server, native.clone()).await;
+    let fx = fixture();
+    let s = with_song_updates(&server, &fx.library);
+    s.full_sync(&|_| {}).await.unwrap();
+    // replaced by another file under the same album entry: same count, one id gone, one new.
+    {
+        let mut st = server.state.lock().unwrap();
+        st.songs[24] = song("a24-new", "Song 24", "Artist 3", "Album 2", "1");
+    }
+    {
+        let mut n = native.lock().unwrap();
+        n[24].3 = "2026-02-02T10:00:00Z".into();
+        n.push(("a24-new".into(), "al-Album 2".into(), "1".into(), "2026-02-02T10:00:01Z".into()));
+    }
+    new_scan(&server, "2026-02-02T00:00:00Z");
+    let o = refreshed(&s).await;
+    assert_eq!(album_calls(&server), ["al-Album 2"]);
+    assert!(fx.library.song("a24").unwrap().is_none());
+    assert!(fx.library.song("a24-new").unwrap().is_some());
+    assert_eq!(o.libraries[0].removed.songs, 1);
+}
+
+/// without the native API (another server, or the login refused) the change pass still runs, and
+/// the full sync stays the only way to see a retag.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_native_api_song_updates_fall_back_to_the_full_sync() {
+    let server = FakeServer::start(state(many(60, "1", "a"), &[("1", "Main")])).await;
+    let fx = fixture();
+    let s = with_song_updates(&server, &fx.library);
+    s.full_sync(&|_| {}).await.unwrap();
+    server.state.lock().unwrap().songs[3].title = "Renamed".into();
+    new_scan(&server, "2026-02-02T00:00:00Z");
+    let o = refreshed(&s).await;
+    assert_eq!((o.pass, o.status), (SyncPass::Changes, SyncStatus::Complete));
+    assert!(album_calls(&server).is_empty());
+    assert_eq!(fx.library.song("a3").unwrap().unwrap().title, "Song 3");
+    s.full_sync(&|_| {}).await.unwrap();
+    assert_eq!(fx.library.song("a3").unwrap().unwrap().title, "Renamed");
+}
+
+/// more updated songs than a pass follows: nothing is guessed, and the next refresh is a full sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn too_many_updated_songs_make_the_next_refresh_full() {
+    let songs = many(60, "1", "a");
+    let native = native_songs(&songs, "2026-01-01T00:00:00Z");
+    let server = FakeServer::start(state(songs, &[("1", "Main")])).await;
+    mount_song_updates(&server, native.clone()).await;
+    let fx = fixture();
+    let s = with_song_updates(&server, &fx.library);
+    s.full_sync(&|_| {}).await.unwrap();
+    {
+        let mut n = native.lock().unwrap();
+        for i in 0..5001 {
+            n.push((format!("ghost{i}"), "al-Album 0".into(), "1".into(), format!("2026-02-02T10:00:00.{i:04}Z")));
+        }
+    }
+    new_scan(&server, "2026-02-02T00:00:00Z");
+    assert_eq!(refreshed(&s).await.pass, SyncPass::Changes);
+    assert!(album_calls(&server).is_empty());
+    // no new scan needed: the scan the pass gave up on is still owed
+    assert_eq!(refreshed(&s).await.pass, SyncPass::Full);
+    assert!(matches!(s.refresh(false, &|_| {}).await.unwrap(), RefreshOutcome::Unchanged));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -11,6 +11,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::audio::decode::{Decoder, TrackSource};
+use crate::audio::edges::{Analyzer, EdgeStore, LibraryEdgeStore};
+use crate::audio::transition::TraitsSlot;
 use crate::audio::engine::{AlbumSpot, EngineConfig, EngineControl, EngineEvent, EngineParts, OutputMode, TrackFeed, TrackOpener, TrackRequest, spawn_feed};
 use crate::audio::live::LiveOpener;
 use crate::audio::output::{CpalBackend, DeviceInfo, OutputBackend, OutputHandle};
@@ -41,7 +43,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The text of a panic payload.
 fn panic_text(payload: &(dyn Any + Send)) -> String {
     match (payload.downcast_ref::<&str>(), payload.downcast_ref::<String>()) {
         (Some(s), _) => (*s).to_string(),
@@ -50,7 +51,6 @@ fn panic_text(payload: &(dyn Any + Send)) -> String {
     }
 }
 
-/// One track in the queue.
 #[derive(Clone, Debug)]
 pub struct QueueItem {
     pub id: String,
@@ -140,9 +140,11 @@ pub enum PlayerEvent {
     OutputError { device: Option<String>, message: String },
     QueueChanged,
     QueueEnded,
-    OutputChanged { rate: u32, device: Option<String> },
-    /// The output's own volume (AirPlay) for the slider to show, or `None` when the output has
-    /// none and the slider shows the player's volume. Never sent back.
+    /// `device_rate`: what the device runs at, when the output can tell.
+    OutputChanged { rate: u32, device_rate: Option<u32>, device: Option<String> },
+    /// The output's own volume (AirPlay) as the slider should show it: read from the device,
+    /// reported by it, or assumed. `None`: the output has no volume of its own, so the slider is
+    /// the player's volume again. Only shown, never sent back.
     DeviceVolume(Option<DeviceVolume>),
     /// The player changed repeat itself. Next or Previous with Repeat one switches to Repeat all.
     RepeatChanged(Repeat),
@@ -263,7 +265,8 @@ pub struct ServerResolver {
 impl ServerResolver {
     pub fn new(client: Client) -> Result<Self> {
         let probe = reqwest::blocking::Client::builder().user_agent(crate::client::user_agent()).connect_timeout(Duration::from_millis(1500)).timeout(Duration::from_secs(3)).build()?;
-        Ok(Self { client, fetcher: HttpFetcher::new()?, config: StreamConfig::default(), fallback_formats: vec!["mp3".to_string(), "opus".to_string()], downloads: None, quality: None, probe })
+        let fetcher = HttpFetcher::new()?.with_offline(client.offline_switch()).with_form_post(client.form_post());
+        Ok(Self { client, fetcher, config: StreamConfig::default(), fallback_formats: vec!["mp3".to_string(), "opus".to_string()], downloads: None, quality: None, probe })
     }
 
     /// Play downloaded songs from disk and apply the downloads' quality settings.
@@ -273,7 +276,6 @@ impl ServerResolver {
         self
     }
 
-    /// Use these quality settings for streaming.
     pub fn with_quality(mut self, quality: Arc<QualityControl>) -> Self {
         self.quality = Some(quality);
         self
@@ -353,9 +355,9 @@ enum Probe {
 }
 
 /// Ask for one byte of the original file, for its `Last-Modified` and length.
-fn probe_original(probe: &reqwest::blocking::Client, url: &str) -> Probe {
+fn probe_original(probe: &reqwest::blocking::Client, form: &crate::client::FormPost, url: &str) -> Probe {
     use reqwest::header::{CONTENT_RANGE, CONTENT_TYPE, LAST_MODIFIED, RANGE};
-    let Ok(resp) = probe.get(url).header(RANGE, "bytes=0-0").send() else { return Probe::Unknown };
+    let Ok(resp) = form.request_blocking(probe, url).header(RANGE, "bytes=0-0").send() else { return Probe::Unknown };
     let status = resp.status().as_u16();
     let header = |name| resp.headers().get(name).and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok()).map(str::to_string);
     let content_type = header(CONTENT_TYPE).unwrap_or_default();
@@ -374,8 +376,8 @@ struct CacheSink {
     cache: Arc<SongCache>,
     control: Arc<QualityControl>,
     entry: NewEntry,
-    /// Where to ask for the original's stamp, since a transcode has none of its own.
-    stamp_from: Option<(reqwest::blocking::Client, String)>,
+    /// Where to ask for the original's stamp, for a transcode, which has none of its own.
+    stamp_from: Option<(reqwest::blocking::Client, crate::client::FormPost, String)>,
 }
 
 impl CompleteSink for CacheSink {
@@ -389,7 +391,7 @@ impl CompleteSink for CacheSink {
             return;
         }
         let stamp = match &self.stamp_from {
-            Some((probe, url)) => match probe_original(probe, url) {
+            Some((probe, form, url)) => match probe_original(probe, form, url) {
                 Probe::Current(stamp) => stamp.last_modified,
                 _ => None,
             },
@@ -422,7 +424,7 @@ impl ServerOpener {
         };
         let stamp_from = match quality {
             Quality::Original => None,
-            Quality::Transcode { .. } => Some((self.probe.clone(), self.raw_url().ok()?)),
+            Quality::Transcode { .. } => Some((self.probe.clone(), self.client.form_post(), self.raw_url().ok()?)),
         };
         Some(Arc::new(CacheSink { cache, control, entry, stamp_from }))
     }
@@ -434,7 +436,7 @@ impl ServerOpener {
             return true;
         }
         let Ok(url) = self.raw_url() else { return true };
-        let current = match probe_original(&self.probe, &url) {
+        let current = match probe_original(&self.probe, &self.client.form_post(), &url) {
             Probe::Current(stamp) => {
                 let changed_stamp = matches!((&hit.stamp, &stamp.last_modified), (Some(a), Some(b)) if a != b);
                 let changed_size = match (hit.quality, stamp.size) {
@@ -634,7 +636,7 @@ impl ServerOpener {
         // While the server is out, any cached copy.
         if let Some(cache) = self.song_cache() {
             let size = self.quality.as_ref().and_then(|c| c.source(&self.id)).and_then(|s| s.size).unwrap_or(0);
-            let offline = self.fetcher.status().waiting();
+            let offline = self.fetcher.status().waiting() || self.client.is_offline();
             let hit = cache
                 .lookup(&self.id, wanted, size)
                 .or_else(|| (wanted != Quality::Original).then(|| cache.lookup(&self.id, Quality::Original, size)).flatten())
@@ -693,12 +695,13 @@ struct Entry {
     opener: Arc<dyn TrackOpener>,
     /// Its album place, looked up the first time a request needs it.
     spot: Arc<OnceLock<Option<AlbumSpot>>>,
+    /// its measured edges for smart transitions, filled in the background.
+    traits: TraitsSlot,
 }
 
 /// Finds a song's place on its album by song id, for Smart crossfade.
 pub type AlbumLookup = Arc<dyn Fn(&str) -> Option<AlbumSpot> + Send + Sync>;
 
-/// An [`AlbumLookup`] from the local library's songs.
 pub fn library_album_lookup(library: crate::library::Library) -> AlbumLookup {
     Arc::new(move |id: &str| {
         let song = library.song(id).ok().flatten()?;
@@ -706,10 +709,14 @@ pub fn library_album_lookup(library: crate::library::Library) -> AlbumLookup {
     })
 }
 
-/// A song's display name ("Title – Artist") for the system's now-playing lists, by song id.
+/// an [`EdgeStore`] in the local library.
+pub fn library_edge_store(library: crate::library::Library) -> Arc<dyn EdgeStore> {
+    Arc::new(LibraryEdgeStore::new(library))
+}
+
+/// A song's name for the system's lists of what's playing ("Title – Artist"), by song id.
 pub type TitleLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
-/// A [`TitleLookup`] from the local library's songs.
 pub fn library_title_lookup(library: crate::library::Library) -> TitleLookup {
     Arc::new(move |id: &str| {
         let song = library.song(id).ok().flatten()?;
@@ -734,24 +741,41 @@ struct Queue {
     albums: Option<AlbumLookup>,
     /// Song names for the output's stream name.
     titles: Option<TitleLookup>,
+    /// measures songs for smart transitions while they're on.
+    analyzer: Option<Analyzer>,
+    smart_transitions: bool,
+    /// the queue ends after this entry instead of going on ([`Player::set_hold_after_current`]).
+    hold: Option<usize>,
 }
 
 impl Queue {
     fn new(resolver: Arc<dyn TrackResolver>) -> Self {
-        Self { entries: Vec::new(), decode_index: None, audible_token: None, repeat: Repeat::Off, next_token: 0, resolver, live: false, albums: None, titles: None }
+        Self { entries: Vec::new(), decode_index: None, audible_token: None, repeat: Repeat::Off, next_token: 0, resolver, live: false, albums: None, titles: None, analyzer: None, smart_transitions: false, hold: None }
     }
 
     fn make_entry(&mut self, item: QueueItem) -> Entry {
         let token = self.next_token;
         self.next_token += 1;
         let opener = self.resolver.opener(&item);
-        Entry { token, item, opener, spot: Arc::default() }
+        Entry { token, item, opener, spot: Arc::default(), traits: Arc::default() }
     }
 
     fn request(&self, index: usize, start_ms: u64) -> Option<TrackRequest> {
         let e = self.entries.get(index)?;
         let album = self.albums.as_ref().and_then(|lookup| e.spot.get_or_init(|| lookup(&e.item.id)).clone());
-        Some(TrackRequest { token: e.token, opener: e.opener.clone(), start_ms, duration_ms: e.item.duration_ms, album })
+        self.measure_from(index);
+        Some(TrackRequest { token: e.token, opener: e.opener.clone(), start_ms, duration_ms: e.item.duration_ms, album, traits: Some(e.traits.clone()) })
+    }
+
+    /// with smart transitions on, measure the entry at `index` and the one after it, in the
+    /// background, so both are ready by the join between them.
+    fn measure_from(&self, index: usize) {
+        let Some(analyzer) = self.analyzer.as_ref().filter(|_| self.smart_transitions && !self.live) else { return };
+        for i in [Some(index), self.after(Some(index))].into_iter().flatten() {
+            if let Some(e) = self.entries.get(i) {
+                analyzer.ask(&e.item.id, || self.resolver.opener(&e.item), e.item.duration_ms, &e.traits);
+            }
+        }
     }
 
     fn index_of(&self, token: usize) -> Option<usize> {
@@ -765,6 +789,9 @@ impl Queue {
         }
         if self.repeat == Repeat::One {
             return Some(index);
+        }
+        if self.hold.is_some() && self.entries.get(index).map(|e| e.token) == self.hold {
+            return None;
         }
         self.skip_from(index)
     }
@@ -868,7 +895,9 @@ enum Command {
     SetRepeat(Repeat),
     SetCrossfadeMs(u32),
     SetSmartCrossfade(bool),
+    SetSmartTransitions(bool),
     SetFollowing(bool),
+    HoldAfterCurrent(bool),
     SetDevice(Option<String>),
     SetPolicy(OutputPolicy),
     RetryNow,
@@ -1150,13 +1179,34 @@ impl Player {
         self.send(Command::SetFollowing(on));
     }
 
-    /// Smart crossfade. A song that continues the previous one's album in order joins gapless
-    /// instead of fading. Needs [`Self::set_album_lookup`].
+    /// while on, the song playing now is the last: the queue ends after it instead of going on,
+    /// and Next still moves on. for a listening session waiting on the other side's song. set it
+    /// a few seconds before the end, before the next song is decoded.
+    pub fn set_hold_after_current(&self, on: bool) {
+        self.send(Command::HoldAfterCurrent(on));
+    }
+
+    /// Smart crossfade: with a crossfade set, a song that continues the previous one's album in
+    /// order (next track, or the next disc's first) joins gapless instead of fading. Needs
+    /// [`Self::set_album_lookup`] to know where songs sit.
     pub fn set_smart_crossfade(&self, on: bool) {
         self.send(Command::SetSmartCrossfade(on));
     }
 
-    /// How songs are named to the system, such as the Linux sound server's stream name.
+    /// Smart transitions: with a crossfade set, each join's length, place, beat alignment, bass
+    /// swap and loudness come from the songs' measured starts and ends. needs
+    /// [`Self::set_edge_store`]; songs not measured yet get the plain crossfade.
+    pub fn set_smart_transitions(&self, on: bool) {
+        self.send(Command::SetSmartTransitions(on));
+    }
+
+    /// where songs' edge analyses are kept, and their tempo and ReplayGain read.
+    pub fn set_edge_store(&self, store: Arc<dyn EdgeStore>) {
+        self.queue.lock().expect("queue").analyzer = Some(Analyzer::spawn(store));
+    }
+
+    /// How the player names the song playing to the system (the Linux sound server's stream
+    /// name, which the desktop's mixer shows).
     pub fn set_title_lookup(&self, lookup: TitleLookup) {
         self.queue.lock().expect("queue").titles = Some(lookup);
     }
@@ -1214,7 +1264,6 @@ impl Player {
         let _ = rx.recv_timeout(Duration::from_secs(5));
     }
 
-    /// Output devices the system offers.
     pub fn list_devices() -> Result<Vec<DeviceInfo>> {
         CpalBackend::default().list_devices()
     }
@@ -1582,13 +1631,15 @@ impl Control {
         let device = self.device();
         match self.backend.open(device.as_deref(), rate, self.core.clone()) {
             Ok(h) => {
+                let device_rate = h.device_rate();
+                tracing::info!(target: "navia_core::output", "opened {} at {rate} Hz ({:?})", device.as_deref().unwrap_or("default"), self.policy);
                 self.core.lock().expect("core").set_stream_rate(rate);
                 self.handle = Some(h);
                 self.follow_device_volume(true);
                 self.apply_volume();
                 self.tell_now_playing();
                 self.state.lock().expect("state").output_rate = rate;
-                self.emit(PlayerEvent::OutputChanged { rate, device });
+                self.emit(PlayerEvent::OutputChanged { rate, device_rate, device });
             }
             Err(e) => self.output_failed(device.as_deref(), &e),
         }
@@ -1658,7 +1709,7 @@ impl Control {
                     q.live = true;
                     let token = q.next_token;
                     q.next_token += 1;
-                    q.entries = vec![Entry { token, item, opener: opener as Arc<dyn TrackOpener>, spot: Arc::default() }];
+                    q.entries = vec![Entry { token, item, opener: opener as Arc<dyn TrackOpener>, spot: Arc::default(), traits: Arc::default() }];
                     q.decode_index = Some(0);
                     q.audible_token = None;
                     q.request(0, 0)
@@ -1927,9 +1978,23 @@ impl Control {
                 self.engine.realign();
             }
             Command::SetSmartCrossfade(on) => self.engine.set_smart_joins(on),
+            Command::SetSmartTransitions(on) => {
+                let mut q = self.queue.lock().expect("queue");
+                q.smart_transitions = on;
+                if let Some(index) = q.decode_index {
+                    q.measure_from(index);
+                }
+                drop(q);
+                self.engine.set_smart_transitions(on);
+            }
             Command::SetCrossfadeMs(ms) => {
                 self.state.lock().expect("state").crossfade_ms = ms;
                 self.apply_crossfade();
+            }
+            Command::HoldAfterCurrent(on) => {
+                let mut q = self.queue.lock().expect("queue");
+                let current = self.audible_index_of(&q).and_then(|i| q.entries.get(i)).map(|e| e.token);
+                q.hold = if on { current } else { None };
             }
             Command::SetFollowing(on) => {
                 if self.following != on {
@@ -2029,7 +2094,9 @@ impl Control {
         };
         self.engine.set_output_mode(mode_for(&self.policy, &caps));
         self.handle = None;
-        if let Some(index) = self.audible_index()
+        // before anything is heard the decoder may already be past the queue's end; the song loaded last is then the one to restart
+        let loaded = self.loaded.and_then(|t| self.queue.lock().expect("queue").index_of(t));
+        if let Some(index) = self.audible_index().or(loaded)
             && !matches!(self.status(), PlayerStatus::Stopped)
         {
             let position = self.shared.position_ms();

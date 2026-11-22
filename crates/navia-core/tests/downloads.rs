@@ -199,12 +199,14 @@ fn downloaded_songs_play_with_the_server_unreachable_and_stay_exact() {
     // The same data now, but the client can't reach any server.
     let offline = client("http://127.0.0.1:9");
     let downloads = Arc::new(DownloadManager::new(library, offline.clone(), dir.path().join("downloads")).unwrap());
-    let backend = CaptureBackend { speed: 0.0, ..Default::default() };
+    // paced: a capture pulling as fast as it can records silence whenever the decoder falls behind
+    let backend = CaptureBackend { speed: 25.0, ..Default::default() };
     let capture = backend.capture.clone();
     let resolver = ServerResolver::new(offline).unwrap().with_downloads(downloads);
     let player = Player::with_backend(Arc::new(resolver), Box::new(backend), PlayerConfig { policy: OutputPolicy::FollowTrack, ..Default::default() }).unwrap();
     player.set_queue(vec![QueueItem::new("a".into(), Some(2000))], 0, 0, false);
     assert!(wait_for(Duration::from_secs(5), || player.snapshot().status == PlayerStatus::Stopped));
+    assert_eq!(player.snapshot().underrun_frames, 0, "underruns");
     let samples = capture.samples();
     let first = samples.chunks_exact(2).position(|f| f[0] != 0.0 || f[1] != 0.0).unwrap_or(0);
     let expected = to_f32(&pcm);

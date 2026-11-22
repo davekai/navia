@@ -2,6 +2,7 @@
 //!
 //! The GPUI and SwiftUI apps stay thin by using only this crate's plain types.
 
+pub mod album_heat;
 pub mod artist_radio;
 pub mod artwork;
 pub mod audio;
@@ -10,6 +11,7 @@ pub mod autoplay;
 pub mod capabilities;
 pub mod client;
 pub mod connect;
+pub mod covers;
 pub mod deezer;
 pub mod display;
 pub mod downloads;
@@ -18,6 +20,7 @@ pub mod error;
 pub mod lanyard;
 pub mod library;
 pub mod listen_along;
+pub mod listenbrainz;
 pub mod lyrics;
 pub mod quality;
 pub mod play_queue;
@@ -34,6 +37,7 @@ pub mod artist_filters;
 pub mod song_filters;
 pub mod songcache;
 pub mod stations;
+pub mod upcoming;
 pub mod updates;
 
 pub use error::{Error, Result};

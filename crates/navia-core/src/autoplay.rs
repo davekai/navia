@@ -17,8 +17,9 @@ pub const PER_SEED: u32 = 40;
 const CHOSEN_KEEP: usize = 12;
 /// How many preceding songs decide which versions Autoplay may continue with.
 const JUNK_CONTEXT: usize = 3;
-/// How many Autoplay songs the queue shows. Matches the plan's length so the whole plan shows.
-pub const SHOWN: usize = 50;
+/// how many Autoplay songs the queue shows; the plan goes on past them, so the next of it fills in
+/// behind as songs play or are removed.
+pub const SHOWN: usize = 25;
 
 /// Why the queue's Autoplay section looks the way it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,7 +318,7 @@ impl Autoplay {
     /// Nothing is offered until the newest choice is answered.
     pub fn finish_fetch(&mut self, seeds: Vec<String>, answers: Vec<Vec<Song>>) {
         if self.mode() == AutoplayMode::Navia {
-            return self.navia.finish(seeds, answers, None);
+            return self.navia.finish(seeds, Answers { similar: answers, ..Default::default() });
         }
         if self.asking.as_ref() == Some(&seeds) {
             self.asking = None;
@@ -326,7 +327,6 @@ impl Autoplay {
         self.answers = answers;
     }
 
-    /// Whether an ask is under way.
     pub fn fetching(&self) -> bool {
         self.asking.is_some() || self.navia.fetching()
     }
@@ -334,7 +334,7 @@ impl Autoplay {
     /// [`Autoplay::finish_fetch`] with what [`fetch_answers`] brought.
     pub fn finish_answers(&mut self, seeds: Vec<String>, answers: Answers) {
         if self.mode() == AutoplayMode::Navia {
-            return self.navia.finish(seeds, answers.similar, answers.deezer);
+            return self.navia.finish(seeds, answers);
         }
         self.finish_fetch(seeds, answers.similar);
     }
@@ -426,52 +426,70 @@ impl Autoplay {
 pub struct Answers {
     pub similar: Vec<Vec<Song>>,
     pub deezer: Option<engine::deezer_src::DeezerAnswers>,
+    /// per seed song id: ListenBrainz's similar recordings as library songs.
+    pub listenbrainz: Vec<(String, Vec<Song>)>,
+}
+
+/// the outside services the Navia mode asks with the recommendations switch on.
+#[derive(Clone, Copy)]
+pub struct Externals<'a> {
+    pub deezer: &'a crate::deezer::Deezer,
+    pub listenbrainz: &'a crate::listenbrainz::ListenBrainz,
+}
+
+impl Externals<'static> {
+    /// the ones the apps use.
+    pub fn shared() -> Self {
+        Self { deezer: crate::deezer::Deezer::shared(), listenbrainz: crate::listenbrainz::ListenBrainz::shared() }
+    }
 }
 
 /// Asks for `seeds` as `mode` needs, from the server and, in the Navia mode with the gate open, from Deezer.
 /// Read-only on the server. Needs a Tokio runtime.
 pub async fn fetch_answers(client: &Client, db: &Library, seeds: &[String], mode: AutoplayMode) -> Answers {
-    fetch_answers_after(client, db, crate::deezer::Deezer::shared(), seeds, mode, engine::DEEZER_DEBOUNCE).await
+    fetch_answers_after(client, db, Externals::shared(), seeds, mode, engine::EXTERNAL_DEBOUNCE).await
 }
 
-/// [`fetch_answers`] with a given Deezer client and no wait before Deezer.
-pub async fn fetch_answers_with(client: &Client, db: &Library, deezer: &crate::deezer::Deezer, seeds: &[String], mode: AutoplayMode) -> Answers {
-    fetch_answers_after(client, db, deezer, seeds, mode, std::time::Duration::ZERO).await
+/// [`fetch_answers`] with given outside services and no wait before them (radios, tests).
+pub async fn fetch_answers_with(client: &Client, db: &Library, ext: Externals<'_>, seeds: &[String], mode: AutoplayMode) -> Answers {
+    fetch_answers_after(client, db, ext, seeds, mode, std::time::Duration::ZERO).await
 }
 
-/// [`fetch_answers`] with a given Deezer client and wait before asking it.
-pub async fn fetch_answers_after(client: &Client, db: &Library, deezer: &crate::deezer::Deezer, seeds: &[String], mode: AutoplayMode, wait: std::time::Duration) -> Answers {
+/// [`fetch_answers`] with given outside services and wait before asking them.
+pub async fn fetch_answers_after(client: &Client, db: &Library, ext: Externals<'_>, seeds: &[String], mode: AutoplayMode, wait: std::time::Duration) -> Answers {
     if mode == AutoplayMode::Server {
-        return Answers { similar: fetch_count(client, seeds, PER_SEED).await, deezer: None };
+        return Answers { similar: fetch_count(client, seeds, PER_SEED).await, ..Default::default() };
     }
-    let similar = fetch_count(client, seeds, engine::plan::SIMILAR_ASK);
+    let similar = engine::server_src::similar(client, db, seeds, engine::plan::SIMILAR_ASK);
     if !crate::deezer::gate(db).is_open() {
-        return Answers { similar: similar.await, deezer: None };
+        return Answers { similar: similar.await, ..Default::default() };
     }
-    let from_deezer = async {
+    let outside = async {
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
             if !db.engine_shared().is_current(seeds) {
-                return None;
+                return (None, Vec::new());
             }
         }
         let seed_songs: Vec<Song> = seeds.iter().filter_map(|id| db.song(id).ok().flatten()).collect();
-        let deadline = tokio::time::Instant::now() + engine::DEEZER_TIMEOUT;
-        let work = async {
-            let mut found = engine::deezer_src::seed_sources(db, deezer, &seed_songs).await;
+        let deadline = tokio::time::Instant::now() + engine::EXTERNAL_TIMEOUT;
+        let deezer = async {
+            let mut found = engine::deezer_src::seed_sources(db, ext.deezer, &seed_songs).await;
             let mut names: Vec<String> = seed_songs.iter().map(|s| main_artist(s).to_string()).collect();
             for (artist, _) in engine::plan::neighbours(Some(db), &seed_songs, Some(&found)).into_iter().take(engine::deezer_src::TOP_ARTISTS) {
                 if let Some(a) = db.artist(&artist).ok().flatten() {
                     names.push(a.name);
                 }
             }
-            found.popular = engine::deezer_src::top_places(db, deezer, &names, deadline).await;
+            found.popular = engine::deezer_src::top_places(db, ext.deezer, &names, deadline).await;
             found
         };
-        tokio::time::timeout(engine::DEEZER_TIMEOUT, work).await.ok()
+        let listenbrainz = engine::lb_src::seed_sources(db, ext.listenbrainz, &seed_songs, deadline);
+        let (deezer, listenbrainz) = tokio::join!(tokio::time::timeout(engine::EXTERNAL_TIMEOUT, deezer), tokio::time::timeout(engine::EXTERNAL_TIMEOUT, listenbrainz));
+        (deezer.ok(), listenbrainz.unwrap_or_default())
     };
-    let (similar, found) = tokio::join!(similar, from_deezer);
-    Answers { similar, deezer: found }
+    let (similar, (deezer, listenbrainz)) = tokio::join!(similar, outside);
+    Answers { similar, deezer, listenbrainz }
 }
 
 /// The BPM of an untagged song from Deezer, when the gate is open. Kept for good.
@@ -511,15 +529,15 @@ pub const RADIO_LEN: usize = 50;
 /// A radio from one song, queued after it by Start Song Radio and by songs played from Search.
 /// Follows the Autoplay mode, and falls back to the same artists' songs when the server has no similar songs.
 pub async fn radio(client: &Client, db: &Library, song_id: &str) -> Vec<Song> {
-    radio_with(client, db, crate::deezer::Deezer::shared(), song_id).await
+    radio_with(client, db, Externals::shared(), song_id).await
 }
 
-/// [`radio`] with a given Deezer client (tests use a fake).
-pub async fn radio_with(client: &Client, db: &Library, deezer: &crate::deezer::Deezer, song_id: &str) -> Vec<Song> {
+/// [`radio`] with given outside services (tests use fakes).
+pub async fn radio_with(client: &Client, db: &Library, ext: Externals<'_>, song_id: &str) -> Vec<Song> {
     let seed = db.song(song_id).ok().flatten().unwrap_or_else(|| Song { id: song_id.to_string(), ..Default::default() });
     let mode = engine::mode(db);
     if mode == AutoplayMode::Navia {
-        let answers = fetch_answers_with(client, db, deezer, std::slice::from_ref(&seed.id), mode).await;
+        let answers = fetch_answers_with(client, db, ext, std::slice::from_ref(&seed.id), mode).await;
         return navia_radio_songs(db, &seed, answers);
     }
     let answers = fetch(client, std::slice::from_ref(&seed.id)).await;
@@ -536,7 +554,7 @@ pub fn navia_radio_songs(db: &Library, seed: &Song, answers: Answers) -> Vec<Son
     let seeds = vec![seed.id.clone()];
     let mut navia = engine::Navia::default();
     navia.set_context(None, seeds.clone());
-    navia.finish(seeds.clone(), answers.similar, answers.deezer);
+    navia.finish(seeds.clone(), answers);
     let ids: HashSet<String> = HashSet::from([seed.id.clone()]);
     let versions: HashSet<String> = HashSet::from([song_version(seed)]);
     let junk = engine::junk::Filter::after(std::slice::from_ref(seed));

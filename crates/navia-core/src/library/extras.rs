@@ -163,6 +163,14 @@ impl Library {
         })
     }
 
+    pub(crate) fn delete_playlist(&self, id: &str) -> Result<()> {
+        let removed = self.write(|tx| Ok(tx.execute("DELETE FROM playlist WHERE id = ?1", [id])?))?;
+        if removed > 0 {
+            self.contents_changed();
+        }
+        Ok(())
+    }
+
     /// Remove stored playlists the server no longer lists. Returns how many went.
     pub(crate) fn delete_playlists_except(&self, keep: &[String]) -> Result<u64> {
         self.write(|tx| {

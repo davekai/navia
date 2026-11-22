@@ -72,6 +72,19 @@ impl LyricLine {
         // Anything after the last word, such as punctuation, counts as sung.
         Some(1.0)
     }
+
+    /// the line with its timing cut to end by `ms`, so the fill is complete then. a held last
+    /// word's own timing can run past the time its line stops being current.
+    pub fn filled_by(&self, ms: u32) -> Self {
+        let mut line = self.clone();
+        for (i, w) in line.words.iter_mut().enumerate() {
+            let end = w.end_ms.or_else(|| self.words.get(i + 1).map(|n| n.start_ms)).or(self.end_ms).unwrap_or(w.start_ms);
+            w.start_ms = w.start_ms.min(ms);
+            w.end_ms = Some(end.min(ms));
+        }
+        line.end_ms = self.end_ms.map(|e| e.min(ms));
+        line
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +377,19 @@ mod tests {
         assert!(cache.get("plain").unwrap().1, "unsynced lyrics have no words to gain");
         cache.put("synced", Some(&Lyrics { synced: true, lines: vec![LyricLine::plain(Some(10), "hi")] }));
         assert!(cache.get("synced").unwrap().1);
+    }
+
+    #[test]
+    fn a_held_word_cut_to_the_hold_is_filled_by_then() {
+        // "EVEN BETTER": the last word's timing runs to 59670, the line stops being current at 59073
+        let word = |start: u32, end: u32, start_ms: u32, end_ms: Option<u32>| LyricWord { start, end, start_ms, end_ms };
+        let line = LyricLine { start_ms: Some(57000), text: "EVEN BETTER".into(), end_ms: None, words: vec![word(0, 4, 57000, None), word(5, 11, 58459, Some(59670))] };
+        assert!(line.sung_fraction(58773).unwrap() < 0.8, "uncut, the glow would start fading over unlit letters");
+        let cut = line.filled_by(58773);
+        assert_eq!(cut.sung_fraction(58773), Some(1.0));
+        assert_eq!(cut.sung_fraction(57000), Some(0.0));
+        assert_eq!(cut.words[0].end_ms, Some(58459), "an earlier word keeps its own timing");
+        assert_eq!(cut.sung_fraction(58500).unwrap() > line.sung_fraction(58500).unwrap(), true, "the held word fills faster, never backwards");
     }
 
     fn plain(lines: &[&str]) -> Lyrics {

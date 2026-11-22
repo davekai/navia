@@ -3,8 +3,8 @@
 //! notice, so everything here is optional. Logging in updates the user's last-login time.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -16,8 +16,18 @@ const SCROBBLE_PAGE: usize = 1000;
 
 /// From 0.55, `/api/album?artist_id=` matches album-artist and track-artist credits.
 const CREDITED_ALBUMS_MIN_VERSION: (u32, u32, u32) = (0, 55, 0);
-/// Albums per request when listing an artist's credited albums. Two in tests to exercise paging.
-const ALBUM_PAGE: usize = if cfg!(test) { 2 } else { 500 };
+/// rows asked for per native list request (an artist's albums, an album's songs).
+/// (Two in unit tests, so paging is exercised.)
+const LIST_PAGE: usize = if cfg!(test) { 2 } else { 500 };
+
+/// the first wait after the server limited or failed a native request; each further failure
+/// doubles it up to [`NATIVE_BACKOFF_CAP`]. a longer `Retry-After` wins.
+const NATIVE_BACKOFF_FIRST: Duration = Duration::from_secs(30);
+const NATIVE_BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
+
+/// songs asked for per request when reading what a scan updated.
+/// (Two in unit tests, so paging is exercised.)
+const SONG_UPDATE_PAGE: usize = if cfg!(test) { 2 } else { 500 };
 
 /// Navidrome added `POST`/`DELETE /api/playlist/{id}/image` in 0.61.
 const IMAGE_UPLOAD_MIN_VERSION: (u32, u32, u32) = (0, 61, 0);
@@ -29,6 +39,19 @@ const PUBLIC_CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
 const IMAGE_MAX_READ: u64 = 256 * 1024 * 1024;
 /// Navidrome's default `MaxImageUploadSize`, for a useful message when an upload is cut off.
 const SERVER_DEFAULT_IMAGE_LIMIT: u64 = 10 * 1000 * 1000;
+
+/// what a scan changed at song level since a mark, from Navidrome's `/api/song` newest `updatedAt`
+/// first. a song's `updatedAt` is its file's modification time when the scan read it (so a retag
+/// moves it), or the moment the scan marked it missing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SongUpdates {
+    /// the albums of the songs updated after the mark, each once, newest first.
+    pub album_ids: Vec<String>,
+    /// the newest `updatedAt` in the library, as the server wrote it: the next mark.
+    pub newest: Option<String>,
+    /// more songs changed than the caller wanted to follow; `album_ids` is incomplete.
+    pub overflow: bool,
+}
 
 /// One play from the server's dated history, for the signed-in user.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,28 +146,130 @@ pub struct SmartSaved {
 
 /// Native API state kept per client: the token, and whether credited albums are listed.
 #[derive(Default)]
+pub(crate) struct NativeShared {
+    session: Mutex<NativeSession>,
+    /// held while logging in, so requests that start together share one login.
+    login: tokio::sync::Mutex<()>,
+}
+
+/// what this client has learned about the native API: a token to reuse (memory only), whether the
+/// server lists an artist's credited albums, and how long to wait after it limited or failed a request.
 pub(crate) struct NativeSession {
     token: Option<String>,
     credited_albums: Option<bool>,
     navidrome: Option<bool>,
+    held_until: Option<Instant>,
+    /// the last backoff step; zero once a request went through.
+    backoff: Duration,
+    backoff_first: Duration,
+    backoff_cap: Duration,
+}
+
+impl Default for NativeSession {
+    fn default() -> Self {
+        Self { token: None, credited_albums: None, navidrome: None, held_until: None, backoff: Duration::ZERO, backoff_first: NATIVE_BACKOFF_FIRST, backoff_cap: NATIVE_BACKOFF_CAP }
+    }
 }
 
 impl Client {
-    /// The kept native token, or a new one from a login. Each reply's `x-nd-authorization`
-    /// header refreshes it.
+    fn native(&self) -> std::sync::MutexGuard<'_, NativeSession> {
+        self.inner.native.session.lock().unwrap()
+    }
+
+    /// how long native requests still wait after the server limited or failed one, if they do.
+    pub fn native_retry_in(&self) -> Option<Duration> {
+        let held = self.native().held_until?;
+        held.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
+    }
+
+    /// shorter backoff steps, for tests.
+    #[doc(hidden)]
+    pub fn set_native_backoff(&self, first: Duration, cap: Duration) {
+        let mut session = self.native();
+        session.backoff_first = first;
+        session.backoff_cap = cap;
+    }
+
+    fn native_hold(&self, endpoint: &str) -> Result<()> {
+        self.offline_switch().check()?;
+        match self.native_retry_in() {
+            Some(wait) => Err(Error::Waiting { endpoint: endpoint.to_string(), seconds: wait.as_secs_f64().ceil() as u64 }),
+            None => Ok(()),
+        }
+    }
+
+    /// starts or lengthens the wait when the server limited a request (429), failed it (5xx,
+    /// 408) or couldn't be reached. any other answer ends the backoff.
+    fn note_native_reply(&self, reply: std::result::Result<&reqwest::Response, &reqwest::Error>) {
+        let retry_after = match reply {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if !(status == 429 || status == 408 || status >= 500) {
+                    let mut session = self.native();
+                    session.backoff = Duration::ZERO;
+                    session.held_until = None;
+                    return;
+                }
+                retry_after(response)
+            }
+            Err(_) => None,
+        };
+        let mut session = self.native();
+        let step = if session.backoff.is_zero() { session.backoff_first } else { (session.backoff * 2).min(session.backoff_cap) };
+        session.backoff = step;
+        let wait = retry_after.map_or(step, |r| r.max(step));
+        session.held_until = Some(Instant::now() + wait);
+        tracing::info!("native API: waiting {} s before asking again", wait.as_secs());
+    }
+
+    /// sends one native request, after any wait, and records how the server answered.
+    async fn native_send(&self, request: reqwest::RequestBuilder, endpoint: &str) -> Result<reqwest::Response> {
+        self.native_hold(endpoint)?;
+        let reply = request.send().await;
+        self.note_native_reply(reply.as_ref());
+        Ok(reply?)
+    }
+
+    /// The kept native token, or a new one from one login. Navidrome hands out a refreshed token
+    /// in each reply's `x-nd-authorization` header, which [`Self::keep_refreshed_token`] stores.
     async fn session_token(&self) -> Result<String> {
-        if let Some(token) = self.inner.native.lock().unwrap().token.clone() {
+        if let Some(token) = self.native().token.clone() {
             return Ok(token);
         }
-        let token = self.native_token(&self.inner.http).await?;
-        self.inner.native.lock().unwrap().token = Some(token.clone());
+        let _login = self.inner.native.login.lock().await;
+        if let Some(token) = self.native().token.clone() {
+            return Ok(token);
+        }
+        self.log_in().await
+    }
+
+    /// logs in and keeps the new token. callers hold the login lock or need a fresh login.
+    async fn log_in(&self) -> Result<String> {
+        let config = self.config();
+        let url = format!("{}/auth/login", config.base_url.trim_end_matches('/'));
+        let body = json!({"username": config.credentials.username(), "password": config.credentials.password()});
+        let response = self.native_send(self.inner.http.post(url).json(&body), "auth/login").await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::HttpStatus { status: status.as_u16(), endpoint: "auth/login".to_string() });
+        }
+        let value: Value = response.json().await?;
+        let token = value.get("token").and_then(Value::as_str).map(str::to_string).ok_or_else(|| Error::Decode { endpoint: "auth/login".to_string(), detail: "no token in the reply".to_string() })?;
+        self.native().token = Some(token.clone());
         Ok(token)
+    }
+
+    /// a fresh login for a change the user asked for, so a token the server has since expired
+    /// can't fail it. shares the wait and the kept token with every other native request.
+    async fn write_token(&self) -> Result<String> {
+        let _login = self.inner.native.login.lock().await;
+        self.log_in().await
     }
 
     fn keep_refreshed_token(&self, response: &reqwest::Response) {
         let refreshed = response.headers().get("x-nd-authorization").and_then(|v| v.to_str().ok()).map(|v| v.trim_start_matches("Bearer ").trim().to_string());
         if let Some(token) = refreshed.filter(|t| !t.is_empty()) {
-            self.inner.native.lock().unwrap().token = Some(token);
+            self.native().token = Some(token);
         }
     }
 
@@ -152,10 +277,14 @@ impl Client {
     async fn native_get(&self, url: &str, endpoint: &str) -> Result<reqwest::Response> {
         for attempt in 0..2 {
             let token = self.session_token().await?;
-            let response = self.inner.http.get(url).header("x-nd-authorization", format!("Bearer {token}")).send().await?;
+            let request = self.inner.http.get(url).header("x-nd-authorization", format!("Bearer {token}"));
+            let response = self.native_send(request, endpoint).await?;
             let status = response.status();
             if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-                self.inner.native.lock().unwrap().token = None;
+                let mut session = self.native();
+                if session.token.as_deref() == Some(token.as_str()) {
+                    session.token = None;
+                }
                 continue;
             }
             if !status.is_success() {
@@ -170,13 +299,13 @@ impl Client {
     /// Whether this server lists the albums an artist is credited on (Navidrome 0.55+).
     /// Asks `ping` once and doesn't log in.
     pub async fn lists_credited_albums(&self) -> Result<bool> {
-        if let Some(known) = self.inner.native.lock().unwrap().credited_albums {
+        if let Some(known) = self.native().credited_albums {
             return Ok(known);
         }
         let info = self.ping().await?;
         let navidrome = info.kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("navidrome"));
         let known = navidrome && info.server_version.as_deref().and_then(parse_version).is_some_and(|v| v >= CREDITED_ALBUMS_MIN_VERSION);
-        self.inner.native.lock().unwrap().credited_albums = Some(known);
+        self.native().credited_albums = Some(known);
         Ok(known)
     }
 
@@ -193,7 +322,7 @@ impl Client {
         let mut ids = Vec::new();
         let mut start = 0;
         loop {
-            let end = start + ALBUM_PAGE;
+            let end = start + LIST_PAGE;
             let url = format!("{base}/api/album?artist_id={artist_id}&missing=false&_sort=name&_order=ASC&_start={start}&_end={end}");
             let response = self.native_get(&url, "api/album").await?;
             let total = response.headers().get("x-total-count").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<usize>().ok());
@@ -204,7 +333,7 @@ impl Client {
                 return Err(Error::Decode { endpoint: "api/album".to_string(), detail: "an album has no id".to_string() });
             }
             ids.extend(page);
-            let done = rows.len() < ALBUM_PAGE || total.is_some_and(|t| ids.len() >= t);
+            let done = rows.len() < LIST_PAGE || total.is_some_and(|t| ids.len() >= t);
             if done {
                 break;
             }
@@ -213,8 +342,47 @@ impl Client {
         Ok(ids)
     }
 
-    /// Artist, album and song counts for one library, or all the user sees, from `X-Total-Count`.
-    /// Navidrome only. A reply without the header is an error, never a guess.
+    /// every `copyright` tag value on an album's songs, in disc and track order, repeats kept so
+    /// callers can tell the album's main line. Navidrome only: Subsonic and OpenSubsonic don't
+    /// carry the tag, and the native album has no album-level copyright, so this reads the songs
+    /// from `/api/song?album_id=`. empty when no song is tagged. logs in once and keeps the token,
+    /// so see the module note.
+    pub async fn album_copyrights(&self, album_id: &str) -> Result<Vec<String>> {
+        if !plain_id(album_id) {
+            return Err(Error::Decode { endpoint: "api/song".to_string(), detail: "not an album id".to_string() });
+        }
+        if !self.is_navidrome().await? {
+            return Err(Error::HttpStatus { status: 404, endpoint: "api/song".to_string() });
+        }
+        let base = self.config().base_url.trim_end_matches('/').to_string();
+        let mut songs: Vec<(i64, i64, Vec<String>)> = Vec::new();
+        let mut start = 0;
+        loop {
+            let end = start + LIST_PAGE;
+            let url = format!("{base}/api/song?album_id={album_id}&missing=false&_sort=album&_order=ASC&_start={start}&_end={end}");
+            let response = self.native_get(&url, "api/song").await?;
+            let total = response.headers().get("x-total-count").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<usize>().ok());
+            let value: Value = response.json().await?;
+            let rows = value.as_array().ok_or_else(|| Error::Decode { endpoint: "api/song".to_string(), detail: "the reply isn't a list".to_string() })?;
+            for row in rows {
+                let number = |key: &str| row.get(key).and_then(Value::as_i64).unwrap_or(0);
+                let values = row.pointer("/tags/copyright").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+                songs.push((number("discNumber"), number("trackNumber"), values));
+            }
+            let done = rows.len() < LIST_PAGE || total.is_some_and(|t| songs.len() >= t);
+            if done {
+                break;
+            }
+            start = end;
+        }
+        songs.sort_by_key(|(disc, track, _)| (*disc, *track));
+        Ok(songs.into_iter().flat_map(|(_, _, values)| values).collect())
+    }
+
+    /// How many artists, albums and songs one library holds (`library_id`), or all the user sees (`None`),
+    /// from the `X-Total-Count` of a one-row native `/api/artist`, `/api/album` and `/api/song`. Navidrome
+    /// only (asked once per client through `ping`); logs in once and keeps the token, so see the module
+    /// note. A reply without the header is an error, never a guess.
     pub async fn library_totals(&self, library_id: Option<&str>) -> Result<LibraryTotals> {
         if library_id.is_some_and(|id| !plain_id(id)) {
             return Err(Error::Decode { endpoint: "api".to_string(), detail: "not a library id".to_string() });
@@ -235,41 +403,88 @@ impl Client {
         Ok(LibraryTotals { artists: counts[0], albums: counts[1], songs: counts[2] })
     }
 
-    /// Whether `ping` says this is Navidrome, asked once per client.
+    /// the albums whose songs a scan updated after `mark` (an `updatedAt` from an earlier answer), in
+    /// one library. without a mark only the newest `updatedAt` is read, to start from. stops after
+    /// `max` updated songs and says so. Navidrome only (asked once per client through `ping`); logs
+    /// in once and keeps the token, so see the module note.
+    pub async fn songs_updated_since(&self, library_id: &str, mark: Option<&str>, max: usize) -> Result<SongUpdates> {
+        if !plain_id(library_id) {
+            return Err(Error::Decode { endpoint: "api/song".to_string(), detail: "not a library id".to_string() });
+        }
+        if !self.is_navidrome().await? {
+            return Err(Error::HttpStatus { status: 404, endpoint: "api/song".to_string() });
+        }
+        let mark = match mark {
+            Some(m) => Some(parse_timestamp(m).ok_or_else(|| Error::Decode { endpoint: "api/song".to_string(), detail: format!("unreadable mark {m}") })?),
+            None => None,
+        };
+        let base = self.config().base_url.trim_end_matches('/').to_string();
+        let page = if mark.is_some() { SONG_UPDATE_PAGE } else { 1 };
+        let mut out = SongUpdates::default();
+        let mut followed = 0;
+        let mut start = 0;
+        loop {
+            let end = start + page;
+            let url = format!("{base}/api/song?library_id={library_id}&_sort=updated_at&_order=DESC&_start={start}&_end={end}");
+            let value: Value = self.native_get(&url, "api/song").await?.json().await?;
+            let rows = value.as_array().ok_or_else(|| Error::Decode { endpoint: "api/song".to_string(), detail: "the reply isn't a list".to_string() })?;
+            for row in rows {
+                let raw = row.get("updatedAt").and_then(Value::as_str).ok_or_else(|| Error::Decode { endpoint: "api/song".to_string(), detail: "a song has no updatedAt".to_string() })?;
+                let at = parse_timestamp(raw).ok_or_else(|| Error::Decode { endpoint: "api/song".to_string(), detail: format!("unreadable updatedAt {raw}") })?;
+                if out.newest.is_none() {
+                    out.newest = Some(raw.to_string());
+                }
+                let Some(mark) = mark else { return Ok(out) };
+                if at <= mark {
+                    return Ok(out);
+                }
+                followed += 1;
+                if followed > max {
+                    out.overflow = true;
+                    return Ok(out);
+                }
+                if let Some(album) = row.get("albumId").and_then(Value::as_str).filter(|a| !a.is_empty())
+                    && !out.album_ids.iter().any(|a| a == album)
+                {
+                    out.album_ids.push(album.to_string());
+                }
+            }
+            if rows.len() < page {
+                return Ok(out);
+            }
+            start = end;
+        }
+    }
+
+    /// from the first song's `tags`: Subsonic has no barcode field. Navidrome only; logs in once and keeps the token (see the module note).
+    pub async fn album_barcode(&self, album_id: &str) -> Result<Option<String>> {
+        if !plain_id(album_id) || !self.is_navidrome().await? {
+            return Ok(None);
+        }
+        let base = self.config().base_url.trim_end_matches('/').to_string();
+        let url = format!("{base}/api/song?album_id={album_id}&missing=false&_start=0&_end=1");
+        let value: Value = self.native_get(&url, "api/song").await?.json().await?;
+        let tags = value.as_array().and_then(|rows| rows.first()).and_then(|s| s.get("tags"));
+        let barcode = tags.and_then(|t| t.get("barcode")).and_then(Value::as_array).and_then(|v| v.iter().find_map(Value::as_str));
+        Ok(barcode.map(str::trim).filter(|b| !b.is_empty()).map(str::to_string))
+    }
+
+    /// Whether `ping` says this is Navidrome, asked once per client. Sends no native request.
     async fn is_navidrome(&self) -> Result<bool> {
-        if let Some(known) = self.inner.native.lock().unwrap().navidrome {
+        if let Some(known) = self.native().navidrome {
             return Ok(known);
         }
         let info = self.ping().await?;
         let known = info.kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("navidrome"));
-        self.inner.native.lock().unwrap().navidrome = Some(known);
+        self.native().navidrome = Some(known);
         Ok(known)
     }
 
-    async fn native_token(&self, http: &reqwest::Client) -> Result<String> {
-        let config = self.config();
-        let url = format!("{}/auth/login", config.base_url.trim_end_matches('/'));
-        let body = json!({"username": config.credentials.username(), "password": config.credentials.password()});
-        let response = http.post(url).json(&body).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::HttpStatus { status: status.as_u16(), endpoint: "auth/login".to_string() });
-        }
-        let value: Value = response.json().await?;
-        value.get("token").and_then(Value::as_str).map(str::to_string).ok_or_else(|| Error::Decode { endpoint: "auth/login".to_string(), detail: "no token in the reply".to_string() })
-    }
-
-    /// A smart playlist's rules as JSON text. `None` when it has none or the API can't say.
+    /// A smart playlist's rules as Navidrome stores them, as JSON text. `None` when the
+    /// playlist has none, or the server's native API doesn't provide them.
     pub async fn playlist_rules(&self, id: &str) -> Result<Option<String>> {
-        let http = reqwest::Client::builder().timeout(self.config().timeout).build()?;
-        let token = self.native_token(&http).await?;
         let url = format!("{}/api/playlist/{id}", self.config().base_url.trim_end_matches('/'));
-        let response = http.get(url).header("x-nd-authorization", format!("Bearer {token}")).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::HttpStatus { status: status.as_u16(), endpoint: "api/playlist".to_string() });
-        }
-        let value: Value = response.json().await?;
+        let value: Value = self.native_get(&url, "api/playlist").await?.json().await?;
         Ok(value.get("rules").filter(|r| !r.is_null()).map(Value::to_string))
     }
 
@@ -286,8 +501,8 @@ impl Client {
         }
         let base = self.config().base_url.trim_end_matches('/').to_string();
         let http = reqwest::Client::builder().timeout(self.config().timeout).build().map_err(|e| SmartSaveError::Connection(e.to_string()))?;
-        let token = self.native_token(&http).await.map_err(|e| match e {
-            Error::HttpStatus { status: 429, .. } => SmartSaveError::Busy,
+        let token = self.write_token().await.map_err(|e| match e {
+            Error::HttpStatus { status: 429, .. } | Error::Waiting { .. } => SmartSaveError::Busy,
             Error::HttpStatus { status: 404 | 405, .. } => SmartSaveError::Unsupported,
             Error::HttpStatus { status, .. } => SmartSaveError::Server(format!("the sign-in was refused (HTTP {status})")),
             other => SmartSaveError::Connection(other.to_string()),
@@ -336,6 +551,9 @@ impl Client {
         if let Some(known) = self.public_config_slot().lock().unwrap().clone() {
             return known;
         }
+        if self.is_offline() {
+            return None;
+        }
         let http = reqwest::Client::builder().timeout(PUBLIC_CONFIG_TIMEOUT).user_agent(super::user_agent()).build().ok()?;
         let url = format!("{}/app/", self.config().base_url.trim_end_matches('/'));
         let response = http.get(url).send().await.ok()?;
@@ -373,7 +591,7 @@ impl Client {
     pub async fn set_playlist_image(&self, id: &str, bytes: Vec<u8>) -> std::result::Result<(), PlaylistImageError> {
         let url = self.playlist_image_url(id)?;
         let http = reqwest::Client::builder().timeout(IMAGE_UPLOAD_TIMEOUT).build().map_err(|e| PlaylistImageError::Connection(e.to_string()))?;
-        let token = self.image_token(&http).await?;
+        let token = self.image_token().await?;
         let size = bytes.len() as u64;
         let boundary = format!("navia{:x}", md5::compute(&bytes));
         let response = http
@@ -391,7 +609,7 @@ impl Client {
     pub async fn remove_playlist_image(&self, id: &str) -> std::result::Result<(), PlaylistImageError> {
         let url = self.playlist_image_url(id)?;
         let http = reqwest::Client::builder().timeout(self.config().timeout).build().map_err(|e| PlaylistImageError::Connection(e.to_string()))?;
-        let token = self.image_token(&http).await?;
+        let token = self.image_token().await?;
         let response = http.delete(url).header("x-nd-authorization", format!("Bearer {token}")).send().await.map_err(|e| PlaylistImageError::Connection(e.to_string()))?;
         image_result(response).await
     }
@@ -407,19 +625,17 @@ impl Client {
         Ok(format!("{}/api/playlist/{id}/image", self.config().base_url.trim_end_matches('/')))
     }
 
-    async fn image_token(&self, http: &reqwest::Client) -> std::result::Result<String, PlaylistImageError> {
-        self.native_token(http).await.map_err(|e| match e {
+    async fn image_token(&self) -> std::result::Result<String, PlaylistImageError> {
+        self.write_token().await.map_err(|e| match e {
             Error::HttpStatus { status: 401 | 403, .. } => PlaylistImageError::NotAllowed,
-            Error::HttpStatus { status: 429, .. } => PlaylistImageError::Busy,
+            Error::HttpStatus { status: 429, .. } | Error::Waiting { .. } => PlaylistImageError::Busy,
             other => PlaylistImageError::Connection(other.to_string()),
         })
     }
 
     /// A copy of this client that may write. Only for tests that change their own playlist.
     pub fn writable_copy(&self) -> Result<Client> {
-        let mut config = self.config().clone();
-        config.write_policy = WritePolicy::Allowed;
-        Client::new(config)
+        self.copy_with_policy(WritePolicy::Allowed)
     }
 
     /// Whether the server has the scrobble history route (Navidrome 0.64+). Asked without
@@ -427,26 +643,24 @@ impl Client {
     pub async fn has_scrobble_history(&self) -> Result<bool> {
         let http = reqwest::Client::builder().timeout(self.config().timeout).build()?;
         let url = format!("{}/api/scrobble?_start=0&_end=1", self.config().base_url.trim_end_matches('/'));
-        Ok(http.get(url).send().await?.status() == reqwest::StatusCode::UNAUTHORIZED)
+        let response = self.native_send(http.get(url), "api/scrobble").await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
+            return Err(Error::HttpStatus { status: status.as_u16(), endpoint: "api/scrobble".to_string() });
+        }
+        Ok(status == reqwest::StatusCode::UNAUTHORIZED)
     }
 
     /// The user's plays since `from` (Unix seconds, inclusive), newest first, at most `limit`.
     /// Empty when `EnableScrobbleHistory` is off. An unknown reply shape is an error.
     pub async fn scrobbles_since(&self, from: i64, limit: usize) -> Result<Vec<ScrobbleEntry>> {
-        let http = reqwest::Client::builder().timeout(self.config().timeout).build()?;
-        let token = self.native_token(&http).await?;
         let base = self.config().base_url.trim_end_matches('/').to_string();
         let mut out = Vec::new();
         let mut start = 0;
         while out.len() < limit {
             let end = start + SCROBBLE_PAGE;
             let url = format!("{base}/api/scrobble?_start={start}&_end={end}&_sort=submission_time&_order=DESC&from={from}");
-            let response = http.get(url).header("x-nd-authorization", format!("Bearer {token}")).send().await?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(Error::HttpStatus { status: status.as_u16(), endpoint: "api/scrobble".to_string() });
-            }
-            let value: Value = response.json().await?;
+            let value: Value = self.native_get(&url, "api/scrobble").await?.json().await?;
             let rows = value.as_array().ok_or_else(|| scrobble_shape("the reply isn't a list"))?;
             let page: Vec<ScrobbleEntry> = rows.iter().filter_map(scrobble_entry).collect();
             if page.is_empty() && !rows.is_empty() {
@@ -462,6 +676,46 @@ impl Client {
         out.truncate(limit);
         Ok(out)
     }
+}
+
+/// a `Retry-After` in seconds, the form Navidrome's limiter sends.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// an RFC 3339 time (`2026-11-18T13:16:22.016375086Z`, or with an offset) as Unix seconds and
+/// nanoseconds, comparable whatever the fraction's length or offset.
+fn parse_timestamp(s: &str) -> Option<(i64, u32)> {
+    let num = |s: &str| -> Option<i64> { s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse().ok()).flatten() };
+    let (date, rest) = s.split_once(['T', 't', ' '])?;
+    let mut d = date.splitn(3, '-');
+    let (year, month, day) = (num(d.next()?)?, num(d.next()?)?, num(d.next()?)?);
+    let zone_at = rest.find(['Z', 'z', '+', '-'])?;
+    let (clock, zone) = rest.split_at(zone_at);
+    let (hms, fraction) = clock.split_once('.').unwrap_or((clock, ""));
+    let mut t = hms.splitn(3, ':');
+    let (hour, minute, second) = (num(t.next()?)?, num(t.next()?)?, num(t.next()?)?);
+    let nanos = if fraction.is_empty() { 0 } else { num(&format!("{fraction:0<9}")[..9])? as u32 };
+    let offset = match zone {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = if zone.starts_with('-') { -1 } else { 1 };
+            let (h, m) = zone[1..].split_once(':')?;
+            sign * (num(h)? * 3600 + num(m)? * 60)
+        }
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // days from 1970-01-01 in the proleptic Gregorian calendar (Howard Hinnant's days_from_civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 + hour * 3600 + minute * 60 + second - offset, nanos))
 }
 
 /// An id that can go in a path as it is. Navidrome's are short alphanumeric strings.
@@ -495,7 +749,6 @@ fn smart_error(status: u16, text: &str, creating: bool) -> SmartSaveError {
     }
 }
 
-/// Reads an image for upload.
 pub fn read_image_file(path: &Path) -> std::result::Result<Vec<u8>, PlaylistImageError> {
     let meta = std::fs::metadata(path).map_err(|e| PlaylistImageError::File(e.to_string()))?;
     if !meta.is_file() {
@@ -584,6 +837,18 @@ fn scrobble_shape(detail: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps_compare_whatever_their_fraction_or_offset() {
+        assert_eq!(parse_timestamp("1970-01-01T00:00:00Z"), Some((0, 0)));
+        assert_eq!(parse_timestamp("2026-11-18T13:16:22.016375086Z"), Some((1_795_007_782, 16_375_086)));
+        assert_eq!(parse_timestamp("2026-11-18T13:16:22.5Z"), Some((1_795_007_782, 500_000_000)));
+        assert_eq!(parse_timestamp("2026-11-18T14:16:22+01:00"), parse_timestamp("2026-11-18T13:16:22Z"));
+        assert!(parse_timestamp("2026-11-18T13:16:22.45Z") < parse_timestamp("2026-11-18T13:16:22.5Z"));
+        assert_eq!(parse_timestamp("2000-02-29T00:00:00Z").map(|t| t.0), Some(951_782_400));
+        assert_eq!(parse_timestamp("yesterday"), None);
+        assert_eq!(parse_timestamp("2026-13-01T00:00:00Z"), None);
+    }
 
     #[test]
     fn reads_the_config_navidrome_embeds_in_its_page() {

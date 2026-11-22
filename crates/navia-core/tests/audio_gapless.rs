@@ -313,18 +313,21 @@ fn lossy_join(codec_args: &[&str], ext: &str, want_source: GaplessSource, tolera
     let (got, want) = (c.samples.len() as i64 / 2, whole.len() as i64 / 2);
     assert!((got - want).abs() <= tolerance, "length {got} vs {want}");
 
-    let original = to_f32(&whole);
     let join = track_starts(&c)[1].1 as usize;
-    let rms = |at: usize| {
-        let r = 1024;
-        let (mut e, n) = (0f64, 2 * r * 2);
-        for i in (at - r) * 2..(at + r) * 2 {
-            e += (c.samples[i] as f64 - original[i] as f64).powi(2);
-        }
-        (e / n as f64).sqrt()
+    let span = 4096;
+    let (p0, p1) = (ffmpeg_decode(&parts[0]), ffmpeg_decode(&parts[1]));
+    let rms = |ours: &[f32], theirs: &[f32]| (ours.iter().zip(theirs).map(|(a, b)| (*a as f64 - *b as f64).powi(2)).sum::<f64>() / ours.len() as f64).sqrt();
+    let tail = rms(&c.samples[(join - span) * 2..join * 2], &p0[p0.len() - span * 2..]);
+    let head = rms(&c.samples[join * 2..(join + span) * 2], &p1[..span * 2]);
+    assert!(tail < 1e-4 && head < 1e-4, "edges against the reference decode: end of first {tail:.6}, start of second {head:.6}");
+
+    // the reference decode could share a misread edit list, so the join must also line up with the original
+    let original = to_f32(&whole);
+    let best_lag = |at: usize| {
+        let err = |lag: i64| (0..span).map(|i| (c.samples[(at + i) * 2] as f64 - original[((at + i) as i64 + lag) as usize * 2] as f64).powi(2)).sum::<f64>();
+        (-2048i64..=2048).min_by(|a, b| err(*a).total_cmp(&err(*b))).unwrap()
     };
-    let (at_join, inside) = (rms(join), rms(join / 2));
-    assert!(at_join < inside * 5.0 + 0.01, "residual at join {at_join:.5} vs inside {inside:.5}");
+    assert_eq!((best_lag(join - span), best_lag(join)), (0, 0), "lag against the original before and after the join");
 }
 
 #[test]

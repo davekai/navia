@@ -6,7 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::{FakeServer, FakeSong, State, song};
-use navia_core::autoplay::radio_with;
+use navia_core::autoplay::{Externals, radio_with};
 use navia_core::deezer::Deezer;
 use navia_core::engine::{self, AutoplayMode};
 use navia_core::library::sync::{SyncOptions, Syncer};
@@ -60,6 +60,10 @@ async fn setup() -> Setup {
     Setup { server, deezer: MockServer::start().await, library, _dir: dir }
 }
 
+fn no_listenbrainz() -> navia_core::listenbrainz::ListenBrainz {
+    navia_core::listenbrainz::ListenBrainz::new("http://127.0.0.1:9")
+}
+
 fn fast(deezer: &MockServer) -> Deezer {
     Deezer::new(deezer.uri()).with_timing(Duration::from_millis(1), Duration::from_secs(5))
 }
@@ -74,7 +78,7 @@ async fn a_search_radio_in_the_navia_mode_is_ranked_spaced_and_left_out_like_aut
     assert_eq!(engine::mode(&s.library), AutoplayMode::Navia, "Navia is the default");
     let client = s.server.read_only_client();
     for _ in 0..5 {
-        let radio = radio_with(&client, &s.library, &fast(&s.deezer), "seed").await;
+        let radio = radio_with(&client, &s.library, Externals { deezer: &fast(&s.deezer), listenbrainz: &no_listenbrainz() }, "seed").await;
         let ids: Vec<&str> = radio.iter().map(|s| s.id.as_str()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
@@ -96,7 +100,7 @@ async fn a_search_radio_in_the_navia_mode_is_ranked_spaced_and_left_out_like_aut
 async fn a_radio_in_the_server_mode_is_the_servers_order_as_before() {
     let s = setup().await;
     engine::set_mode(&s.library, AutoplayMode::Server).unwrap();
-    let radio = radio_with(&s.server.read_only_client(), &s.library, &fast(&s.deezer), "seed").await;
+    let radio = radio_with(&s.server.read_only_client(), &s.library, Externals { deezer: &fast(&s.deezer), listenbrainz: &no_listenbrainz() }, "seed").await;
     let ids: Vec<&str> = radio.iter().map(|s| s.id.as_str()).collect();
     assert_eq!(ids, ["fa1", "fa2", "fa3", "inst", "short", "o1", "o2", "o3", "o4", "o5", "o6", "o7", "o8"]);
     assert!(s.deezer.received_requests().await.unwrap().is_empty());

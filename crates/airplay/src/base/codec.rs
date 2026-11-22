@@ -118,9 +118,7 @@ impl AudioFormat {
         }
     }
 
-    /// Calculate bytes per frame (per sample across all channels).
-    ///
-    /// For 16-bit stereo audio: 16 bits * 2 channels / 8 = 4 bytes per frame.
+    /// bytes per frame across all channels.
     pub fn bytes_per_frame(&self) -> usize {
         (self.bit_depth as usize * self.channels as usize) / 8
     }

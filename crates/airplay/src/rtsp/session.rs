@@ -14,7 +14,6 @@ use crate::rtsp::plist_codec::{
 /// Session state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
-    /// Not connected.
     Disconnected,
     /// Connected, awaiting pairing.
     Connected,
@@ -24,11 +23,8 @@ pub enum SessionState {
     SetupPhase1,
     /// Setup phase 2 complete, ready to stream.
     Ready,
-    /// Currently streaming.
     Playing,
-    /// Paused.
     Paused,
-    /// Tearing down.
     TearingDown,
 }
 
@@ -50,7 +46,6 @@ pub struct RtspSession {
     client_device_id: String,
     stream_config: StreamConfig,
     ports: Option<SessionPorts>,
-    /// Our local control port for receiving control messages
     local_control_port: u16,
     /// Stream connection ID (random u32, separate from session UUID)
     stream_connection_id: u32,
@@ -65,11 +60,9 @@ pub struct RtspSession {
 }
 
 impl RtspSession {
-    /// Create new session for device.
     pub fn new(device: Device, stream_config: StreamConfig) -> Self {
         let mut rng = rand::thread_rng();
 
-        // Generate random encryption keys
         let mut eiv = [0u8; 16];
         let mut ekey = [0u8; 72];
         let mut shk = [0u8; 32];
@@ -80,10 +73,9 @@ impl RtspSession {
         rng.fill(&mut ekey[64..]);
         rng.fill(&mut shk);
 
-        // Generate random local control port (ephemeral range)
+        // ephemeral port range.
         let local_control_port = rng.gen_range(49152..65535);
 
-        // Generate random stream connection ID (separate from session UUID)
         let stream_connection_id: u32 = rng.gen();
 
         let client_device_id = device.id.to_mac_string();
@@ -105,17 +97,14 @@ impl RtspSession {
         }
     }
 
-    /// Get session UUID.
     pub fn id(&self) -> Uuid {
         self.session_id
     }
 
-    /// Get current state.
     pub fn state(&self) -> SessionState {
         self.state
     }
 
-    /// Get device.
     pub fn device(&self) -> &Device {
         &self.device
     }
@@ -137,8 +126,7 @@ impl RtspSession {
 
     /// Build RTSP request URI for this session.
     ///
-    /// The session UUID in the URI must match the case of sessionUUID in the plist payload.
-    /// We use uppercase to match the sessionUUID field in SetupPhase1Request.
+    /// the UUID is uppercase to match sessionUUID in the plist payload.
     pub fn request_uri(&self) -> String {
         let host = self.request_host.as_deref().unwrap_or("local");
         let host = if host.contains(':') && !host.starts_with('[') {
@@ -146,21 +134,17 @@ impl RtspSession {
         } else {
             host.to_string()
         };
-        // Use uppercase UUID to match sessionUUID in plist payload
         format!("rtsp://{}/{}", host, self.session_id.to_string().to_uppercase())
     }
 
-    /// Get stream config.
     pub fn stream_config(&self) -> &StreamConfig {
         &self.stream_config
     }
 
-    /// Get allocated ports (after setup).
     pub fn ports(&self) -> Option<&SessionPorts> {
         self.ports.as_ref()
     }
 
-    /// Get the stream encryption key (for audio encryption).
     pub fn stream_key(&self) -> &[u8; 32] {
         &self.shk
     }
@@ -177,7 +161,6 @@ impl RtspSession {
         self.shk = shk;
     }
 
-    /// Transition to connected state.
     pub fn set_connected(&mut self) -> Result<()> {
         if self.state != SessionState::Disconnected {
             return Err(RtspError::SetupFailed(format!(
@@ -190,7 +173,6 @@ impl RtspSession {
         Ok(())
     }
 
-    /// Transition to paired state.
     pub fn set_paired(&mut self) -> Result<()> {
         if self.state != SessionState::Connected {
             return Err(RtspError::SetupFailed(format!(
@@ -278,11 +260,9 @@ impl RtspSession {
             "SETUP phase1 payload (minimal owntone-style)"
         );
 
-        // Log the full plist for debugging
         let encoded = plist_codec::encode(&request)?;
         if let Ok(dict) = plist_codec::decode::<plist::Dictionary>(&encoded) {
             tracing::debug!("SETUP phase1 plist keys: {:?}", dict.keys().collect::<Vec<_>>());
-            // Log the decoded values
             for (key, value) in dict.iter() {
                 match value {
                     plist::Value::String(s) => tracing::debug!("  {}: \"{}\"", key, s),
@@ -291,14 +271,12 @@ impl RtspSession {
                 }
             }
         }
-        // Log first 64 bytes of the binary plist
         let hex: String = encoded.iter().take(64).map(|b| format!("{:02x}", b)).collect();
         tracing::debug!("SETUP phase1 plist hex (first 64 bytes): {}", hex);
 
         Ok(encoded)
     }
 
-    /// Process SETUP phase 1 response.
     pub fn process_setup_phase1_response(&mut self, response: &[u8]) -> Result<()> {
         if self.state != SessionState::Paired {
             return Err(RtspError::SetupFailed(format!(
@@ -317,7 +295,6 @@ impl RtspSession {
             phase1_response.timing_peer_info.is_some()
         );
 
-        // Log receiver's timing peer info (important for PTP)
         if let Some(ref peer_info) = phase1_response.timing_peer_info {
             tracing::info!(
                 "Receiver timing peer info: addresses={:?}, id={}",
@@ -357,9 +334,7 @@ impl RtspSession {
             .into());
         }
 
-        // Generate AudioSpecificConfig for AAC codecs.
-        // Use ASC from StreamConfig if provided (e.g. ALAC magic cookie),
-        // otherwise generate for AAC if needed
+        // the ASC from StreamConfig (an ALAC magic cookie, for one), else one generated for AAC.
         let asc = if let Some(ref asc) = self.stream_config.asc {
             Some(asc.clone())
         } else {
@@ -369,10 +344,7 @@ impl RtspSession {
                     // - Object type (AAC-LC = 2) in 5 bits
                     // - Sample rate index in 4 bits
                     // - Channel configuration in 4 bits
-                    // For 44100Hz stereo AAC-LC: 0x12, 0x10
-                    // Object type: AAC-LC = 2 (5 bits)
-                    // Sample rate index: 4 = 44100Hz (4 bits)
-                    // Channel config: 2 = stereo (4 bits)
+                    // for 44.1 kHz stereo AAC-LC (object type 2, rate index 4, channels 2): 0x12, 0x10.
                     // Byte 0: (object_type << 3) | (sample_rate_index >> 1) = (2 << 3) | (4 >> 1) = 0x12
                     // Byte 1: ((sample_rate_index & 1) << 7) | (channel_config << 3) = ((4 & 1) << 7) | (2 << 3) = 0x10
                     Some(vec![0x12, 0x10])
@@ -421,7 +393,6 @@ impl RtspSession {
         plist_codec::encode(&request)
     }
 
-    /// Process SETUP phase 2 response.
     pub fn process_setup_phase2_response(&mut self, response: &[u8]) -> Result<()> {
         if self.state != SessionState::SetupPhase1 {
             return Err(RtspError::SetupFailed(format!(
@@ -433,12 +404,10 @@ impl RtspSession {
 
         let phase2_response: SetupPhase2Response = plist_codec::decode(response)?;
 
-        // Debug: log the raw response
         if let Ok(raw) = plist::from_bytes::<plist::Dictionary>(response) {
             tracing::debug!("SETUP phase2 response raw: {:?}", raw);
         }
 
-        // Find our audio stream in the response
         let audio_stream = phase2_response
             .streams
             .iter()
@@ -447,7 +416,6 @@ impl RtspSession {
                 RtspError::SetupFailed("No matching stream in phase 2 response".to_string())
             })?;
 
-        // Update ports with the actual data/control ports
         tracing::debug!(
             "SETUP phase2 response stream: type={}, data_port={}, control_port={}, stream_id={}",
             audio_stream.stream_type,
@@ -484,7 +452,6 @@ impl RtspSession {
         Ok(())
     }
 
-    /// Transition to paused state.
     pub fn pause(&mut self) -> Result<()> {
         if self.state != SessionState::Playing {
             return Err(RtspError::SetupFailed(format!(
@@ -497,7 +464,6 @@ impl RtspSession {
         Ok(())
     }
 
-    /// Transition to tearing down state.
     pub fn start_teardown(&mut self) -> Result<()> {
         // Can teardown from most states
         match self.state {
@@ -649,7 +615,6 @@ mod tests {
             session.set_connected().unwrap();
             session.set_paired().unwrap();
 
-            // Create a mock phase 1 response
             let response = SetupPhase1Response {
                 event_port: 58168,
                 timing_port: 58169,
@@ -862,7 +827,6 @@ mod tests {
             let data = session.build_setup_phase1(54321, None).unwrap();
             let decoded: plist::Dictionary = plist_codec::decode(&data).unwrap();
 
-            // timingPort should be the port we passed
             assert_eq!(
                 decoded.get("timingPort").and_then(|v| v.as_unsigned_integer()),
                 Some(54321)
@@ -886,7 +850,7 @@ mod tests {
             assert!(decoded.contains_key("timingPort"));
             assert!(decoded.contains_key("timingProtocol"));
 
-            // Should NOT have the old fields
+            // none of the fields the minimal payload leaves out.
             assert!(!decoded.contains_key("eiv"), "Should not have eiv");
             assert!(!decoded.contains_key("ekey"), "Should not have ekey");
             assert!(!decoded.contains_key("et"), "Should not have et");
@@ -1052,7 +1016,6 @@ mod tests {
             let device = make_test_device();
             let session = RtspSession::new(device, StreamConfig::default());
 
-            // Test various volume levels
             let data = session.build_set_volume(1.0).unwrap();
             let text = String::from_utf8(data).unwrap();
             assert!(text.starts_with("volume: 0.00")); // Max volume = 0 dB

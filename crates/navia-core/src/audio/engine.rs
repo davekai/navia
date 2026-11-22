@@ -1,6 +1,7 @@
 //! The playback engine: queue, decode, resample, crossfade, processing, ring buffer.
 //! [`RenderCore`] pulls from the ring in any block size, as a device callback would.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,12 +18,17 @@ use crate::audio::processing::ProcessingChain;
 use crate::audio::render::{Marker, MarkerKind, NO_HELD_POSITION, RenderCore, RenderShared};
 use crate::audio::resample::StreamResampler;
 use crate::audio::stream::{HttpStream, RETRY_MAX, RETRY_MIN};
+use crate::audio::transition::{self, JoinKind, Transition, TraitsSlot};
 use crate::error::{Error, Result};
 
 /// Output channel count. The engine renders everything to stereo.
 pub const OUTPUT_CHANNELS: usize = 2;
 const MARKER_CAPACITY: usize = 64;
-/// Start opening the next track this long before the decoder reaches the current one's end.
+/// the held tail is written in pieces this long, so an interrupt loses none of it.
+const RELEASE_CHUNK_FRAMES: usize = 4_096;
+/// the rate assumed before any track has set one.
+const DEFAULT_RATE: u32 = 48_000;
+/// Start opening the next track this long before the current one ends (decode position).
 const PRELOAD_LEAD_MS: u64 = 30_000;
 /// With the ring full, wait for this share of it to drain before writing again, so the engine
 /// writes in a few large batches instead of waking for every small gap.
@@ -70,6 +76,8 @@ pub struct EngineConfig {
     pub crossfade_frames: usize,
     /// Smart crossfade, where joins that continue an album in order play gapless.
     pub smart_joins: bool,
+    /// Smart transitions: each join's length and place come from the songs' measured edges.
+    pub smart_transitions: bool,
     pub ring_frames: usize,
     /// Stages applied to the final mix. Leave empty for bit-exact playback.
     pub processing: ProcessingChain,
@@ -77,7 +85,7 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     pub fn new(output: OutputMode) -> Self {
-        Self { output, crossfade_frames: 0, smart_joins: false, ring_frames: 48_000, processing: ProcessingChain::new() }
+        Self { output, crossfade_frames: 0, smart_joins: false, smart_transitions: false, ring_frames: 48_000, processing: ProcessingChain::new() }
     }
 }
 
@@ -149,6 +157,15 @@ pub struct TrackRequest {
     pub duration_ms: Option<u64>,
     /// Where the song sits on its album, for Smart crossfade. `None` when unknown.
     pub album: Option<AlbumSpot>,
+    /// the song's measured edges and facts for smart transitions, filled in the background.
+    pub traits: Option<TraitsSlot>,
+}
+
+impl TrackRequest {
+    /// a file on disk, for tests and tools.
+    pub fn file(token: usize, path: PathBuf) -> Self {
+        Self { token, opener: Arc::new(FileOpener(path)), start_ms: 0, duration_ms: None, album: None, traits: None }
+    }
 }
 
 /// A song's album id, disc and track number as the server tags them.
@@ -216,6 +233,7 @@ pub(crate) enum EngineCommand {
     SetCrossfade(usize),
     /// Smart crossfade, where joins that continue an album play gapless.
     SetSmartJoins(bool),
+    SetSmartTransitions(bool),
     SetOutputMode(OutputMode),
     /// Stop waiting out a backoff and try the server now.
     RetryNow,
@@ -277,6 +295,11 @@ impl EngineControl {
     /// With a crossfade set, play joins that continue the album in order gapless.
     pub fn set_smart_joins(&self, on: bool) {
         let _ = self.tx.send(EngineCommand::SetSmartJoins(on));
+    }
+
+    /// with a crossfade set, shape each join from the songs' measured edges.
+    pub fn set_smart_transitions(&self, on: bool) {
+        let _ = self.tx.send(EngineCommand::SetSmartTransitions(on));
     }
 
     pub fn set_output_mode(&self, mode: OutputMode) {
@@ -342,12 +365,18 @@ pub fn spawn_feed(feed: Box<dyn TrackFeed>, config: EngineConfig, first: Option<
                 crossfade_frames: config.crossfade_frames,
                 next_crossfade: None,
                 smart_joins: config.smart_joins,
+                smart_transitions: config.smart_transitions,
                 last_spot: None,
                 join_fades: false,
+                join_continues: false,
+                join_pending: false,
+                held_owner: None,
+                tail_traits: None,
+                tail_gain: 1.0,
                 chain: config.processing,
                 written: 0,
                 epoch: 0,
-                held: Vec::new(),
+                held: VecDeque::new(),
                 resampler: None,
                 current_rate: None,
                 preload: None,
@@ -417,7 +446,7 @@ pub fn spawn_with_albums(queue: Vec<(PathBuf, Option<AlbumSpot>)>, config: Engin
     let requests: Vec<TrackRequest> = queue
         .into_iter()
         .enumerate()
-        .map(|(i, (p, album))| TrackRequest { token: i, opener: Arc::new(FileOpener(p)), start_ms: 0, duration_ms: None, album })
+        .map(|(i, (p, album))| TrackRequest { album, ..TrackRequest::file(i, p) })
         .collect();
     let first = requests.first().cloned();
     let feed = VecFeed { queue: requests, index: 1 };
@@ -492,12 +521,22 @@ struct Worker {
     last_spot: Option<AlbumSpot>,
     /// Whether the join into the track being decoded fades. Decided once per track.
     join_fades: bool,
+    smart_transitions: bool,
+    /// the track being decoded continues the held song's album in order.
+    join_continues: bool,
+    /// the join into the track being decoded is still to be shaped by its first `body`.
+    join_pending: bool,
+    /// the track whose audio the held tail is.
+    held_owner: Option<usize>,
+    /// measured edges of the song whose end is being held, and its leveling gain.
+    tail_traits: Option<TraitsSlot>,
+    tail_gain: f32,
     chain: ProcessingChain,
     /// Frames written to the ring buffer so far, including stale ones later flushed.
     written: u64,
     epoch: u64,
     /// Held-back end of the previous track, waiting to crossfade.
-    held: Vec<f32>,
+    held: VecDeque<f32>,
     resampler: Option<StreamResampler>,
     current_rate: Option<u32>,
     preload: Option<OpenJob>,
@@ -636,6 +675,7 @@ impl Worker {
                 }
                 EngineCommand::SetCrossfade(frames) => self.crossfade_frames = frames,
                 EngineCommand::SetSmartJoins(on) => self.smart_joins = on,
+                EngineCommand::SetSmartTransitions(on) => self.smart_transitions = on,
                 EngineCommand::SetOutputMode(mode) => self.mode = mode,
                 EngineCommand::Exit => return None,
                 EngineCommand::Seek(_) | EngineCommand::Stop | EngineCommand::RetryNow => {}
@@ -669,6 +709,7 @@ impl Worker {
             match next {
                 Ok(EngineCommand::SetCrossfade(frames)) => self.next_crossfade = Some(frames),
                 Ok(EngineCommand::SetSmartJoins(on)) => self.smart_joins = on,
+                Ok(EngineCommand::SetSmartTransitions(on)) => self.smart_transitions = on,
                 Ok(EngineCommand::SetOutputMode(mode)) => self.mode = mode,
                 Ok(EngineCommand::RetryNow) => self.retry_now = true,
                 Ok(EngineCommand::Realign) => {
@@ -704,6 +745,7 @@ impl Worker {
     /// Discard everything not yet heard.
     fn flush(&mut self) {
         self.held.clear();
+        self.held_owner = None;
         self.resampler = None;
         self.preload = None;
         self.chain.reset();
@@ -756,7 +798,10 @@ impl Worker {
             self.current_rate = Some(self.started[k].rate);
             self.started.truncate(k + 1);
         }
-        self.held.clear();
+        // the kept song's held end isn't written yet; it stays to join what follows now.
+        if !(self.held_owner == Some(keep) && from >= self.written) {
+            self.held.clear();
+        }
         self.resampler = None;
         self.preload = None;
         self.chain.reset();
@@ -878,8 +923,9 @@ impl Worker {
             self.crossfade_frames = frames;
         }
         let continues = matches!((&req.album, &self.last_spot), (Some(spot), Some(last)) if spot.continues(last));
-        self.join_fades = self.crossfade_frames > 0 && !(self.smart_joins && continues);
-        self.last_spot = req.album.clone();
+        self.join_continues = continues;
+        self.join_pending = true;
+        self.join_fades = if self.shaping() { self.plan_join(&req).kind != JoinKind::Gapless } else { self.crossfade_frames > 0 && !(self.smart_joins && continues) };
         let finished = self.decode_track(decoder, base_ms, &req);
         self.set_reading(None);
         let decode_errors = finished?;
@@ -945,10 +991,11 @@ impl Worker {
     /// Decode and emit one track from its current position.
     fn body(&mut self, decoder: &mut Decoder, req: &TrackRequest, base_ms: u64) -> std::result::Result<(), Interrupt> {
         let source_rate = decoder.sample_rate;
-        // During a crossfade the device keeps its rate and the incoming track is resampled.
-        // Otherwise a new rate reopens the device. A rate the output mode no longer allows is
-        // never kept.
-        let output_rate = match (self.crossfade_frames > 0, self.current_rate) {
+        // a join that fades into a held tail keeps the device at its rate and resamples the
+        // incoming track to it; a fresh start or a gapless join gets a reopen when the track wants
+        // a new rate. a rate the output mode no longer allows (another device since) is never kept.
+        let fades_into_tail = self.join_fades && !self.held.is_empty();
+        let output_rate = match (fades_into_tail, self.current_rate) {
             (true, Some(current)) if self.mode.accepts(current) => current,
             _ => self.mode.rate_for(source_rate),
         };
@@ -964,9 +1011,30 @@ impl Worker {
         }
         // A join that doesn't fade plays the held tail as is, then this track right after it.
         if reopen || !self.join_fades {
-            let held = std::mem::take(&mut self.held);
+            let held: Vec<f32> = std::mem::take(&mut self.held).into();
             self.push_all(&held)?;
         }
+        let plan = (std::mem::take(&mut self.join_pending) && self.shaping() && !self.held.is_empty()).then(|| self.plan_join(req));
+        if let Some(p) = &plan {
+            let id = |slot: Option<&TraitsSlot>| slot.and_then(|s| s.get()).map_or("unmeasured".to_string(), |t| t.song_id.clone());
+            tracing::info!(target: "navia_core::mix", "{} -> {}: {p}", id(self.tail_traits.as_ref()), id(req.traits.as_ref()));
+        }
+        let mut head_target = self.held.len() / OUTPUT_CHANNELS;
+        let mut skip = 0usize;
+        if let Some(p) = &plan {
+            let rate = self.current_rate.unwrap_or(DEFAULT_RATE);
+            let start = ms_to_frames(p.start_before_ms, rate).min(head_target);
+            let overlap = ms_to_frames(p.overlap_ms, rate).min(start);
+            // written before this song starts, so a queue change meanwhile keeps the held song's end.
+            self.release_held(head_target - start)?;
+            // the outgoing song has faded out by the overlap's end; the rest is never heard.
+            self.held.truncate(overlap * OUTPUT_CHANNELS);
+            head_target = overlap;
+            skip = ms_to_frames(p.skip_ms, rate);
+        }
+        self.tail_traits = req.traits.clone();
+        self.tail_gain = req.opener.gain();
+        self.last_spot = req.album.clone();
         if source_rate != output_rate && self.resampler.is_none() {
             match StreamResampler::new(source_rate, output_rate) {
                 Ok(r) => self.resampler = Some(r),
@@ -982,7 +1050,8 @@ impl Worker {
         self.current_rate = Some(output_rate);
         self.chain.set_output(output_rate, OUTPUT_CHANNELS);
 
-        let held_frames = self.held.len() / 2;
+        let start_ms = base_ms + plan.as_ref().map_or(0, |p| u64::from(p.skip_ms));
+        let held_frames = self.held.len() / OUTPUT_CHANNELS;
         // Start of this track in output frames, excluding the crossfade overlap.
         let mut start_frame = self.written + held_frames as u64;
         if let Some(r) = self.resampler.as_ref() {
@@ -990,8 +1059,7 @@ impl Worker {
         }
 
         let mut block = Vec::new();
-        let mut head_target = held_frames;
-        let mut head: Vec<f32> = Vec::with_capacity(self.held.len());
+        let mut head: Vec<f32> = Vec::with_capacity(head_target * OUTPUT_CHANNELS);
         let mut started = false;
         let mut out = Vec::new();
         let mut decoded_frames = 0u64;
@@ -1029,6 +1097,14 @@ impl Worker {
                 None => out.extend_from_slice(&block),
             }
             let mut data = &out[..];
+            if skip > 0 {
+                let take = (skip * OUTPUT_CHANNELS).min(data.len());
+                data = &data[take..];
+                skip -= take / OUTPUT_CHANNELS;
+                if data.is_empty() {
+                    continue;
+                }
+            }
             if head_target > 0 && head.len() / 2 < head_target {
                 let take = (head_target * 2 - head.len()).min(data.len());
                 head.extend_from_slice(&data[..take]);
@@ -1036,12 +1112,12 @@ impl Worker {
                 if head.len() / 2 < head_target {
                     continue;
                 }
-                self.signal_start(req.token, start_frame - head_target as u64, output_rate, reopen, head_target, base_ms);
+                self.signal_start(req.token, start_frame - head_target as u64, output_rate, reopen, head_target, start_ms);
                 started = true;
-                self.mix_overlap(&head)?;
+                self.mix_overlap(&head, plan.as_ref())?;
                 head_target = 0;
             } else if !started && head_target == 0 {
-                self.signal_start(req.token, start_frame, output_rate, reopen, 0, base_ms);
+                self.signal_start(req.token, start_frame, output_rate, reopen, 0, start_ms);
                 started = true;
             }
             self.emit_with_hold(data)?;
@@ -1050,16 +1126,17 @@ impl Worker {
         // The track ended while collecting the crossfade head, so it's shorter than the fade.
         if head_target > 0 && !head.is_empty() {
             let overlap = head.len() / 2;
-            self.signal_start(req.token, start_frame - overlap as u64, output_rate, reopen, overlap, base_ms);
+            self.signal_start(req.token, start_frame - overlap as u64, output_rate, reopen, overlap, start_ms);
             started = true;
-            self.mix_overlap(&head)?;
+            self.mix_overlap(&head, plan.as_ref())?;
         }
         if !started {
-            self.signal_start(req.token, start_frame, output_rate, reopen, 0, base_ms);
+            self.signal_start(req.token, start_frame, output_rate, reopen, 0, start_ms);
         }
-        // Without a crossfade the resampler persists for gapless. With Smart, the next join may
-        // be gapless, so the run ends at the next track's start once that's known.
-        if self.crossfade_frames > 0 && !self.smart_joins && let Some(mut r) = self.resampler.take() {
+        // Without a crossfade there is nothing to hold; the resampler persists for gapless. With
+        // Smart the next join may be gapless, so the run ends at the next track's start instead,
+        // once it's known whether that join fades.
+        if self.crossfade_frames > 0 && !self.smart_joins && !self.smart_transitions && let Some(mut r) = self.resampler.take() {
             let mut sink = Vec::new();
             r.finish(&mut sink);
             self.emit_with_hold(&sink)?;
@@ -1068,6 +1145,7 @@ impl Worker {
     }
 
     fn signal_start(&mut self, token: usize, frame: u64, rate: u32, reopen: bool, overlap: usize, start_ms: u64) {
+        self.held_owner = Some(token);
         if self.started.len() >= STARTED_KEPT {
             self.started.remove(0);
         }
@@ -1106,8 +1184,8 @@ impl Worker {
                 return Err(self.finish_interrupted(i));
             }
         }
-        let held = std::mem::take(&mut self.held);
-        // Marker first, so the output never sees the ring run dry without knowing why.
+        let held: Vec<f32> = std::mem::take(&mut self.held).into();
+        // The marker goes first so the output never sees the ring run dry without knowing why.
         self.send_marker(self.written + (held.len() / OUTPUT_CHANNELS) as u64, MarkerKind::QueueEnd);
         if let Err(i) = self.push_all(&held) {
             return Err(self.finish_interrupted(i));
@@ -1128,12 +1206,16 @@ impl Worker {
         }
     }
 
-    /// Mix the held tail with `head`, then emit the result.
-    fn mix_overlap(&mut self, head: &[f32]) -> std::result::Result<(), Interrupt> {
+    /// mix the held tail with `head`, then emit the result. a smart transition's `plan` shapes the mix.
+    fn mix_overlap(&mut self, head: &[f32], plan: Option<&Transition>) -> std::result::Result<(), Interrupt> {
         let frames = head.len() / 2;
-        let tail = std::mem::take(&mut self.held);
+        let tail: Vec<f32> = std::mem::take(&mut self.held).into();
         let (pre, overlap_tail) = tail.split_at(tail.len() - head.len());
         self.push_all(pre)?;
+        if let Some(plan) = plan {
+            let mixed = transition::mix(overlap_tail, head, self.current_rate.unwrap_or(DEFAULT_RATE), plan);
+            return self.push_all(&mixed);
+        }
         let mut mixed = Vec::with_capacity(head.len());
         for k in 0..frames {
             let t = (k as f32 + 0.5) / frames as f32;
@@ -1145,23 +1227,74 @@ impl Worker {
     }
 
     fn emit_with_hold(&mut self, data: &[f32]) -> std::result::Result<(), Interrupt> {
-        let hold = self.crossfade_frames * 2;
+        let hold = self.hold_frames() * OUTPUT_CHANNELS;
         if hold == 0 {
             return self.push_all(data);
         }
-        self.held.extend_from_slice(data);
+        self.held.extend(data.iter().copied());
         if self.held.len() > hold {
             let excess = self.held.len() - hold;
-            let tail = self.held.split_off(excess);
-            let release = std::mem::replace(&mut self.held, tail);
+            let release: Vec<f32> = self.held.drain(..excess).collect();
             self.push_all(&release)?;
         }
         Ok(())
     }
 
-    /// How long to wait for `needed` frames to drain from a full ring, at the faster of the
-    /// measured and nominal rate. Paused waits are longer. The cap keeps the output from running
-    /// dry while this sleeps.
+    /// write the first `frames` of the held tail, dropping from it only what was written, so an
+    /// interrupt leaves the rest held.
+    fn release_held(&mut self, frames: usize) -> std::result::Result<(), Interrupt> {
+        let mut left = frames;
+        while left > 0 {
+            let n = left.min(RELEASE_CHUNK_FRAMES);
+            let chunk: Vec<f32> = self.held.range(..n * OUTPUT_CHANNELS).copied().collect();
+            let before = self.written;
+            let pushed = self.push_all(&chunk);
+            let done = (self.written - before) as usize;
+            self.held.drain(..done * OUTPUT_CHANNELS);
+            pushed?;
+            left -= done;
+        }
+        Ok(())
+    }
+
+    /// whether joins are shaped from measured edges: smart transitions with a crossfade set.
+    fn shaping(&self) -> bool {
+        self.smart_transitions && self.crossfade_frames > 0
+    }
+
+    /// how much of the song being decoded to hold back for its join: the crossfade, or with
+    /// smart transitions as much as its measured end may need.
+    fn hold_frames(&self) -> usize {
+        let edges = self.tail_traits.as_ref().and_then(|slot| slot.get()).and_then(|t| t.edges.as_ref());
+        match edges {
+            Some(edges) if self.shaping() => {
+                let ms = transition::hold_ms(edges).min(crate::audio::edges::EDGE_WINDOW_MS as u32);
+                self.crossfade_frames.max(ms_to_frames(ms, self.current_rate.unwrap_or(DEFAULT_RATE)))
+            }
+            _ => self.crossfade_frames,
+        }
+    }
+
+    /// the smart transition from the held song into `req`.
+    fn plan_join(&self, req: &TrackRequest) -> Transition {
+        let rate = self.current_rate.unwrap_or(DEFAULT_RATE);
+        let out = self.tail_traits.as_ref().and_then(|slot| slot.get()).cloned();
+        let inc = req.traits.as_ref().and_then(|slot| slot.get()).cloned();
+        transition::plan(transition::Join {
+            out: out.as_deref(),
+            inc: inc.as_deref(),
+            out_gain: self.tail_gain,
+            in_gain: req.opener.gain(),
+            continues: self.join_continues,
+            plain_ms: frames_to_ms(self.crossfade_frames, rate),
+            held_ms: frames_to_ms(self.held.len() / OUTPUT_CHANNELS, rate),
+        })
+    }
+
+    /// How long to wait for room in a full ring before trying again: until `needed` frames
+    /// (at least a share of the ring) have drained at the output rate, measured or nominal,
+    /// whichever is faster. Paused, nothing drains, so it waits longer. A command ends any wait at once, and the cap stays well under the
+    /// ring's length, so the output never runs dry while this sleeps, even right after a resume.
     fn full_ring_wait(&mut self, needed: usize) -> Duration {
         // After a flush the ring holds frames the output is about to skip, which takes one
         // callback. Check often, since a seek or skip waits on it.
@@ -1180,7 +1313,7 @@ impl Worker {
         }
         self.drain_mark = Some((now, heard));
         let capacity = self.prod.capacity().get() / OUTPUT_CHANNELS;
-        let nominal = f64::from(self.current_rate.unwrap_or(48_000).max(1));
+        let nominal = f64::from(self.current_rate.unwrap_or(DEFAULT_RATE).max(1));
         let rate = self.drain_rate.max(nominal) as u64;
         let frames = needed.max(capacity / REFILL_SHARE).min(capacity / 2) as u64;
         let ring = Duration::from_micros(capacity as u64 * 1_000_000 / rate);
@@ -1218,6 +1351,14 @@ impl Worker {
         }
         Ok(())
     }
+}
+
+fn ms_to_frames(ms: u32, rate: u32) -> usize {
+    (u64::from(ms) * u64::from(rate) / 1000) as usize
+}
+
+fn frames_to_ms(frames: usize, rate: u32) -> u32 {
+    (frames as u64 * 1000 / u64::from(rate.max(1))) as u32
 }
 
 /// Equal-power gains at position `t` in 0..1, as (outgoing, incoming).

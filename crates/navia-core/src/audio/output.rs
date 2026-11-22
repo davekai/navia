@@ -38,6 +38,11 @@ pub trait OutputHandle {
     fn failed(&self) -> bool;
     /// Rate of the device, in frames per second.
     fn rate(&self) -> u32;
+    /// the rate the device itself runs at, for showing; `None` where something between may
+    /// convert the stream (the Linux sound server, an ALSA plugin), so the stream's rate isn't it
+    fn device_rate(&self) -> Option<u32> {
+        Some(self.rate())
+    }
     /// Device-side buffer overruns or underruns reported by the system.
     fn xruns(&self) -> u64;
     /// True when the device's own volume follows the volume control, as on AirPlay.
@@ -172,6 +177,18 @@ impl CpalBackend {
         Ok(if stereo.is_empty() { configs } else { stereo })
     }
 
+    /// CoreAudio moves the device to the stream's rate; WASAPI's shared mode converts to the
+    /// mix format's; on Linux ALSA's default device is often a converting plugin, so unknown
+    fn device_rate_of(device: &cpal::Device, rate: u32) -> Option<u32> {
+        if cfg!(target_os = "macos") {
+            Some(rate)
+        } else if cfg!(target_os = "windows") {
+            device.default_output_config().ok().map(|c| c.sample_rate())
+        } else {
+            None
+        }
+    }
+
     fn caps_of(device: &cpal::Device) -> Result<DeviceCaps> {
         let rates = Self::stereo_ranges(device)?.iter().map(|c| (c.min_sample_rate(), c.max_sample_rate())).collect();
         let default_rate = device.default_output_config().map_err(|e| cpal_err("default config", e))?.sample_rate();
@@ -217,7 +234,7 @@ impl CpalBackend {
             other => return Err(Error::Audio(format!("unsupported device sample format {other:?}"))),
         }?;
         stream.play().map_err(|e| cpal_err("start stream", e))?;
-        Ok(Box::new(CpalHandle { _stream: stream, shared, rate, render_shared }))
+        Ok(Box::new(CpalHandle { _stream: stream, shared, rate, device_rate: Self::device_rate_of(device, rate), render_shared }))
     }
 }
 
@@ -323,6 +340,7 @@ struct CpalHandle {
     _stream: cpal::Stream,
     shared: Arc<HandleState>,
     rate: u32,
+    device_rate: Option<u32>,
     /// Where the heard latency goes, reset when the device closes.
     render_shared: Arc<crate::audio::render::RenderShared>,
 }
@@ -360,6 +378,10 @@ impl OutputHandle for CpalHandle {
 
     fn rate(&self) -> u32 {
         self.rate
+    }
+
+    fn device_rate(&self) -> Option<u32> {
+        self.device_rate
     }
 
     fn xruns(&self) -> u64 {

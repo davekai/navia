@@ -145,7 +145,6 @@ struct Doc {
     name_len: u16,
 }
 
-
 /// One document's fields, ready to index.
 struct Row {
     rowid: i64,

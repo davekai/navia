@@ -10,7 +10,7 @@ use tokio::time::Instant;
 use crate::autoplay::song_version;
 use crate::client::{Client, Song};
 pub use crate::deezer::{Deezer, DeezerError, DeezerTrack, Gate};
-use crate::lanyard::matching::{find_named, key, names};
+use crate::lanyard::matching::{find_named_or_bare, key, names};
 use crate::library::Library;
 
 /// Songs per radio, and how many the server's radio is asked for.
@@ -138,7 +138,7 @@ impl Taken {
 }
 
 /// The library's artist names, as [`key`]s (every name of a joined credit).
-pub(crate) fn owned_artists(db: &Library) -> HashSet<String> {
+pub fn owned_artists(db: &Library) -> HashSet<String> {
     let mut out = HashSet::new();
     for artist in db.list_artists(0, u32::MAX).unwrap_or_default() {
         out.insert(key(&artist.name));
@@ -152,7 +152,8 @@ fn artist_owned(owned: &HashSet<String>, track: &DeezerTrack) -> bool {
     owned.contains(&key(&track.artist.name)) || names(&track.artist.name).iter().any(|n| owned.contains(n))
 }
 
-/// Each track's library song by name, or `None`.
+/// each track's library song by name (the names as given, then bare: `find_named_or_bare`), or
+/// `None`.
 pub(crate) fn match_by_name(db: &Library, tracks: &[DeezerTrack], owned: &HashSet<String>) -> Vec<Option<Song>> {
     tracks
         .iter()
@@ -160,7 +161,7 @@ pub(crate) fn match_by_name(db: &Library, tracks: &[DeezerTrack], owned: &HashSe
             if !artist_owned(owned, t) {
                 return None;
             }
-            find_named(db, &t.title, &[t.artist.name.as_str()], &t.album.title, t.duration.map(|d| d * 1000)).map(|(_, s)| s)
+            find_named_or_bare(db, &t.title, &[t.artist.name.as_str()], &t.album.title, t.duration.map(|d| d * 1000)).map(|(_, s)| s)
         })
         .collect()
 }

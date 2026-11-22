@@ -59,7 +59,10 @@ async fn plain_subsonic_server_has_no_extensions_and_does_not_fail() {
     let c = Capabilities::detect(&server.read_only_client(), None).await.unwrap();
     assert!(c.extensions.is_empty());
     assert_eq!(c.synced_lyrics.support, Support::Unavailable);
-    assert_eq!(server.calls("getOpenSubsonicExtensions"), 0);
+    // only the request style's ask, which carries no credentials
+    let asks: Vec<_> = server.sent().into_iter().filter(|r| r.endpoint == "getOpenSubsonicExtensions").collect();
+    assert_eq!(asks.len(), 1);
+    assert!(!asks[0].credentials_in_url() && !asks[0].credentials_in_body());
 }
 
 #[tokio::test(flavor = "multi_thread")]

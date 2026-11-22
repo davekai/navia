@@ -152,7 +152,6 @@ fn buffer_attr(rate: u32) -> protocol::stream::BufferAttr {
     protocol::stream::BufferAttr { max_length: bytes(BUFFER_MS), target_length: bytes(BUFFER_MS), minimum_request_length: bytes(REQUEST_MS), ..Default::default() }
 }
 
-/// Frames in `ms` at `rate`.
 fn ms_frames(ms: u32, rate: u32) -> u64 {
     u64::from(rate) * u64::from(ms) / 1000
 }
@@ -563,6 +562,11 @@ impl OutputHandle for PulseHandle {
 
     fn rate(&self) -> u32 {
         self.state.rate
+    }
+
+    // the sound server converts to the sink's rate as it likes
+    fn device_rate(&self) -> Option<u32> {
+        None
     }
 
     fn xruns(&self) -> u64 {

@@ -24,7 +24,6 @@ pub struct AesCbcCipher {
 }
 
 impl AesCbcCipher {
-    /// Create cipher with 16-byte key and IV.
     pub fn new(key: [u8; 16], iv: [u8; 16]) -> Self {
         Self { key, iv }
     }
@@ -50,7 +49,6 @@ impl AesCbcCipher {
                 block[i] = chunk[i] ^ prev_block[i];
             }
 
-            // Encrypt in place
             let block_arr = aes::Block::from_mut_slice(&mut block);
             cipher.encrypt_block(block_arr);
 
@@ -79,7 +77,6 @@ impl AesCbcCipher {
             let mut block = [0u8; 16];
             block.copy_from_slice(chunk);
 
-            // Decrypt
             let block_arr = aes::Block::from_mut_slice(&mut block);
             cipher.decrypt_block(block_arr);
 
@@ -100,12 +97,10 @@ impl AesCbcCipher {
         self.iv = iv;
     }
 
-    /// Get the stored IV.
     pub fn iv(&self) -> &[u8; 16] {
         &self.iv
     }
 
-    /// Get the stored key.
     pub fn key(&self) -> &[u8; 16] {
         &self.key
     }
@@ -126,8 +121,7 @@ pub fn aes_gcm_encrypt(
     // We increment the last byte as the nonce (matching the C code: iv[15]++)
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes.copy_from_slice(&iv[..12]);
-    // The C code increments iv[15], but GCM only uses 12 bytes
-    // We use the first 12 bytes as the nonce
+    // GCM uses only the first 12 bytes.
     let nonce = GcmNonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher.encrypt(nonce, plaintext)
@@ -159,7 +153,6 @@ pub fn aes_gcm_decrypt(
     nonce_bytes.copy_from_slice(&iv[..12]);
     let nonce = GcmNonce::from_slice(&nonce_bytes);
 
-    // Combine ciphertext and tag for decryption
     let mut combined = Vec::with_capacity(ciphertext.len() + 16);
     combined.extend_from_slice(ciphertext);
     combined.extend_from_slice(tag);
@@ -171,7 +164,7 @@ pub fn aes_gcm_decrypt(
 /// AES-128-CTR encryption for fruit pair-verify.
 ///
 /// Used in pair-verify phase 2 to encrypt the signature.
-/// Note: CTR mode encryption and decryption are the same operation.
+/// CTR encryption and decryption are the same operation.
 pub fn aes_ctr_encrypt(
     plaintext: &[u8],
     key: &[u8; 16],
@@ -184,8 +177,6 @@ pub fn aes_ctr_encrypt(
 }
 
 /// AES-128-CTR decryption for fruit pair-verify.
-///
-/// Note: CTR mode encryption and decryption are the same operation.
 pub fn aes_ctr_decrypt(
     ciphertext: &[u8],
     key: &[u8; 16],
@@ -198,10 +189,6 @@ impl AesCbcCipher {
     /// RAOP encryption: only full 16-byte blocks are encrypted, trailing
     /// bytes pass through unencrypted. The IV is always reset to the
     /// original IV (stored at construction) before each call.
-    ///
-    /// This matches the AirPlay 1 / RAOP audio encryption behavior where
-    /// each RTP packet is encrypted independently using the same key and
-    /// original IV.
     pub fn encrypt_raop(&self, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let full_blocks = payload.len() / 16;
         let full_len = full_blocks * 16;
@@ -211,10 +198,8 @@ impl AesCbcCipher {
             return Ok(payload.to_vec());
         }
 
-        // Encrypt only the full-block portion using CBC with the stored IV
         let encrypted_blocks = self.encrypt(&payload[..full_len])?;
 
-        // Concatenate encrypted blocks + trailing unencrypted bytes
         let mut result = Vec::with_capacity(payload.len());
         result.extend_from_slice(&encrypted_blocks);
         result.extend_from_slice(&payload[full_len..]);
@@ -317,7 +302,6 @@ mod tests {
 
         assert_eq!(ciphertext, expected_ciphertext);
 
-        // Verify decryption
         let decrypted = cipher.decrypt(&ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
     }
@@ -352,7 +336,6 @@ mod tests {
 
         assert_eq!(ciphertext, expected_ciphertext);
 
-        // Verify decryption
         let decrypted = cipher.decrypt(&ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
     }
@@ -429,10 +412,8 @@ mod tests {
 
     #[test]
     fn key_zeroized_on_drop() {
-        // Create cipher, drop it, verify memory is cleared
-        // This is verified by the ZeroizeOnDrop derive
+        // ZeroizeOnDrop clears the key; nothing to observe here.
         let cipher = AesCbcCipher::new([0x42u8; 16], [0x24u8; 16]);
         drop(cipher);
-        // The ZeroizeOnDrop derive ensures the key is cleared
     }
 }

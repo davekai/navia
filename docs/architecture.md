@@ -12,21 +12,29 @@ The GPUI app calls the core directly. The Mac app reaches it through UniFFI bind
 - `client/`: talks to the server. Navia is a Navidrome client first, then OpenSubsonic, then plain Subsonic.
   `native.rs` uses Navidrome's own API for sync counts, discography, scrobble history, playlist images and smart
   playlist rules. The rest is the OpenSubsonic API, with extensions when the server has them. `capabilities`
-  records what the server supports.
+  records what the server supports. `form.rs` sends the credentials in a POST body instead of the URL when the
+  server offers OpenSubsonic `formPost`.
 - `library/`: the local SQLite database and its FTS5 search index. The first sync pages through the whole
-  library. After that, background refreshes pick up stars, play counts, playlists and new albums. Browse pages,
-  genres, discography and Home rows are queries over this database.
+  library. After that, a sync fetches only what changed on the server, and background refreshes pick up stars,
+  play counts, playlists and new albums. Browse pages, genres, discography, Home rows and the album page's
+  copyright line are queries over this database.
 - `audio/`: the playback engine. Symphonia decodes, with libopus for Opus. `rubato` resamples and `cpal` plays.
   Gapless and crossfade are sample-accurate. AAC gapless reads MP4 edit lists and iTunSMPB directly. Songs stream
   over HTTP range requests, and formats Navia can't decode are transcoded by the server. ReplayGain, the
-  equalizer, internet radio (`live.rs`) and AirPlay output (`airplay/`) are here too.
+  equalizer, internet radio (`live.rs`) and AirPlay output (`airplay/`) are here too. The Mix transition measures
+  each song's first and last seconds once (`edges.rs`) and plans every join from them (`transition.rs`): its
+  length, beat alignment and loudness. Beats and tempo come from aubio, in `crates/navia-aubio`.
 - `play_queue`, `queue_order`, `queue_sync`: the queue, shuffle and repeat, and saving the queue to the server so
   another device can resume it.
 - `engine/`, `autoplay`, `recommend`, `artist_radio`: the recommendation engine behind Autoplay, song and artist
   radio, and mixes. See [autoplay.md](autoplay.md). `deezer` is a cached, rate-limited client for Deezer's public
-  API, used only when the user turns it on.
+  API, used only when the user turns it on. `listenbrainz` asks ListenBrainz for similar songs under the same
+  switch. `upcoming` (announced albums by library artists) and `album_heat` (each album song's popularity) also
+  come from Deezer.
 - `reporting`: scrobbles and now playing. Reports made offline are sent later.
 - `downloads`, `songcache`: offline downloads, and the cache of played songs.
+- `artwork`, `covers`: cover art on disk, animated covers (`artwork/animated.rs`), and the ready-made playlist
+  covers the New Playlist dialog uploads.
 - `smart_editor`, `smart_rules`, `song_filters`, `artist_filters`: the smart playlist editor and the filters.
   Their labels are translation keys, so both apps share them.
 - `listen_along`, `lanyard/`: listening along with someone on the same server, or with a friend's Spotify
@@ -43,6 +51,11 @@ commands back through a trait, so the player doesn't depend on them. The Mac app
 
 UniFFI bindings that expose the core to Swift. `build-xcframework.sh` builds them as an xcframework. It isn't a
 workspace member, since it only builds for Apple targets.
+
+### `crates/navia-aubio`
+
+aubio's beat tracker, tempo estimate and onset detector, built from the vendored C source in `aubio/` and linked
+statically.
 
 ### `crates/airplay`
 

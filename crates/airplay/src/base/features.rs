@@ -80,7 +80,6 @@ impl Features {
             ));
         }
 
-        // Helper to parse a hex value with optional 0x prefix
         fn parse_hex(part: &str) -> Result<u64, ParseError> {
             let part = part.trim();
             let hex_str = part
@@ -110,17 +109,14 @@ impl Features {
         Ok(Self(lower | (upper << 32)))
     }
 
-    /// Create from raw 64-bit value.
     pub fn from_raw(value: u64) -> Self {
         Self(value)
     }
 
-    /// Get raw 64-bit value.
     pub fn raw(&self) -> u64 {
         self.0
     }
 
-    /// Format as TXT record value.
     pub fn to_txt_value(&self) -> String {
         let lower = self.0 & 0xFFFF_FFFF;
         let upper = self.0 >> 32;
@@ -283,17 +279,14 @@ impl Features {
     /// 3. FairPlay - if bit 14 is set
     /// 4. None - no authentication required
     pub fn auth_method(&self) -> AuthMethod {
-        // MFi takes absolute priority - if set, we can't connect
         if self.requires_mfi() {
             return AuthMethod::MfiRequired;
         }
 
-        // HomeKit transient pairing: bit 51 without bit 26, or bit 48
         if self.supports_unified_pair_mfi() || self.supports_transient_pairing() {
             return AuthMethod::HomeKitTransient;
         }
 
-        // FairPlay authentication
         if self.requires_fairplay() {
             return AuthMethod::FairPlay;
         }
@@ -361,13 +354,11 @@ mod tests {
 
         #[test]
         fn roundtrip_to_txt_value() {
-            // Test single value roundtrip
             let original = Features::from_raw(0x445F8A00);
             let txt = original.to_txt_value();
             let parsed = Features::from_txt_value(&txt).unwrap();
             assert_eq!(original.0, parsed.0);
 
-            // Test 64-bit value roundtrip
             let original = Features::from_raw(0x1C340_445F8A00);
             let txt = original.to_txt_value();
             let parsed = Features::from_txt_value(&txt).unwrap();
@@ -496,7 +487,6 @@ mod tests {
         #[test]
         fn auth_method_priority_order() {
             // MFi > HomeKit > FairPlay > None
-            // If MFi is set, it always takes priority
             let features = Features::from_raw((1 << 26) | (1 << 51) | (1 << 14));
             assert_eq!(features.auth_method(), AuthMethod::MfiRequired);
 
@@ -515,55 +505,40 @@ mod tests {
 
         #[test]
         fn apple_tv_4k_features() {
-            // Test with actual Apple TV 4K feature string from CLAUDE.md
-            // features=0x445F8A00,0x1C340
-            // Note: This particular device has bit 26 (MFi) set but NOT bit 51 (Unified),
-            // meaning it requires MFi hardware authentication. Different Apple TV
-            // configurations or firmware versions may have different feature sets.
+            // a real Apple TV 4K feature string: bit 26 (MFi) set and bit 51 not, so it needs MFi.
             let features = Features::from_txt_value("0x445F8A00,0x1C340").unwrap();
 
-            // Verify it parses correctly
             assert_eq!(features.0, 0x1C340_445F8A00);
 
-            // Apple TV 4K supports AirPlay 2 features
             assert!(features.supports_audio()); // bit 9
             assert!(features.supports_buffered_audio()); // bit 40
             assert!(features.supports_ptp()); // bit 41
 
-            // This device has bit 26 set and bit 51 NOT set
             assert!(features.requires_mfi()); // bit 26 IS set
             assert!(!features.supports_unified_pair_mfi()); // bit 51 NOT set
 
-            // Per requirements: if bit 26 is set, return MfiRequired
             assert_eq!(features.auth_method(), AuthMethod::MfiRequired);
         }
 
         #[test]
         fn device_supporting_homekit_transient() {
-            // A device that supports HomeKit transient pairing (bit 51 without bit 26)
-            // This is the configuration open-source implementations can connect to
-            // Using the spec's minimum AirPlay 2 features: 0x40000a00,0x80300
+            // HomeKit transient (bit 51 without bit 26), with the spec's minimum AirPlay 2 features.
             let features = Features::from_txt_value("0x40000a00,0x80300").unwrap();
 
-            // Should have key AirPlay 2 bits
             assert!(features.supports_audio()); // bit 9
             assert!(features.supports_redundant_audio()); // bit 11
             assert!(features.supports_buffered_audio()); // bit 40
             assert!(features.supports_ptp()); // bit 41
             assert!(features.supports_unified_pair_mfi()); // bit 51
 
-            // Should NOT require MFi (bit 26 not set)
             assert!(!features.requires_mfi());
 
-            // Can connect using HomeKit transient pairing
             assert_eq!(features.auth_method(), AuthMethod::HomeKitTransient);
         }
 
         #[test]
         fn homepod_mini_features() {
-            // HomePod Mini typically has similar features to Apple TV
-            // Using a representative feature string: 0x40000a00,0x80300
-            // This includes bits 9, 11, 40, 41, 51
+            // a representative HomePod mini feature string.
             let features = Features::from_txt_value("0x40000a00,0x80300").unwrap();
 
             assert!(features.supports_audio()); // bit 9
@@ -572,24 +547,20 @@ mod tests {
             assert!(features.supports_ptp()); // bit 41
             assert!(features.supports_unified_pair_mfi()); // bit 51
 
-            // Should NOT require MFi
             assert!(!features.requires_mfi());
 
-            // Should use HomeKit transient pairing
             assert_eq!(features.auth_method(), AuthMethod::HomeKitTransient);
         }
 
         #[test]
         fn airplay_1_legacy_device_features() {
-            // Legacy AirPlay 1 device with only 32-bit features
-            // Typically has audio support (bit 9) but no buffered audio
+            // legacy AirPlay 1: 32-bit features, audio but no buffered audio.
             let features = Features::from_txt_value("0x200").unwrap();
 
             assert!(features.supports_audio()); // bit 9
             assert!(!features.supports_buffered_audio());
             assert!(!features.supports_ptp());
 
-            // Legacy device might have no auth or FairPlay
             assert_eq!(features.auth_method(), AuthMethod::None);
         }
     }

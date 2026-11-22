@@ -82,7 +82,6 @@ pub struct AesCbcPacketCipher {
 }
 
 impl AesCbcPacketCipher {
-    /// Create a new AES-CBC packet cipher with the given key and IV.
     pub fn new(key: [u8; 16], iv: [u8; 16]) -> Self {
         Self { key, iv }
     }
@@ -96,7 +95,6 @@ impl PacketCipher for AesCbcPacketCipher {
         _ssrc: u32,
         _sequence: u16,
     ) -> Result<EncryptedPayload> {
-        // Create a fresh cipher with the original IV for each packet
         let cipher = AesCbcCipher::new(self.key, self.iv);
         let encrypted = cipher
             .encrypt_raop(payload)

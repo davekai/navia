@@ -8,10 +8,7 @@
 
 use md5::{Digest, Md5};
 
-/// Compute a Digest Authentication `Authorization` header value per RFC 2617.
-///
-/// `www_authenticate` is the value of the `WWW-Authenticate` header from the 401 response.
-/// Returns a complete `Digest ...` string suitable for the `Authorization` header.
+/// the `Authorization` value answering a 401's `WWW-Authenticate` challenge, per RFC 2617.
 pub fn compute_digest_response(
     username: &str,
     password: &str,
@@ -32,9 +29,7 @@ pub fn compute_digest_response(
     ))
 }
 
-/// Extract a quoted field value from a Digest challenge header.
-///
-/// Looks for `field="value"` in the header string.
+/// the value of `field="value"` in a digest challenge.
 fn extract_field<'a>(header: &'a str, field: &str) -> Option<&'a str> {
     let pattern = format!("{}=\"", field);
     let start = header.find(&pattern)? + pattern.len();
@@ -43,12 +38,10 @@ fn extract_field<'a>(header: &'a str, field: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-/// Compute MD5 hex digest of the given input.
 fn md5_hex(input: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_bytes());
     let result = hasher.finalize();
-    // Format as lowercase hex
     result.iter().map(|b| format!("{:02x}", b)).collect()
 }
 

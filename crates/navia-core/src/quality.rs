@@ -431,7 +431,7 @@ impl QualityControl {
                 return false;
             }
             let Ok(url) = self.client.extensions_url() else { return false };
-            let Ok(resp) = self.http.get(url).send() else { return false };
+            let Ok(resp) = self.client.form_post().request_blocking(&self.http, &url).send() else { return false };
             let Ok(value) = resp.json::<Value>() else { return false };
             value.get("subsonic-response").and_then(|r| r.get("openSubsonicExtensions")).and_then(Value::as_array).is_some_and(|list| {
                 list.iter().any(|e| e.get("name").and_then(Value::as_str) == Some("transcoding"))

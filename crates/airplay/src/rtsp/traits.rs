@@ -8,13 +8,10 @@ use crate::rtsp::{RtspRequest, RtspResponse};
 #[async_trait]
 #[cfg_attr(test, mockall::automock)]
 pub trait RtspTransport: Send + Sync {
-    /// Send RTSP request and receive response.
     async fn send(&mut self, request: RtspRequest) -> Result<RtspResponse>;
     
-    /// Check if connected.
     fn is_connected(&self) -> bool;
     
-    /// Close the connection.
     async fn close(&mut self) -> Result<()>;
 }
 
@@ -27,7 +24,6 @@ mod tests {
     async fn mock_transport_returns_configured_response() {
         let mut mock = MockRtspTransport::new();
 
-        // Configure the mock to return a specific response
         mock.expect_send().returning(|_request| {
             Box::pin(async {
                 Ok(RtspResponse {
@@ -41,7 +37,6 @@ mod tests {
 
         mock.expect_is_connected().returning(|| true);
 
-        // Call the mock
         let request = RtspRequest::new(crate::rtsp::RtspMethod::Get, "/info");
         let response = mock.send(request).await.unwrap();
 

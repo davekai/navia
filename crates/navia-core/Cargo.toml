@@ -28,19 +28,23 @@ ringbuf = "=0.6.0"
 audioadapter-buffers = "=5.2.0"
 opusic-sys = { version = "=0.7.7", default-features = false, optional = true }
 cpal = "=0.18.2"
+navia-aubio = { path = "../navia-aubio" }
 tempfile = "3"
-image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "qoi"] }
 fast_image_resize = { version = "=6.1.0", features = ["image"] }
+# The ready-made playlist covers (`covers`): a software canvas and the title's glyph outlines. Both are already in the
+# tree through GPUI.
+tiny-skia = { version = "=0.11.4", default-features = false, features = ["std", "simd"] }
+ttf-parser = { version = "=0.25.1", default-features = false, features = ["std"] }
 # Lanyard's presence socket (Spotify friends). TLS through the same rustls, aws-lc-rs provider and
 # platform verifier that reqwest uses.
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-platform-verifier = "0.7"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-# AirPlay output: the trimmed airplay2-rs protocol pieces (crates/airplay, GPL-3.0-or-later), mDNS
-# discovery in pure Rust (no Avahi or Bonjour library), local addresses to hide this machine's receiver.
+# AirPlay output: the trimmed airplay2-rs protocol pieces (crates/airplay, GPL-3.0-or-later), local
+# addresses to hide this machine's receiver.
 navia-airplay = { path = "../airplay" }
-mdns-sd = "=0.21.7"
 if-addrs = "0.15"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -54,6 +58,10 @@ futures-executor = "0.3"
 # The default output's stream latency (an AirPlay route picked in Control Center), which cpal's
 # timestamps leave out. Already in the tree through cpal.
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "AudioHardware"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# AirPlay discovery in pure Rust (no Avahi or Bonjour library); the Mac uses the system's Bonjour.
+mdns-sd = "=0.21.7"
 
 [target.'cfg(unix)'.dependencies]
 # Free disk space for the song cache (`statvfs`).

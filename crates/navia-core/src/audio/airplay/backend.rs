@@ -159,14 +159,21 @@ impl AirPlay {
                     }
                 }
             });
-            // Sound still works without it. Only the remote buttons don't.
-            match Dacp::start(started.daemon(), self.inner.config.ports.dacp, &self.inner.ids, handler) {
+            // Without it, sound still works; only the receiver's remote buttons don't.
+            match Dacp::start(&started, self.inner.config.ports.dacp, &self.inner.ids, handler) {
                 Ok(dacp) => *self.inner.dacp.lock().expect("dacp") = Some(dacp),
                 Err(e) => tracing::warn!("airplay remote control: {e}"),
             }
             *d = Some(started);
         }
         Ok(())
+    }
+
+    /// ask the network for receivers again, for a list about to be shown or after this machine woke.
+    pub fn rescan(&self) {
+        if let Some(d) = self.inner.discovery.lock().expect("discovery").as_ref() {
+            d.rescan();
+        }
     }
 
     /// Receivers on the network that can take audio, then paired ones that aren't seen now.

@@ -35,7 +35,7 @@ const ART_MISS_TTL: Duration = Duration::from_secs(6 * 3600);
 pub enum StatusText {
     /// The name of the Discord application.
     AppName,
-    /// The default, like Spotify. Shows "♫ Artist" in the member list.
+    /// The default. Shows "♫ Artist" in the member list.
     #[default]
     Artist,
     Song,

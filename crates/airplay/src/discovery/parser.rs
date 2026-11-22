@@ -6,135 +6,109 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use tracing::warn;
 
-/// Parser for mDNS TXT records.
 pub struct TxtRecordParser;
 
 impl TxtRecordParser {
-    /// Parse `_airplay._tcp` service TXT record into a Device.
     pub fn parse_airplay_txt(
         name: &str,
         txt: &HashMap<String, String>,
         addresses: Vec<IpAddr>,
         port: u16,
     ) -> Result<Device, ParseError> {
-        // deviceid is required
         let device_id_str = txt
             .get("deviceid")
             .ok_or(ParseError::MissingField("deviceid"))?;
         let id = DeviceId::from_mac_string(device_id_str)?;
 
-        // Parse features (64-bit format "0xLOWER,0xUPPER")
+        // 64-bit, as "0xLOWER,0xUPPER"
         let features = txt
             .get("features")
             .map(|f| Features::from_txt_value(f))
             .transpose()?
             .unwrap_or_default();
 
-        // Parse model (optional)
         let model = txt.get("model").cloned().unwrap_or_default();
 
-        // Parse source version
         let source_version = txt
             .get("srcvers")
             .map(|v| Version::parse(v))
             .transpose()?
             .unwrap_or_default();
 
-        // Parse Ed25519 public key (optional, 64 hex chars = 32 bytes)
+        // 64 hex chars = 32 bytes
         let public_key = txt
             .get("pk")
             .map(|pk| Self::parse_public_key(pk))
             .transpose()?;
 
-        // Parse password required flag
         let requires_password = txt
             .get("pw")
             .map(|pw| pw == "true" || pw == "1")
             .unwrap_or(false);
 
-        // Parse required sender features
         let required_sender_features = txt
             .get("rsf")
             .map(|f| Features::from_txt_value(f))
             .transpose()?;
 
-        // Parse status/system flags
         let status_flags = txt
             .get("flags")
             .or_else(|| txt.get("sf"))
             .map(|f| Self::parse_hex_or_decimal(f))
             .unwrap_or(0);
 
-        // Parse access control level
         let access_control = txt
             .get("acl")
             .and_then(|v| v.parse::<u8>().ok());
 
-        // Parse firmware version
         let firmware_version = txt.get("fv").cloned();
 
-        // Parse OS version
         let os_version = txt.get("osvers").cloned();
 
-        // Parse protocol version
         let protocol_version = txt.get("protovers").cloned();
 
-        // Parse manufacturer
         let manufacturer = txt.get("manufacturer").cloned();
 
-        // Parse serial number
         let serial_number = txt.get("serialNumber").cloned();
 
-        // Parse Bluetooth address
         let bluetooth_address = txt.get("btaddr").cloned();
 
-        // Parse pairing identities
         let pairing_identity = txt.get("pi").cloned();
         let system_pairing_identity = txt.get("psi").cloned();
 
-        // Parse HomeKit home UUID
         let homekit_home_id = txt.get("hkid").cloned();
 
-        // Parse group UUID
         let group_id = txt
             .get("gid")
             .and_then(|gid| Self::parse_compound_group_uuid("gid", gid));
 
-        // Parse is group leader flag
         let is_group_leader = txt
             .get("igl")
             .map(|igl| igl == "1" || igl == "true")
             .unwrap_or(false);
 
-        // Parse group public name
         let group_public_name = txt.get("gpn").cloned();
 
-        // Parse group contains discoverable leader
         let group_contains_discoverable_leader = txt
             .get("gcgl")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
 
-        // Parse home group ID
         let home_group_id = txt.get("hgid").cloned();
 
-        // Parse household ID
         let household_id = txt.get("hmid").cloned();
 
-        // Parse parent group UUID
         let parent_group_id = txt
             .get("pgid")
             .and_then(|pgid| Self::parse_compound_group_uuid("pgid", pgid));
 
-        // Parse parent group contains discoverable leader
         let parent_group_contains_discoverable_leader = txt
             .get("pgcgl")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
 
-        // Parse tight sync UUID (plain UUID only)
-        // Compound values were only observed in gid/pgid. tsid identifies a stereo pair, so
-        // cutting an unknown format down to its leading UUID could merge two different pairs.
+        // plain UUID only: tsid identifies a stereo pair, so cutting an unknown compound form down
+        // to its leading UUID could merge two different pairs.
         let tight_sync_id = txt
             .get("tsid")
             .and_then(|tsid| Self::parse_group_field_uuid("tsid", tsid));
@@ -180,16 +154,13 @@ impl TxtRecordParser {
         })
     }
 
-    /// Parse `_raop._tcp` service TXT record into a Device.
-    ///
-    /// RAOP service names have format "AABBCCDDEEFF@Device Name".
+    /// RAOP service names have the form "AABBCCDDEEFF@Device Name".
     pub fn parse_raop_txt(
         name: &str,
         txt: &HashMap<String, String>,
         addresses: Vec<IpAddr>,
         port: u16,
     ) -> Result<Device, ParseError> {
-        // Parse name format: "AABBCCDDEEFF@Device Name"
         let at_pos = name
             .find('@')
             .ok_or_else(|| ParseError::InvalidFormat("RAOP name must contain '@'".to_string()))?;
@@ -197,28 +168,25 @@ impl TxtRecordParser {
         let mac_hex = &name[..at_pos];
         let device_name = &name[at_pos + 1..];
 
-        // MAC should be 12 hex chars (bare format)
+        // 12 hex chars, no separators
         let id = DeviceId::from_mac_string(mac_hex)?;
 
-        // Parse features: prefer 'ft' (full 64-bit) over 'sf' (legacy 32-bit status flags)
+        // 'ft' is the full 64-bit features; 'sf' the legacy 32-bit status flags
         let features = if let Some(ft) = txt.get("ft") {
-            // Modern RAOP records have 'ft' with full 64-bit features
             Features::from_txt_value(ft)?
         } else if let Some(sf) = txt.get("sf") {
-            // Legacy fallback to 'sf' field
             Self::parse_legacy_features(sf)?
         } else {
             Features::default()
         };
 
-        // Parse model (optional, often 'am' in RAOP)
+        // RAOP often uses 'am'
         let model = txt
             .get("am")
             .or_else(|| txt.get("model"))
             .cloned()
             .unwrap_or_default();
 
-        // Parse source version from 'vs' or 'vn'
         let source_version = txt
             .get("vs")
             .or_else(|| txt.get("vn"))
@@ -226,40 +194,34 @@ impl TxtRecordParser {
             .transpose()?
             .unwrap_or_default();
 
-        // Parse password required from 'pw'
         let requires_password = txt
             .get("pw")
             .map(|pw| pw == "true" || pw == "1")
             .unwrap_or(false);
 
-        // Parse Ed25519 public key (optional, 64 hex chars = 32 bytes)
+        // 64 hex chars = 32 bytes
         let public_key = txt
             .get("pk")
             .map(|pk| Self::parse_public_key(pk))
             .transpose()?;
 
-        // Parse firmware version
         let firmware_version = txt.get("fv").cloned();
 
-        // Parse OS version (RAOP uses 'ov')
+        // RAOP uses 'ov'
         let os_version = txt.get("ov").cloned();
 
-        // Parse status flags from 'sf'
         let status_flags = txt
             .get("sf")
             .map(|f| Self::parse_hex_or_decimal(f))
             .unwrap_or(0);
 
-        // Parse vodka version
         let vodka_version = txt.get("vv").cloned();
 
-        // Parse digest auth
         let raop_digest_auth = txt
             .get("da")
             .map(|da| da == "true" || da == "1")
             .unwrap_or(false);
 
-        // Parse RAOP-specific TXT fields
         let raop_encryption_types = txt.get("et").map(|et| {
             et.split(',')
                 .filter_map(|s| s.trim().parse::<u8>().ok())
@@ -321,7 +283,6 @@ impl TxtRecordParser {
         })
     }
 
-    /// Parse Ed25519 public key from hex string.
     pub fn parse_public_key(hex: &str) -> Result<[u8; 32], ParseError> {
         let hex = hex.trim();
 
@@ -345,11 +306,8 @@ impl TxtRecordParser {
         Ok(arr)
     }
 
-    /// Parse an optional group identifier that must be a single UUID.
-    ///
-    /// Group identifiers only describe grouping, so an unreadable value is
-    /// logged and treated as absent instead of making the whole receiver
-    /// unusable.
+    /// group identifiers only describe grouping, so an unreadable one is logged and treated as
+    /// absent rather than making the receiver unusable.
     fn parse_group_field_uuid(field: &str, value: &str) -> Option<uuid::Uuid> {
         let parsed = uuid::Uuid::parse_str(value.trim()).ok();
 
@@ -359,20 +317,15 @@ impl TxtRecordParser {
         parsed
     }
 
-    /// Parse `gid` or `pgid`, which may also use a compound form.
-    ///
-    /// Idle HomePod mini stereo pairs (HomePod software 27.0) advertise
-    /// `<UUID1>+1+<UUID2>`, where the leading UUID equals the pair's `tsid`.
-    /// Only the leading UUID is kept and the meaning of the rest is unknown,
-    /// so two values that differ only after the first `+` become equal here.
-    ///
-    /// Revisit this before comparing these IDs or sending them to a receiver.
+    /// `gid` or `pgid`. idle HomePod mini stereo pairs (HomePod software 27.0) advertise
+    /// `<UUID1>+1+<UUID2>`, the leading UUID being the pair's `tsid`. only the leading UUID is
+    /// kept, so values that differ after the first `+` compare equal: revisit this before
+    /// comparing these IDs or sending them to a receiver.
     fn parse_compound_group_uuid(field: &str, value: &str) -> Option<uuid::Uuid> {
         let leading = value.split_once('+').map_or(value, |(head, _)| head);
         Self::parse_group_field_uuid(field, leading)
     }
 
-    /// Parse a hex or decimal string to u64.
     fn parse_hex_or_decimal(s: &str) -> u64 {
         let s = s.trim();
         if s.starts_with("0x") || s.starts_with("0X") {
@@ -382,34 +335,25 @@ impl TxtRecordParser {
         }
     }
 
-    /// Parse legacy 32-bit features from 'sf' field.
-    ///
-    /// The 'sf' field in RAOP records contains a 32-bit value (hex or decimal)
-    /// which is zero-extended to the 64-bit Features format.
+    /// RAOP's 'sf' is a 32-bit value (hex or decimal), zero-extended to 64-bit features.
     pub fn parse_legacy_features(sf: &str) -> Result<Features, ParseError> {
         let sf = sf.trim();
 
-        // Try parsing as hex first (with optional 0x prefix)
         let value = if sf.starts_with("0x") || sf.starts_with("0X") {
             u64::from_str_radix(&sf[2..], 16).map_err(|_| ParseError::InvalidHex(sf.to_string()))?
         } else if sf.chars().all(|c| c.is_ascii_digit()) {
-            // Decimal format
             sf.parse::<u64>()
                 .map_err(|_| ParseError::InvalidValue(format!("invalid decimal: {}", sf)))?
         } else {
-            // Try as bare hex
+            // bare hex
             u64::from_str_radix(sf, 16).map_err(|_| ParseError::InvalidHex(sf.to_string()))?
         };
 
         Ok(Features::from_raw(value))
     }
 
-    /// Merge device info from both AirPlay and RAOP records.
-    ///
-    /// AirPlay record takes priority for features, name, and public_key.
-    /// Addresses are combined from both records.
+    /// the AirPlay record takes priority; addresses are combined from both.
     pub fn merge_device_info(airplay: &Device, raop: &Device) -> Device {
-        // Combine addresses, removing duplicates
         let mut addresses = airplay.addresses.clone();
         for addr in &raop.addresses {
             if !addresses.contains(addr) {
@@ -456,7 +400,6 @@ impl TxtRecordParser {
             parent_group_id: airplay.parent_group_id,
             parent_group_contains_discoverable_leader: airplay.parent_group_contains_discoverable_leader,
             tight_sync_id: airplay.tight_sync_id,
-            // RAOP fields come from the RAOP record
             raop_port: raop.raop_port,
             raop_encryption_types: raop.raop_encryption_types.clone(),
             raop_codecs: raop.raop_codecs.clone(),
@@ -631,9 +574,8 @@ mod tests {
 
         #[test]
         fn keeps_leading_uuid_from_compound_group_ids() {
-            // HomePods can advertise "<UUID>+1+<UUID>" instead of a single UUID in
-            // gid and pgid fields.
-            // Shape captured from idle HomePod mini stereo pair (HomePod software 27.0)
+            // idle HomePod mini stereo pairs (HomePod software 27.0) advertise "<UUID>+1+<UUID>"
+            // in gid and pgid.
             let pair = "1A2B3C4D-38C0-5C20-80E9-6B6A736DC895";
             let compound = format!("{pair}+1+5E6F7A8B-82CB-46DE-AA96-991E357D4F23");
 
@@ -715,11 +657,9 @@ mod tests {
 
         #[test]
         fn parses_codec_flags() {
-            // cn field specifies supported codecs
             // cn=0,1,2,3 means PCM, ALAC, AAC, AAC-ELD
             let txt = make_txt(&[("cn", "0,1,2,3")]);
 
-            // We don't parse cn directly into device, but TXT is available
             let device =
                 TxtRecordParser::parse_raop_txt("AABBCCDDEEFF@Device", &txt, vec![], 5000).unwrap();
             assert_eq!(device.name, "Device");
@@ -727,7 +667,6 @@ mod tests {
 
         #[test]
         fn parses_encryption_types() {
-            // et field specifies encryption types
             let txt = make_txt(&[("et", "0,3,5")]);
 
             let device =

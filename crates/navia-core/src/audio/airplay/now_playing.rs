@@ -31,7 +31,7 @@ impl NowPlayingSource for ClientNowPlaying {
         let handle = tokio::runtime::Handle::try_current().ok()?;
         let url = self.client.cover_art_url(cover_id, Some(800)).ok()?;
         handle.block_on(async {
-            let resp = self.client.http().get(url).send().await.ok()?.error_for_status().ok()?;
+            let resp = self.client.fetch(&url).await.send().await.ok()?.error_for_status().ok()?;
             resp.bytes().await.ok().map(|b| b.to_vec())
         })
     }

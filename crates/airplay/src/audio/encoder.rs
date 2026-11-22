@@ -5,7 +5,6 @@ use crate::base::{AudioFormat, AudioCodec, SampleRate, error::Result};
 /// Encoded audio packet.
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
-    /// Encoded data.
     pub data: Vec<u8>,
     /// Number of samples in this packet.
     pub samples: u32,
@@ -13,15 +12,11 @@ pub struct EncodedPacket {
     pub timestamp: u64,
 }
 
-/// Generic audio encoder trait.
 pub trait AudioEncoder: Send {
-    /// Encode PCM samples to codec format.
     fn encode(&mut self, samples: &[i16]) -> Result<EncodedPacket>;
 
-    /// Get codec type.
     fn codec(&self) -> AudioCodec;
 
-    /// Get frames per packet.
     fn frames_per_packet(&self) -> u32;
 
     /// Flush any buffered samples.
@@ -39,16 +34,13 @@ pub struct AlacEncoder {
 }
 
 impl AlacEncoder {
-    /// Create new ALAC encoder.
     pub fn new(format: AudioFormat) -> Result<Self> {
-        // Create ALAC format description with sample_rate, frames_per_packet, channels
         let alac_format = alac_encoder::FormatDescription::alac(
             format.sample_rate.as_hz() as f64,
             format.frames_per_packet,
             format.channels as u32,
         );
 
-        // Create PCM input format description
         let pcm_format = alac_encoder::FormatDescription::pcm::<i16>(
             format.sample_rate.as_hz() as f64,
             format.channels as u32,
@@ -56,8 +48,7 @@ impl AlacEncoder {
 
         let encoder = alac_encoder::AlacEncoder::new(&alac_format);
 
-        // Calculate maximum encoded frame size
-        // ALAC worst case is slightly larger than raw PCM
+        // ALAC's worst case is slightly larger than raw PCM.
         let max_encoded_size = format.frames_per_packet as usize * format.channels as usize * 2 + 256;
 
         Ok(Self {
@@ -70,14 +61,11 @@ impl AlacEncoder {
         })
     }
 
-    /// Get the ALAC-specific config data (magic cookie) for SETUP.
-    ///
-    /// The magic cookie is a 24-byte structure containing codec parameters.
+    /// the ALAC magic cookie for SETUP: a 24-byte structure of codec parameters.
     pub fn magic_cookie(&self) -> Vec<u8> {
         self.encoder.magic_cookie().to_vec()
     }
 
-    /// Encode a single frame of samples.
     fn encode_frame(&mut self, samples: &[i16]) -> Result<EncodedPacket> {
         let num_samples = samples.len() / self.format.channels as usize;
 
@@ -87,7 +75,6 @@ impl AlacEncoder {
             .flat_map(|s| s.to_ne_bytes())
             .collect();
 
-        // Encode using alac-encoder
         let encoded_size = self.encoder.encode(
             &self.input_format,
             &input_bytes,
@@ -109,10 +96,8 @@ impl AudioEncoder for AlacEncoder {
     fn encode(&mut self, samples: &[i16]) -> Result<EncodedPacket> {
         let samples_per_frame = self.format.frames_per_packet as usize * self.format.channels as usize;
 
-        // Add to buffer
         self.buffer.extend_from_slice(samples);
 
-        // If we have enough for a full frame, encode it
         if self.buffer.len() >= samples_per_frame {
             let frame_samples: Vec<i16> = self.buffer.drain(..samples_per_frame).collect();
             self.encode_frame(&frame_samples)
@@ -146,7 +131,6 @@ impl AudioEncoder for AlacEncoder {
     }
 }
 
-/// Create appropriate encoder for format.
 pub fn create_encoder(format: AudioFormat) -> Result<Box<dyn AudioEncoder>> {
     match format.codec {
         AudioCodec::Alac => Ok(Box::new(AlacEncoder::new(format)?)),
@@ -229,11 +213,8 @@ mod tests {
             let samples = vec![0i16; 704];
             let packet = encoder.encode(&samples).unwrap();
 
-            // Check that we have output data (real ALAC encoding)
             assert!(packet.data.len() > 0);
-            // ALAC encoded data should be smaller or roughly equal to raw PCM
-            // (704 samples * 2 bytes = 1408 bytes raw)
-            // Compressed silence should be much smaller
+            // compressed silence is far smaller than the 1408 raw bytes.
             assert!(packet.data.len() <= 1500);
         }
 
@@ -242,7 +223,6 @@ mod tests {
             let encoder = AlacEncoder::new(alac_format_44100()).unwrap();
             let cookie = encoder.magic_cookie();
 
-            // Magic cookie should be present
             assert!(!cookie.is_empty());
             // ALAC magic cookie is typically 24+ bytes
             assert!(cookie.len() >= 24);
@@ -251,7 +231,6 @@ mod tests {
         #[test]
         fn flush_returns_remaining_samples() {
             let mut encoder = AlacEncoder::new(alac_format_44100()).unwrap();
-            // Add partial frame
             encoder.buffer = vec![0i16; 100];
             let flushed = encoder.flush().unwrap();
             assert!(flushed.is_some());
@@ -302,13 +281,11 @@ mod tests {
 
     }
 
-    /// Audio validation tests to verify encoders produce correct, audible audio.
     mod audio_validation {
         use super::*;
         use std::f64::consts::PI;
 
-        /// Generate a sine wave at the given frequency.
-        /// Returns interleaved stereo samples.
+        /// a sine wave at `frequency`, as interleaved stereo samples.
         fn generate_sine_wave(
             frequency_hz: f64,
             sample_rate: u32,
@@ -319,14 +296,12 @@ mod tests {
             for i in 0..duration_samples {
                 let t = i as f64 / sample_rate as f64;
                 let value = (amplitude as f64 * (2.0 * PI * frequency_hz * t).sin()) as i16;
-                // Stereo: same value on both channels
                 samples.push(value);
                 samples.push(value);
             }
             samples
         }
 
-        /// Calculate RMS (root mean square) energy of samples.
         fn calculate_rms(samples: &[i16]) -> f64 {
             if samples.is_empty() {
                 return 0.0;
@@ -335,8 +310,7 @@ mod tests {
             (sum_squares / samples.len() as f64).sqrt()
         }
 
-        /// Check if samples contain a dominant frequency near the expected value.
-        /// Uses zero-crossing rate as a simple frequency estimator.
+        /// the dominant frequency, estimated from the zero-crossing rate.
         fn estimate_frequency_from_zero_crossings(samples: &[i16], sample_rate: u32) -> f64 {
             if samples.len() < 4 {
                 return 0.0;
@@ -361,19 +335,16 @@ mod tests {
         fn alac_encodes_sine_wave_440hz() {
             let mut encoder = AlacEncoder::new(alac_format_44100()).unwrap();
 
-            // Generate 1 second of 440Hz sine wave (A4 note)
             let sample_rate = 44100u32;
             let duration_samples = sample_rate as usize; // 1 second
             let sine_wave = generate_sine_wave(440.0, sample_rate, duration_samples, 16000);
 
-            // Verify source audio has expected properties
             let source_rms = calculate_rms(&sine_wave);
             assert!(source_rms > 10000.0, "Source RMS too low: {}", source_rms);
 
             let source_freq = estimate_frequency_from_zero_crossings(&sine_wave, sample_rate);
             assert!((source_freq - 440.0).abs() < 20.0, "Source frequency wrong: {} Hz", source_freq);
 
-            // Encode in 352-sample chunks
             let samples_per_frame = 352 * 2; // stereo
             let mut encoded_packets = Vec::new();
             let mut total_encoded_bytes = 0;
@@ -386,12 +357,10 @@ mod tests {
                 }
             }
 
-            // Verify encoding produced data
             assert!(!encoded_packets.is_empty(), "No packets encoded");
             assert!(total_encoded_bytes > 0, "No encoded data produced");
 
-            // ALAC is lossless, so encoded size should be reasonable
-            // (not much larger than raw, could be smaller for simple signals)
+            // ALAC is lossless: not much larger than raw, and smaller for simple signals.
             let raw_size = sine_wave.len() * 2; // 2 bytes per sample
             assert!(
                 total_encoded_bytes < raw_size * 2,
@@ -416,11 +385,9 @@ mod tests {
             let mut encoder = AlacEncoder::new(alac_format_44100()).unwrap();
             let sample_rate = 44100u32;
 
-            // Test multiple frequencies: 220Hz, 440Hz, 880Hz, 1760Hz
             let frequencies = [220.0, 440.0, 880.0, 1760.0];
 
             for freq in frequencies {
-                // Generate 0.5 seconds of each frequency
                 let duration_samples = (sample_rate / 2) as usize;
                 let sine_wave = generate_sine_wave(freq, sample_rate, duration_samples, 16000);
 
@@ -432,7 +399,6 @@ mod tests {
                         let packet = encoder.encode(chunk).unwrap();
                         encoded_size += packet.data.len();
 
-                        // Each packet should have non-trivial data
                         assert!(packet.data.len() > 10, "Packet too small for {} Hz", freq);
                     }
                 }
@@ -446,7 +412,6 @@ mod tests {
         fn alac_silence_compresses_well() {
             let mut encoder = AlacEncoder::new(alac_format_44100()).unwrap();
 
-            // 1 second of silence
             let silence = vec![0i16; 44100 * 2];
 
             let samples_per_frame = 352 * 2;
@@ -492,10 +457,8 @@ mod tests {
                 complex_signal.push(value);
             }
 
-            // Calculate source energy
             let source_rms = calculate_rms(&complex_signal);
 
-            // Encode
             let samples_per_frame = 352 * 2;
             let mut packet_count = 0;
 

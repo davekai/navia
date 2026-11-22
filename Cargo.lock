@@ -4013,6 +4013,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "navia-aubio"
+version = "0.1.2"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "navia-core"
 version = "0.1.2"
 dependencies = [
@@ -4029,6 +4036,7 @@ dependencies = [
  "md5",
  "mdns-sd",
  "navia-airplay",
+ "navia-aubio",
  "objc2-core-audio",
  "opusic-sys",
  "pulseaudio",
@@ -4046,9 +4054,11 @@ dependencies = [
  "symphonia",
  "tempfile",
  "thiserror 2.0.21",
+ "tiny-skia",
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "ttf-parser",
  "unicode-normalization",
  "url",
  "wiremock",

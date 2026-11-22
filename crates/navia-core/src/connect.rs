@@ -15,7 +15,6 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// It's never on by itself, so a stray `.env.local` can't override a user's own account.
 pub const DEVELOPER_ENV: &str = "NAVIA_DEV";
 
-/// True when the developer override is on (`NAVIA_DEV=1`).
 pub fn developer_override() -> bool {
     std::env::var_os(DEVELOPER_ENV).is_some_and(|v| v == "1")
 }
@@ -116,14 +115,23 @@ impl Probe {
 
 /// Checks `address` with this login. An empty username or password means "just check the server".
 pub async fn probe(address: &str, username: &str, password: &str) -> Probe {
+    probe_within(address, username, password, PROBE_TIMEOUT).await
+}
+
+/// the extension ask before the ping shares the limit, so an unreachable server still takes no longer.
+async fn probe_within(address: &str, username: &str, password: &str, limit: Duration) -> Probe {
+    tokio::time::timeout(limit, probe_once(address, username, password, limit)).await.unwrap_or(Probe::TimedOut)
+}
+
+async fn probe_once(address: &str, username: &str, password: &str, limit: Duration) -> Probe {
     let Some(address) = parse_address(address) else { return Probe::BadAddress };
     let login_given = !username.trim().is_empty() && !password.is_empty();
     let username = if login_given { username.trim() } else { "navia-probe" };
     let credentials = Credentials::new(username, if login_given { password } else { "" });
     let mut config = ClientConfig::new(address.url, credentials).read_only();
-    config.timeout = PROBE_TIMEOUT;
+    config.timeout = limit;
     let Ok(client) = Client::new(config) else { return Probe::BadAddress };
-    let Ok(request) = client.ping_request() else { return Probe::BadAddress };
+    let Ok(request) = client.ping_request().await else { return Probe::BadAddress };
     match request.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
@@ -238,7 +246,7 @@ mod tests {
     fn only_remote_plain_http_warns() {
         assert!(parsed("http://music.example.org").unencrypted);
         assert!(!parsed("https://music.example.org").unencrypted);
-        for local in ["http://localhost:4533", "http://127.0.0.1:4533", "http://192.168.1.2", "http://10.0.0.8", "http://172.16.3.4", "http://100.98.1.2", "http://nas.local", "http://[::1]:4533"] {
+        for local in ["http://localhost:4533", "http://127.0.0.1:4533", "http://192.168.1.2", "http://10.0.0.8", "http://172.16.3.4", "http://100.64.1.2", "http://nas.local", "http://[::1]:4533"] {
             assert!(!parsed(local).unencrypted, "{local}");
         }
         assert!(parsed("http://8.8.8.8").unencrypted);
@@ -288,6 +296,15 @@ mod tests {
         // A port with nothing listening, bound briefly and released.
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         assert_eq!(probe(&format!("http://127.0.0.1:{port}"), "ada", "pw").await, Probe::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_times_out_within_the_limit() {
+        let s = MockServer::start().await;
+        Mock::given(wiremock::matchers::any()).respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30))).mount(&s).await;
+        let started = std::time::Instant::now();
+        assert_eq!(probe_within(&s.uri(), "ada", "pw", Duration::from_millis(800)).await, Probe::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
     }
 
     #[tokio::test]

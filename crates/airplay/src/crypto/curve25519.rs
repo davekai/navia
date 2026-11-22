@@ -14,7 +14,6 @@ pub struct EcdhKeyPair {
 }
 
 impl EcdhKeyPair {
-    /// Generate a new random key pair.
     pub fn generate() -> Self {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
@@ -24,7 +23,6 @@ impl EcdhKeyPair {
         }
     }
 
-    /// Create from existing secret key bytes.
     pub fn from_secret(secret: &[u8; 32]) -> Self {
         let static_secret = StaticSecret::from(*secret);
         let public = PublicKey::from(&static_secret);
@@ -34,17 +32,12 @@ impl EcdhKeyPair {
         }
     }
 
-    /// Get the public key (32 bytes).
     pub fn public_key(&self) -> [u8; 32] {
         self.public
     }
 
-    /// Perform Diffie-Hellman key exchange.
-    ///
-    /// Returns the shared secret (32 bytes).
     /// Rejects low-order points (all-zero public keys produce all-zero output).
     pub fn diffie_hellman(self, peer_public: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
-        // Check for all-zero public key (invalid)
         if peer_public.iter().all(|&b| b == 0) {
             return Err(CryptoError::Encryption(
                 "Invalid peer public key: all zeros".to_string(),
@@ -55,7 +48,7 @@ impl EcdhKeyPair {
         let their_public = PublicKey::from(*peer_public);
         let shared = static_secret.diffie_hellman(&their_public);
 
-        // Check for weak result (low-order points produce all-zero shared secret)
+        // Low-order points produce an all-zero shared secret.
         let shared_bytes = shared.to_bytes();
         if shared_bytes.iter().all(|&b| b == 0) {
             return Err(CryptoError::Encryption(
@@ -219,18 +212,15 @@ mod tests {
 
         #[test]
         fn secret_key_zeroized_on_drop() {
-            // Create keypair, drop it, and verify memory is cleared
-            // This is hard to test directly, but we can verify the type derives ZeroizeOnDrop
+            // only checks the type derives ZeroizeOnDrop; the zeroing itself is hard to observe.
             let kp = EcdhKeyPair::generate();
-            let _public = kp.public_key(); // Just verify it works
+            let _public = kp.public_key();
             drop(kp);
-            // The ZeroizeOnDrop derive ensures the secret is cleared
         }
 
         #[test]
         fn secret_key_not_in_debug_output() {
-            // EcdhKeyPair doesn't derive Debug, so this is enforced at compile time
-            // We just verify the public key is accessible
+            // EcdhKeyPair doesn't derive Debug; that is enforced at compile time.
             let kp = EcdhKeyPair::generate();
             let _pub = kp.public_key();
         }
@@ -242,25 +232,20 @@ mod tests {
         #[test]
         fn rfc7748_test_vector() {
             // RFC 7748 Section 6.1 Test Vectors
-            // Alice's private key
             let alice_private =
                 hex::decode("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
                     .unwrap();
-            // Alice's public key
             let alice_public_expected =
                 hex::decode("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
                     .unwrap();
 
-            // Bob's private key
             let bob_private =
                 hex::decode("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
                     .unwrap();
-            // Bob's public key
             let bob_public_expected =
                 hex::decode("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
                     .unwrap();
 
-            // Shared secret
             let shared_expected =
                 hex::decode("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
                     .unwrap();
@@ -272,15 +257,12 @@ mod tests {
             let mut bob_public = [0u8; 32];
             bob_public.copy_from_slice(&bob_public_expected);
 
-            // Verify Alice's public key derivation
             let alice = EcdhKeyPair::from_secret(&alice_secret);
             assert_eq!(alice.public_key().to_vec(), alice_public_expected);
 
-            // Verify Bob's public key derivation
             let bob = EcdhKeyPair::from_secret(&bob_secret);
             assert_eq!(bob.public_key().to_vec(), bob_public_expected);
 
-            // Verify shared secret
             let shared = alice.diffie_hellman(&bob_public).unwrap();
             assert_eq!(shared.to_vec(), shared_expected);
         }

@@ -9,8 +9,9 @@ no Last.fm, no external agents or no ratings, the engine uses what's left.
 
 ## Sources
 
-- `getSimilarSongs2` by song, about 150 results, weighted by rank since the best matches come first. Never by
-  album or playlist, which returns random songs.
+- `getSimilarSongs2` by song, weighted by rank since the best matches come first. Never by album or playlist,
+  which returns random songs. The server tops an agent's answer up with songs that change on every call, so
+  Navia asks twice and keeps only the part both answers share.
 - `getTopSongs`, by artist id when the server supports it, for popularity.
 - Similar artists from `getArtistInfo2`, combined with Deezer's related artists when Deezer is on. Artists both
   agree on count for more.
@@ -21,6 +22,8 @@ no Last.fm, no external agents or no ratings, the engine uses what's left.
 - Deezer, only when you turn it on: artist radio, related artists, top tracks and BPM for songs without a BPM tag.
   Deezer songs are matched to your library by title and main artist, then by duration within about 3 seconds, and
   by ISRC when that's still ambiguous.
+- ListenBrainz, under the same switch: similar recordings for the songs you start, by the song's MusicBrainz id
+  or by artist and title. Anonymous, at most two requests a second, and any failure is skipped.
 
 ## Deezer limits
 
@@ -75,9 +78,9 @@ when they agree with the lead, by similar artists, genre or artist. Radio from a
 
 ## Order
 
-A weighted draw from the top 20, favoring smooth transitions: genre, a year within about 8, and BPM within 8% or
-at double or half tempo. No artist twice within 4 songs, at most 2 songs per artist in 10, and no album twice
-within 8.
+Autoplay keeps 25 songs ahead, spread across artists: at most 2 by one artist in those 25, never two in a row,
+and no album again within 3 songs. The artist you started from may come up at most twice in the first 10. The
+rules loosen only when nothing else fits, so a small library still gets a full list.
 
 ## Skips
 

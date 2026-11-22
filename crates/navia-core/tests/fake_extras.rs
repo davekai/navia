@@ -206,6 +206,73 @@ async fn artwork_is_fetched_once_cached_tinted_and_glowed() {
     assert_eq!(server.calls("getCoverArt"), 1, "the glow reuses the cached cover");
 }
 
+fn sidecars(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect()
+}
+
+/// an image marked `no-store` (Navidrome's no-cover placeholder) is reused for a while but never
+/// cached for good, so a cover added later on the server shows after a relaunch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_no_store_placeholder_isnt_kept_for_the_cover() {
+    let server = FakeServer::start(State { cover_png: Some(png(64, 64, [90, 90, 90])), cover_no_store: true, ..state() }).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = ArtworkConfig { dir: dir.path().join("art"), max_bytes: u64::MAX };
+    let cache = ArtworkCache::new(server.client(), config.clone()).unwrap();
+    let placeholder = cache.cover("al-1", Some(300)).await.unwrap();
+    assert!(placeholder.path.exists());
+    assert_eq!(cache.cover("al-1", Some(300)).await.unwrap().path, placeholder.path);
+    assert_eq!(server.calls("getCoverArt"), 1, "reused while fresh");
+    let glow = cache.glow("al-1", 40, 40).await.unwrap();
+    assert!(glow.path.starts_with(placeholder.path.parent().unwrap()));
+    assert!(sidecars(&config.dir).is_empty(), "nothing cached under the cover's own name");
+
+    {
+        let mut st = server.state.lock().unwrap();
+        st.cover_png = Some(png(64, 64, [200, 60, 40]));
+        st.cover_no_store = false;
+    }
+    let relaunched = ArtworkCache::new(server.client(), config).unwrap();
+    let real = relaunched.cover("al-1", Some(300)).await.unwrap();
+    assert!(real.tint[0] > 150, "the real cover, tint {:?}", real.tint);
+}
+
+/// a placeholder cached before it was recognised is dropped once the same image comes marked
+/// `no-store`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_cached_placeholder_is_dropped_once_recognised() {
+    let server = FakeServer::start(State { cover_png: Some(png(64, 64, [90, 90, 90])), ..state() }).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = ArtworkConfig { dir: dir.path().join("art"), max_bytes: u64::MAX };
+    let cache = ArtworkCache::new(server.client(), config.clone()).unwrap();
+    cache.cover("al-old", Some(300)).await.unwrap();
+    assert_eq!(sidecars(&config.dir).len(), 1);
+
+    server.state.lock().unwrap().cover_no_store = true;
+    cache.cover("al-new", Some(300)).await.unwrap();
+    let relaunched = ArtworkCache::new(server.client(), config.clone()).unwrap();
+    relaunched.cover("al-old", Some(300)).await.unwrap();
+    assert_eq!(server.calls("getCoverArt"), 3, "asked again instead of served from the old copy");
+    assert!(sidecars(&config.dir).is_empty());
+}
+
+/// the image's path is derived from the cache's own file name, whatever a sidecar says.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sidecar_cant_point_the_cover_elsewhere() {
+    let server = FakeServer::start(State { cover_png: Some(png(32, 32, [200, 60, 40])), ..state() }).await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = ArtworkConfig { dir: dir.path().join("art"), max_bytes: u64::MAX };
+    let cache = ArtworkCache::new(server.client(), config.clone()).unwrap();
+    let cover = cache.cover("al-1", Some(300)).await.unwrap();
+    let sidecar = sidecars(&config.dir).pop().unwrap();
+    let mut json: Value = serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    json["path"] = json!("/etc/hostname");
+    std::fs::write(&sidecar, json.to_string()).unwrap();
+    let again = cache.cover("al-1", Some(300)).await.unwrap();
+    assert_eq!(again.path, cover.path);
+    assert!(again.path.starts_with(&config.dir));
+    assert_eq!(server.calls("getCoverArt"), 1);
+}
+
 
 #[tokio::test(flavor = "multi_thread")]
 async fn local_stars_update_and_clear() {
@@ -249,4 +316,57 @@ async fn create_playlist_is_refused_without_writes() {
     let syncer = Syncer::new(server.read_only_client(), library, SyncOptions::default());
     assert!(matches!(syncer.create_playlist("New").await, Err(navia_core::Error::WritesDisabled { .. })));
     assert_eq!(server.calls("createPlaylist"), 0);
+}
+
+/// Navidrome's native song list for album `al-Alb`, as `/api/song?album_id=` answers it: out of
+/// track order, one song untagged, one with two values.
+async fn mount_album_songs(server: &FakeServer, status: u16) {
+    Mock::given(method("POST")).and(path("/auth/login")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"token": "abc", "id": "u"}))).mount(&server.server).await;
+    let rows = json!([
+        {"id": "s3", "discNumber": 2, "trackNumber": 1, "tags": {"copyright": ["© 2001 Late Disc"]}},
+        {"id": "s2", "discNumber": 1, "trackNumber": 2, "tags": {"genre": ["Rock"]}},
+        {"id": "s1", "discNumber": 1, "trackNumber": 1, "tags": {"copyright": ["(P) 2001 Label", "© 2001 Label"]}},
+        {"id": "s4", "discNumber": 1, "trackNumber": 3, "tags": {"copyright": ["(P) 2001 Label"]}}
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/api/song"))
+        .and(wiremock::matchers::query_param("album_id", "al-Alb"))
+        .and(header("x-nd-authorization", "Bearer abc"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(rows).insert_header("x-total-count", "4"))
+        .mount(&server.server)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn album_copyrights_come_from_the_native_songs_in_track_order() {
+    use navia_core::library::copyright::{AlbumFooterSource, album_footer};
+    let mut st = state();
+    st.album_extra.insert("al-Alb".into(), json!({"recordLabels": [{"name": "Fallback Records"}]}));
+    let server = FakeServer::start(st).await;
+    mount_album_songs(&server, 200).await;
+    let (_dir, library) = open_library();
+    syncer(&server, &library).full_sync(&|_| {}).await.unwrap();
+    let client = server.client();
+    assert_eq!(client.album_copyrights("al-Alb").await.unwrap(), ["(P) 2001 Label", "© 2001 Label", "(P) 2001 Label", "© 2001 Late Disc"]);
+    let footer = album_footer(&client, &library, "al-Alb", true).await.unwrap().unwrap();
+    assert_eq!(footer.source, AlbumFooterSource::Copyright);
+    assert_eq!(footer.lines, ["℗ 2001 Label", "© 2001 Label", "© 2001 Late Disc"]);
+    let local = album_footer(&client, &library, "al-Alb", false).await.unwrap().unwrap();
+    assert_eq!((local.source, local.lines), (AlbumFooterSource::RecordLabel, vec!["Fallback Records".to_string()]));
+    assert!(client.album_copyrights("../x").await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_native_read_falls_back_to_the_labels_and_nothing_hides() {
+    use navia_core::library::copyright::{AlbumFooterSource, album_footer};
+    let mut st = state();
+    st.album_extra.insert("al-Alb".into(), json!({"recordLabels": [{"name": "Fallback Records"}]}));
+    let server = FakeServer::start(st).await;
+    mount_album_songs(&server, 500).await;
+    let (_dir, library) = open_library();
+    syncer(&server, &library).full_sync(&|_| {}).await.unwrap();
+    let client = server.client();
+    let footer = album_footer(&client, &library, "al-Alb", true).await.unwrap().unwrap();
+    assert_eq!((footer.source, footer.lines), (AlbumFooterSource::RecordLabel, vec!["Fallback Records".to_string()]));
+    assert!(album_footer(&client, &library, "unknown", true).await.unwrap().is_none());
 }

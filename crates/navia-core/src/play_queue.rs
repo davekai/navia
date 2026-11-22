@@ -844,8 +844,20 @@ impl<T: Clone + Eq + std::hash::Hash> PlayQueue<T> {
         self.changed();
     }
 
-    /// Keeps the followed song as the playing entry when following ends.
-    /// The edits put the queue back around it.
+    /// while following someone, the first song of Next in Queue leaves the waiting queue to be
+    /// played through them (a listening session's turn). the player doesn't hold this queue then.
+    pub fn take_queued_next(&mut self) -> Option<T> {
+        if self.queued_run() == 0 {
+            return None;
+        }
+        let entry = self.entries.remove(self.pos + 1);
+        self.changed();
+        Some(entry.song)
+    }
+
+    /// The song followed (listen along) stays as the playing entry, right before the listener's
+    /// own song, when following ends. The player holds only that song: the edits put the queue
+    /// back before and after it.
     pub fn keep_in_front(&mut self, song: T) -> Vec<Edit<T>> {
         let at = self.pos.min(self.entries.len());
         let id = self.fresh_id();
@@ -1654,5 +1666,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_session_turn_takes_the_first_queued_song_of_the_waiting_queue() {
+        let mut q = PlayQueue::new();
+        q.start(vec![1, 2, 3], 0, false);
+        q.insert(vec![8, 9], 0, true);
+        assert_eq!(q.take_queued_next(), Some(8));
+        assert_eq!((q.songs(), q.pos(), q.queued_run()), (vec![1, 9, 2, 3], 0, 1));
+        assert_eq!(q.take_queued_next(), Some(9));
+        assert_eq!(q.take_queued_next(), None, "the list's own songs aren't taken");
+        assert_eq!(q.songs(), vec![1, 2, 3]);
     }
 }

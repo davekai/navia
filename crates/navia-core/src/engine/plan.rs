@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::deezer_src::DeezerAnswers;
-use super::sequence::{Item, Spacer, Strict};
+use super::sequence::{Item, SPREAD_WINDOW, Spacer, Strict};
 use crate::autoplay::song_version;
 use crate::client::Song;
 use crate::library::Library;
@@ -24,6 +24,8 @@ pub const ARTIST_SONGS: usize = 30;
 /// Neighbor artists taken, and songs of each.
 pub const NEIGHBOURS: usize = 20;
 pub const NEIGHBOUR_SONGS: usize = 5;
+/// ...and of each when too few songs by other artists than the anchors' qualify.
+pub const NEIGHBOUR_SONGS_SHORT: usize = 15;
 /// Below this many qualifying songs the plan widens.
 pub const QUALIFY_MIN: usize = 15;
 /// The neighbors' neighbors taken when widening, and songs of each.
@@ -53,6 +55,7 @@ const PLAYLIST_NEAR: usize = 20;
 pub enum Source {
     Similar,
     Artist,
+    ListenBrainz,
     DeezerRadio,
     Neighbour,
     Playlist,
@@ -66,6 +69,7 @@ impl Source {
         match self {
             Source::Similar => 0.9,
             Source::Artist => 0.85,
+            Source::ListenBrainz => 0.85,
             Source::DeezerRadio => 0.7,
             Source::Neighbour => 0.5,
             Source::Playlist => 0.6,
@@ -111,6 +115,8 @@ pub struct Inputs<'a> {
     pub similar: &'a [Vec<Song>],
     /// Deezer's answers, when the listener has it turned on.
     pub deezer: Option<&'a DeezerAnswers>,
+    /// ListenBrainz's similar recordings per anchor as library songs, when the switch is on.
+    pub listenbrainz: &'a [(String, Vec<Song>)],
     /// Songs offered for the first anchor on an earlier day.
     pub recent: &'a HashSet<String>,
     /// Score multipliers for songs the listener is tired of, by id.
@@ -210,6 +216,11 @@ fn playlist_lists(db: &Library, anchors: &[Song], hood: &HashSet<String>) -> Vec
 
 /// Every collaborative list for the inputs.
 pub fn lists(db: Option<&Library>, inp: &Inputs) -> Vec<List> {
+    lists_with(db, inp, NEIGHBOUR_SONGS)
+}
+
+/// [`lists`] with `per_neighbour` songs of each neighbour artist.
+fn lists_with(db: Option<&Library>, inp: &Inputs, per_neighbour: usize) -> Vec<List> {
     let mut out: Vec<List> = inp.similar.iter().map(|answer| List { source: Source::Similar, weight: Source::Similar.weight(), songs: answer.iter().enumerate().map(|(i, s)| (s.clone(), rank_weight(i))).collect() }).collect();
     let empty = HashMap::new();
     let popular = inp.deezer.map(|d| &d.popular).unwrap_or(&empty);
@@ -222,6 +233,9 @@ pub fn lists(db: Option<&Library>, inp: &Inputs) -> Vec<List> {
     if inp.provisional {
         return out;
     }
+    for (_, songs) in inp.listenbrainz {
+        out.push(List { source: Source::ListenBrainz, weight: Source::ListenBrainz.weight(), songs: songs.iter().enumerate().map(|(i, s)| (s.clone(), rank_weight(i))).collect() });
+    }
     if let Some(d) = inp.deezer {
         for (_, songs) in &d.radio {
             out.push(List { source: Source::DeezerRadio, weight: Source::DeezerRadio.weight(), songs: songs.iter().enumerate().map(|(i, s)| (s.clone(), rank_weight(i))).collect() });
@@ -231,9 +245,9 @@ pub fn lists(db: Option<&Library>, inp: &Inputs) -> Vec<List> {
         let near = neighbours(Some(db), inp.anchors, inp.deezer);
         let mut hood: HashSet<String> = anchor_artists(inp.anchors).into_iter().collect();
         hood.extend(near.iter().map(|(a, _)| a.clone()));
-        hood.extend(out.iter().filter(|l| matches!(l.source, Source::Similar | Source::DeezerRadio)).flat_map(|l| l.songs.iter().map(|(s, _)| artist_key(s))));
+        hood.extend(out.iter().filter(|l| matches!(l.source, Source::Similar | Source::ListenBrainz | Source::DeezerRadio)).flat_map(|l| l.songs.iter().map(|(s, _)| artist_key(s))));
         for (artist, w) in near {
-            let songs = artist_songs(db, &artist, popular).into_iter().take(NEIGHBOUR_SONGS).enumerate().map(|(i, s)| (s, 1.0 / (1.0 + i as f32 / 2.0))).collect();
+            let songs = artist_songs(db, &artist, popular).into_iter().take(per_neighbour).enumerate().map(|(i, s)| (s, 1.0 / (1.0 + i as f32 / 2.0))).collect();
             out.push(List { source: Source::Neighbour, weight: w, songs });
         }
         out.extend(playlist_lists(db, inp.anchors, &hood));
@@ -374,13 +388,24 @@ pub fn score(lists: &[List], inp: &Inputs, skip: &dyn Fn(&Song, &str) -> bool) -
 pub fn candidates(db: Option<&Library>, inp: &Inputs, skip: &dyn Fn(&Song, &str) -> bool) -> Vec<Pick> {
     let mut all = lists(db, inp);
     let mut picks = score(&all, inp, skip);
+    // the seed artist's own songs don't count: they can fill only a few of the first places.
+    let own = anchor_artists(inp.anchors);
+    let others = |picks: &[Pick]| picks.iter().filter(|p| !own.contains(&artist_key(&p.song))).count();
     if let Some(db) = db
-        && picks.len() < QUALIFY_MIN
+        && others(&picks) < QUALIFY_MIN
+        && !inp.provisional
+    {
+        // short: more of each neighbour artist's songs first, then their neighbours, then tags.
+        all = lists_with(Some(db), inp, NEIGHBOUR_SONGS_SHORT);
+        picks = score(&all, inp, skip);
+    }
+    if let Some(db) = db
+        && others(&picks) < QUALIFY_MIN
         && !inp.provisional
     {
         all.extend(widened(db, inp));
         picks = score(&all, inp, skip);
-        if picks.len() < QUALIFY_MIN
+        if others(&picks) < QUALIFY_MIN
             && let Some(tags) = inp.anchors.first().and_then(|a| tag_list(db, a))
         {
             all.push(tags);
@@ -404,7 +429,7 @@ pub fn sequence(picks: &[Pick], history: &[Item], seed_artists: &[String]) -> Ve
     }
     queues.sort_by_key(|q| (q.1, q.0));
     let items: Vec<Item> = picks.iter().map(|p| Item::of(&p.song)).collect();
-    let mut spacer = Spacer::new(history, seed_artists);
+    let mut spacer = Spacer::new(history, seed_artists, SPREAD_WINDOW);
     let mut credit: Vec<f32> = vec![0.0; queues.len()];
     let mut out = Vec::with_capacity(picks.len());
     while out.len() < picks.len() {
@@ -418,7 +443,30 @@ pub fn sequence(picks: &[Pick], history: &[Item], seed_artists: &[String]) -> Ve
         }
         let mut order = active.clone();
         order.sort_by(|a, b| credit[*b].total_cmp(&credit[*a]).then(a.cmp(b)));
-        let found = [Strict::All, Strict::Gap].into_iter().find_map(|strict| order.iter().find_map(|&t| queues[t].2.iter().take(LOOK).position(|&i| spacer.fits(&items[i], strict)).map(|k| (t, k))));
+        let fitting = |among: &[usize], look: usize, strict: Strict| among.iter().find_map(|&t| queues[t].2.iter().take(look).position(|&i| spacer.fits(&items[i], strict)).map(|k| (t, k)));
+        // when the turn's sources have nothing that fits, a later song that does (a neighbour's,
+        // the continuation, a fallback tier) comes before a rule gives way
+        let all: Vec<usize> = (0..queues.len()).filter(|&t| !queues[t].2.is_empty()).collect();
+        // once an artist may come more often, the song whose artist the window holds least, so
+        // the loosened run stays spread and doesn't use up the others early
+        let fewest = |strict: Strict| {
+            let mut best: Option<(usize, usize, usize)> = None;
+            for &t in order.iter().chain(all.iter().filter(|t| !order.contains(t))) {
+                for (k, &i) in queues[t].2.iter().enumerate() {
+                    if spacer.fits(&items[i], strict) {
+                        let n = spacer.in_window(&items[i]);
+                        if best.is_none_or(|b| n < b.0) {
+                            best = Some((n, t, k));
+                        }
+                    }
+                }
+            }
+            best.map(|(_, t, k)| (t, k))
+        };
+        let found = fitting(&order, LOOK, Strict::All)
+            .or_else(|| fitting(&all, usize::MAX, Strict::All))
+            .or_else(|| [Strict::Third, Strict::Gap].into_iter().find_map(fewest))
+            .or_else(|| fitting(&all, usize::MAX, Strict::Seed));
         let (t, k) = found.unwrap_or((order[0], 0));
         let i = queues[t].2.remove(k);
         credit[t] -= total;
@@ -456,7 +504,7 @@ mod tests {
     static NO_FATIGUE: std::sync::LazyLock<HashMap<String, f32>> = std::sync::LazyLock::new(HashMap::new);
 
     fn inputs<'a>(anchors: &'a [Song], similar: &'a [Vec<Song>], deezer: Option<&'a DeezerAnswers>, recent: &'a HashSet<String>) -> Inputs<'a> {
-        Inputs { anchors, similar, deezer, recent, fatigue: &NO_FATIGUE, day: 1, provisional: false }
+        Inputs { anchors, similar, deezer, listenbrainz: &[], recent, fatigue: &NO_FATIGUE, day: 1, provisional: false }
     }
 
     #[test]
@@ -506,6 +554,81 @@ mod tests {
         let recent: HashSet<String> = HashSet::from(["s1".to_string(), "s0".to_string()]);
         let three = build(None, &inputs(&anchor, &similar, None, &recent), &|_, _| false, &[]);
         assert!(three.iter().position(|p| p.song.id == "s0").unwrap() > 0);
+    }
+
+    #[test]
+    fn the_seed_artist_fills_at_most_two_of_the_first_ten_even_with_few_candidates() {
+        let pick = |id: String, artist: &str, tier: Source, score: f32| Pick { song: song(&id, artist, "", 0), related: score, score, tier };
+        // many strong songs by the seed artist, a few weak neighbours (under the interleave floor).
+        let mut picks: Vec<Pick> = (0..30).map(|i| pick(format!("own{i}"), "Seed", Source::Artist, 0.8)).collect();
+        picks.extend((0..8).map(|i| pick(format!("n{i}"), &format!("N{i}"), Source::Neighbour, 0.2)));
+        let order = sequence(&picks, &[], &["ar-Seed".to_string()]);
+        let first10: Vec<&str> = order.iter().take(10).map(|&i| picks[i].song.id.as_str()).collect();
+        assert!(first10.iter().filter(|id| id.starts_with("own")).count() <= 2, "{first10:?}");
+        assert!(first10.iter().any(|id| id.starts_with("own")), "allowed, not left out: {first10:?}");
+        assert_eq!(order.len(), picks.len());
+    }
+
+    fn spread_pick(id: String, artist: &str, tier: Source, score: f32) -> Pick {
+        Pick { song: song(&id, artist, "", 0), related: score, score, tier }
+    }
+
+    fn artists_in_order<'a>(picks: &'a [Pick], order: &[usize]) -> Vec<&'a str> {
+        order.iter().map(|&i| picks[i].song.artist.as_deref().unwrap_or("")).collect()
+    }
+
+    fn most_by_one(artists: &[&str]) -> usize {
+        artists.iter().map(|a| artists.iter().filter(|b| *b == a).count()).max().unwrap_or(0)
+    }
+
+    #[test]
+    fn the_shown_songs_have_at_most_two_by_an_artist_and_never_two_in_a_row() {
+        // strong artists with many songs each lead every source, a long tail of others follows
+        let mut picks: Vec<Pick> = Vec::new();
+        for i in 0..8 {
+            picks.extend((0..6).map(|k| spread_pick(format!("s{i}-{k}"), &format!("Strong{i}"), Source::Similar, 0.9 - k as f32 * 0.01)));
+        }
+        picks.extend((0..80).map(|i| spread_pick(format!("n{i}"), &format!("Other{i}"), Source::Neighbour, 0.5)));
+        picks.extend((0..10).map(|i| spread_pick(format!("own{i}"), "Seed", Source::Artist, 0.85)));
+        let order = sequence(&picks, &[], &["ar-Seed".to_string()]);
+        assert_eq!(order.len(), picks.len(), "every candidate stays in the plan");
+        let artists = artists_in_order(&picks, &order);
+        // while the pool lasts, every run of 25 the queue shows as the plan is walked
+        for start in 0..=60 {
+            let shown = &artists[start..start + SPREAD_WINDOW];
+            let others: Vec<&str> = shown.iter().copied().filter(|a| *a != "Seed").collect();
+            assert!(most_by_one(&others) <= 2, "{shown:?}");
+        }
+        assert!(artists.windows(2).all(|w| w[0] != w[1]), "{artists:?}");
+        let first10 = &artists[..10];
+        assert!(first10.iter().filter(|a| **a == "Seed").count() <= 2, "the seed artist's own cap: {first10:?}");
+        assert!(first10.contains(&"Seed"), "the seed artist is allowed: {first10:?}");
+    }
+
+    #[test]
+    fn a_small_pool_loosens_the_spread_instead_of_shortening_the_list() {
+        // ten artists of three songs: a third song each is needed to fill 25, never back to back
+        let picks: Vec<Pick> = (0..10).flat_map(|i| (0..3).map(move |k| spread_pick(format!("a{i}-{k}"), &format!("A{i}"), Source::Similar, 0.9)).collect::<Vec<_>>()).collect();
+        let order = sequence(&picks, &[], &[]);
+        assert_eq!(order.len(), picks.len());
+        let shown = artists_in_order(&picks, &order[..SPREAD_WINDOW]);
+        assert_eq!(most_by_one(&shown), 3, "{shown:?}");
+        assert!(shown.windows(2).all(|w| w[0] != w[1]), "{shown:?}");
+        // three artists only: any number of songs each, still never back to back
+        let picks: Vec<Pick> = (0..3).flat_map(|i| (0..10).map(move |k| spread_pick(format!("b{i}-{k}"), &format!("B{i}"), Source::Similar, 0.9)).collect::<Vec<_>>()).collect();
+        let order = sequence(&picks, &[], &[]);
+        assert_eq!(order.len(), picks.len());
+        let shown = artists_in_order(&picks, &order[..SPREAD_WINDOW]);
+        assert!(shown.windows(2).all(|w| w[0] != w[1]), "{shown:?}");
+        // one artist and a few others: back to back only once nothing else is left
+        let mut picks: Vec<Pick> = (0..20).map(|k| spread_pick(format!("c{k}"), "C", Source::Similar, 0.9)).collect();
+        picks.extend((0..3).map(|i| spread_pick(format!("d{i}"), &format!("D{i}"), Source::Similar, 0.5)));
+        let order = sequence(&picks, &[], &[]);
+        assert_eq!(order.len(), picks.len());
+        let artists = artists_in_order(&picks, &order);
+        let last_other = artists.iter().rposition(|a| *a != "C").unwrap();
+        let first_pair = artists.windows(2).position(|w| w[0] == w[1]).unwrap();
+        assert!(first_pair > last_other, "{artists:?}");
     }
 
     #[test]

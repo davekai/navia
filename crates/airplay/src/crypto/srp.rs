@@ -73,9 +73,7 @@ pub struct SrpProof {
 }
 
 impl SrpClient {
-    /// Create new SRP client with identity and password.
-    ///
-    /// For AirPlay, identity is typically "Pair-Setup" and password is the PIN.
+    /// for AirPlay, identity is "Pair-Setup" and password is the PIN.
     pub fn new(identity: &[u8], password: &[u8]) -> Self {
         let params = SrpParams::default();
 
@@ -116,7 +114,6 @@ impl SrpClient {
         pad_to_n(&self.public_key)
     }
 
-    /// Process server's challenge and generate proof.
     pub fn process_challenge(&self, challenge: &SrpChallenge) -> Result<SrpProof, CryptoError> {
         let b = BigUint::from_bytes_be(&challenge.server_public_key);
 
@@ -127,7 +124,6 @@ impl SrpClient {
             ));
         }
 
-        // Get private key a
         let a = BigUint::from_bytes_be(&self.private_key);
 
         // Compute u = H(PAD(A) || PAD(B))
@@ -189,17 +185,11 @@ impl SrpClient {
         })
     }
 
-    /// Verify server's proof M2.
     pub fn verify_server_proof(&self, proof: &[u8], expected: &[u8]) -> bool {
         proof.ct_eq(expected).into()
     }
 
-    /// Dump SRP transcript for debugging M4 failures.
-    ///
-    /// Call this after `process_challenge()` to log all SRP values for comparison
-    /// against known-good implementations like shairport-sync.
-    ///
-    /// Enable with `cargo build --features srp-debug`
+    /// dump the SRP transcript for debugging M4 failures. enable with `--features srp-debug`.
     #[cfg(feature = "srp-debug")]
     pub fn dump_transcript(&self, challenge: &SrpChallenge, proof: &SrpProof) {
         fn hex_str(data: &[u8]) -> String {
@@ -241,9 +231,7 @@ fn compute_m1(
     let h_n = hasher.finalize();
 
     // H(g)
-    // IMPORTANT: Apple expects H(g) over the raw generator bytes (e.g., 0x05),
-    // NOT H(PAD(g)). Padding g here causes SRP proof mismatch -> M4 error 0x02.
-    // This differs from k = H(N || PAD(g)) which correctly uses padding.
+    // Apple expects H(g) over the raw generator bytes, not H(PAD(g)) as in k; padding here fails M4 with 0x02.
     let g_bytes = params.g.to_bytes_be();
     let mut hasher = Sha512::new();
     hasher.update(&g_bytes);
@@ -504,8 +492,7 @@ mod tests {
 
         #[test]
         fn uses_constant_time_comparison() {
-            // The constant-time comparison is provided by subtle crate
-            // We verify it works correctly
+            // the comparison is constant-time, through subtle.
             let client = SrpClient::new(b"Pair-Setup", b"1234");
             let proof = [0x42u8; 64];
             let expected = [0x42u8; 64];
@@ -588,7 +575,6 @@ mod tests {
                 // Generate server private key b
                 let b = OsRng.gen_biguint(256);
 
-                // Compute k
                 let k = compute_k(&params);
 
                 // Server public key B = (k*v + g^b) mod N
@@ -637,22 +623,16 @@ mod tests {
             let password = b"1234";
             let salt = [0x42u8; 16];
 
-            // Create server
             let server = MockSrpServer::new(identity, password, salt);
 
-            // Create client
             let client = SrpClient::new(identity, password);
 
-            // Get challenge from server
             let challenge = server.challenge();
 
-            // Client processes challenge
             let proof = client.process_challenge(&challenge).unwrap();
 
-            // Server computes session key
             let server_session_key = server.compute_session_key(&client.public_key());
 
-            // Both should have the same session key
             assert_eq!(proof.shared_secret, server_session_key);
         }
 
@@ -669,16 +649,12 @@ mod tests {
             // Client uses wrong password
             let client = SrpClient::new(identity, wrong_password);
 
-            // Get challenge from server
             let challenge = server.challenge();
 
-            // Client processes challenge
             let proof = client.process_challenge(&challenge).unwrap();
 
-            // Server computes session key
             let server_session_key = server.compute_session_key(&client.public_key());
 
-            // Session keys should NOT match
             assert_ne!(proof.shared_secret, server_session_key);
         }
     }
@@ -688,20 +664,16 @@ mod tests {
 
         #[test]
         fn private_key_zeroized_on_drop() {
-            // Create client, drop it, verify memory is cleared
-            // This is verified by the ZeroizeOnDrop derive
+            // ZeroizeOnDrop clears the private key; nothing to observe here.
             let client = SrpClient::new(b"Pair-Setup", b"1234");
             drop(client);
-            // The ZeroizeOnDrop derive ensures the private key is cleared
         }
 
         #[test]
         fn password_zeroized_on_drop() {
-            // Create client, drop it, verify password is cleared
-            // This is verified by the ZeroizeOnDrop derive
+            // ZeroizeOnDrop clears the password; nothing to observe here.
             let client = SrpClient::new(b"Pair-Setup", b"1234");
             drop(client);
-            // The ZeroizeOnDrop derive ensures the password is cleared
         }
     }
 
@@ -710,14 +682,12 @@ mod tests {
 
         #[test]
         fn rfc5054_appendix_b_prime() {
-            // RFC 5054 Appendix B includes test vectors for 1024-bit group
-            // We use 3072-bit, so we just verify our prime is valid
+            // RFC 5054's vectors are for the 1024-bit group; for 3072-bit, only sanity-check the prime.
             let params = SrpParams::default();
 
             // Verify N is odd (should be for a prime)
             assert!(&params.n % BigUint::from(2u32) != BigUint::ZERO);
 
-            // Verify N > g
             assert!(params.n > params.g);
 
             // Verify g^2 mod N != 1 (g has high order)

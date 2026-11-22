@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio::time::Instant;
 
 use crate::client::user_agent;
-use crate::lanyard::matching::{find_named, key};
+use crate::lanyard::matching::{find_named_or_bare, first_credited, key};
 use crate::library::Library;
 
 /// The account setting's key in `meta`. "1" is on, "0" off and absent unset.
@@ -68,9 +68,15 @@ const BUDGET: Duration = Duration::from_secs(5);
 /// Timeout for one request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Time between two requests. Deezer doesn't publish its limit, and bursts of 8 per second hit it after about 70.
-const PACE: Duration = Duration::from_millis(200);
-/// At most this many same-name Deezer artists are compared by top tracks.
+/// Deezer's largest page.
+const PAGE_LIMIT: usize = 100;
+/// pages read of one album's tracks.
+const ALBUM_PAGES: usize = 5;
+const ALBUM_SEARCH_LIMIT: u32 = 10;
+/// time between two requests: 40 in 5 s. Deezer refuses the 51st request inside 5 s (measured); the
+/// room left is for other software on the same address.
+const PACE: Duration = Duration::from_millis(125);
+/// Deezer artists with the same name compared by their top tracks, at most.
 const SAME_NAME_CHECKS: usize = 3;
 /// Cache lifetimes for a name's artist, a name Deezer lacks, a radio's tracks and a track's ISRC.
 const ARTIST_TTL: Duration = Duration::from_secs(6 * 3600);
@@ -84,9 +90,9 @@ const BACKOFF_FIRST: Duration = Duration::from_secs(10);
 const BACKOFF_MAX: Duration = Duration::from_secs(10 * 60);
 /// Deezer's error code for the quota.
 const QUOTA_CODE: i64 = 4;
-/// Requests per hour at most. Past it, cached answers serve until the hour moves on.
-const HOURLY_CAP: usize = 300;
-/// Size cap for answers kept in the library's `deezer_cache`, evicted least recently used first.
+/// requests per hour at most, for everything Navia asks Deezer. past it, cached answers serve until the hour moves on.
+const HOURLY_CAP: usize = 3000;
+/// What the answers kept in the library may take (`deezer_cache`), least recently used out first.
 const STORE_MAX_BYTES: i64 = 20 * 1024 * 1024;
 
 
@@ -134,6 +140,30 @@ pub struct Named {
 #[serde(default)]
 pub struct Titled {
     pub title: String,
+}
+
+/// one track of a Deezer album, with its popularity.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AlbumTrack {
+    pub id: u64,
+    pub title: String,
+    pub title_short: String,
+    /// seconds.
+    pub duration: Option<u64>,
+    pub rank: u64,
+    pub isrc: Option<String>,
+    pub track_position: Option<u32>,
+    pub disk_number: Option<u32>,
+}
+
+/// a Deezer album from a search.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FoundAlbum {
+    pub id: u64,
+    pub title: String,
+    pub artist: Named,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -222,14 +252,14 @@ impl Deezer {
         self
     }
 
-    fn http(&self) -> &reqwest::Client {
-        // Built at first use, so the app version is set by then.
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        // Built at first use, so the app's version is set by then (`client::set_app_version`).
         self.http.get_or_init(|| reqwest::Client::builder().user_agent(user_agent()).connect_timeout(CONNECT_TIMEOUT).build().unwrap_or_default())
     }
 
-    /// One paced GET within `deadline`, reading Deezer's errors out of its 200 answers.
-    /// A repeat of a request in flight waits for its answer.
-    async fn get(&self, path: &str, query: &[(&str, String)], deadline: Instant) -> Answer {
+    /// One GET, paced, within `deadline`, with Deezer's errors read out of its 200 answers. The
+    /// same request asked again while one is under way waits for that one's answer.
+    pub(crate) async fn get(&self, path: &str, query: &[(&str, String)], deadline: Instant) -> Answer {
         let mut url = url::Url::parse(&format!("{}{path}", self.base)).map_err(|e| DeezerError::Connection(e.to_string()))?;
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
@@ -333,8 +363,17 @@ impl Deezer {
                 return Ok(known);
             }
         }
-        let body = self.get("/search/artist", &[("q", name.to_string()), ("limit", "10".to_string())], deadline).await?;
-        let mut same: Vec<DeezerArtist> = Self::data::<DeezerArtist>(body)?.into_iter().filter(|a| a.id > 0 && key(&a.name) == wanted).collect();
+        // the name as given first; only when Deezer has no artist by it, the first credited one.
+        let mut same: Vec<DeezerArtist> = Vec::new();
+        let first = first_credited(name);
+        for asked in std::iter::once(name).chain((first != name.trim()).then_some(first)) {
+            let body = self.get("/search/artist", &[("q", asked.to_string()), ("limit", "10".to_string())], deadline).await?;
+            let exact = key(asked);
+            same = Self::data::<DeezerArtist>(body)?.into_iter().filter(|a| a.id > 0 && !exact.is_empty() && key(&a.name) == exact).collect();
+            if !same.is_empty() {
+                break;
+            }
+        }
         same.sort_by_key(|a| std::cmp::Reverse(a.nb_fan));
         let found = match same.len() {
             0 => None,
@@ -344,7 +383,7 @@ impl Deezer {
                 for artist in same.iter().take(SAME_NAME_CHECKS) {
                     let Ok(body) = self.get(&format!("/artist/{}/top", artist.id), &[("limit", "10".to_string())], deadline).await else { break };
                     let tracks = Self::data::<DeezerTrack>(body).unwrap_or_default();
-                    let owned = tracks.iter().filter(|t| find_named(db, &t.title, &[name], &t.album.title, t.duration.map(|d| d * 1000)).is_some()).count();
+                    let owned = tracks.iter().filter(|t| find_named_or_bare(db, &t.title, &[name], &t.album.title, t.duration.map(|d| d * 1000)).is_some()).count();
                     if best.is_none_or(|(n, _)| owned > n) {
                         best = Some((owned, artist.id));
                     }
@@ -397,7 +436,31 @@ impl Deezer {
         self.get(&format!("/track/isrc:{isrc}"), &[], deadline).await
     }
 
-    /// A track's ISRC, for checks against the real service.
+    /// a Deezer album's tracks with their `rank`, in album order.
+    pub(crate) async fn album_tracks(&self, album: u64, deadline: Instant) -> Result<Vec<AlbumTrack>, DeezerError> {
+        let mut tracks = Vec::new();
+        for page in 0..ALBUM_PAGES {
+            let query = [("index", (page * PAGE_LIMIT).to_string()), ("limit", PAGE_LIMIT.to_string())];
+            let body = self.get(&format!("/album/{album}/tracks"), &query, deadline).await?;
+            let more = body.get("next").and_then(Value::as_str).is_some();
+            let found = Self::data::<AlbumTrack>(body)?;
+            let full = found.len() >= PAGE_LIMIT;
+            tracks.extend(found.into_iter().filter(|t| t.id > 0));
+            if !more || !full {
+                break;
+            }
+        }
+        Ok(tracks)
+    }
+
+    /// albums Deezer finds for an artist and title (`/search/album`), best first.
+    pub(crate) async fn search_album(&self, artist: &str, title: &str, deadline: Instant) -> Result<Vec<FoundAlbum>, DeezerError> {
+        let q = format!("artist:\"{}\" album:\"{}\"", artist.replace('"', ""), title.replace('"', ""));
+        let body = self.get("/search/album", &[("q", q), ("limit", ALBUM_SEARCH_LIMIT.to_string())], deadline).await?;
+        Ok(Self::data::<FoundAlbum>(body)?.into_iter().filter(|a| a.id > 0).collect())
+    }
+
+    /// A track's ISRC, on its own (for checks against the real service).
     pub async fn track_isrc(&self, track: u64) -> Option<String> {
         self.isrc(track, Instant::now() + REQUEST_TIMEOUT).await
     }

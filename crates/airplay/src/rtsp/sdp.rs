@@ -1,22 +1,15 @@
-//! SDP builder for RAOP (AirPlay 1) ANNOUNCE requests.
-//!
-//! Constructs an SDP body declaring ALAC codec parameters and encryption
-//! keys for the receiver's audio pipeline configuration.
+//! SDP bodies for RAOP (AirPlay 1) ANNOUNCE: ALAC codec parameters and encryption keys.
 
 use crate::base::error::Result;
 use crate::base::AudioFormat;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 
-/// Builder for RAOP ANNOUNCE SDP bodies.
 pub struct SdpBuilder {
     /// Session ID (random u32)
     session_id: u32,
-    /// Sender's local IP address
     local_ip: String,
-    /// Receiver's IP address
     remote_ip: String,
-    /// Audio format configuration
     audio_format: AudioFormat,
     /// Minimum latency in samples
     latency_min: u32,
@@ -27,7 +20,6 @@ pub struct SdpBuilder {
 }
 
 impl SdpBuilder {
-    /// Create a new SDP builder.
     pub fn new(
         session_id: u32,
         local_ip: String,
@@ -46,17 +38,14 @@ impl SdpBuilder {
         }
     }
 
-    /// Set RSA-encrypted AES key and IV for encrypted RAOP streams.
-    ///
-    /// The `rsa_aes_key` should be the 256-byte RSA-OAEP ciphertext of the
-    /// 16-byte AES key. The `aes_iv` is the raw 16-byte initialization vector.
+    /// for encrypted RAOP: `rsa_aes_key` is the 256-byte RSA-OAEP ciphertext of the 16-byte AES key,
+    /// `aes_iv` the raw 16-byte IV.
     pub fn with_encryption(mut self, rsa_aes_key: Vec<u8>, aes_iv: [u8; 16]) -> Self {
         self.rsa_aes_key = Some(rsa_aes_key);
         self.aes_iv = Some(aes_iv);
         self
     }
 
-    /// Build the complete SDP body as bytes.
     pub fn build(&self) -> Result<Vec<u8>> {
         let af = &self.audio_format;
         let spf = af.frames_per_packet;
@@ -96,7 +85,6 @@ impl SdpBuilder {
             sr,
         );
 
-        // Add encryption attributes if set
         if let (Some(ref rsa_key), Some(ref iv)) = (&self.rsa_aes_key, &self.aes_iv) {
             let key_b64 = STANDARD_NO_PAD.encode(rsa_key);
             let iv_b64 = STANDARD_NO_PAD.encode(iv);
@@ -183,7 +171,6 @@ mod tests {
         let key_line = sdp.lines().find(|l| l.starts_with("a=rsaaeskey:")).unwrap();
         let key_b64 = &key_line["a=rsaaeskey:".len()..];
         assert!(!key_b64.contains('='), "Base64 should use NO_PAD");
-        // Decode should succeed
         let decoded = STANDARD_NO_PAD.decode(key_b64).unwrap();
         assert_eq!(decoded.len(), 256);
 

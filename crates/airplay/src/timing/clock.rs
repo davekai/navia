@@ -36,7 +36,6 @@ pub struct Clock {
 }
 
 impl Clock {
-    /// Create new clock with sample rate.
     pub fn new(sample_rate: u32) -> Self {
         Self {
             start_instant: Instant::now(),
@@ -63,7 +62,6 @@ impl Clock {
         unix_to_ntp(self.now_wall_ns())
     }
 
-    /// Convert wall-clock nanoseconds to RTP timestamp.
     pub fn wall_to_rtp(&self, wall_ns: u64) -> u32 {
         let start_ns = self.start_system
             .duration_since(UNIX_EPOCH)
@@ -73,7 +71,6 @@ impl Clock {
         ns_to_samples(elapsed_ns, self.sample_rate)
     }
 
-    /// Convert RTP timestamp to wall-clock nanoseconds.
     pub fn rtp_to_wall(&self, rtp: u32) -> u64 {
         let start_ns = self.start_system
             .duration_since(UNIX_EPOCH)
@@ -83,7 +80,6 @@ impl Clock {
         start_ns + elapsed_ns
     }
 
-    /// Create timestamp pair for current time.
     pub fn timestamp_pair(&self) -> TimestampPair {
         let wall_ns = self.now_wall_ns();
         TimestampPair {
@@ -97,17 +93,14 @@ impl Clock {
         (local_ns as i64 + offset.offset_ns) as u64
     }
 
-    /// Convert samples to nanoseconds.
     pub fn samples_to_ns(&self, samples: u32) -> u64 {
         samples_to_ns(samples, self.sample_rate)
     }
 
-    /// Convert nanoseconds to samples.
     pub fn ns_to_samples(&self, ns: u64) -> u32 {
         ns_to_samples(ns, self.sample_rate)
     }
 
-    /// Get the sample rate.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -115,12 +108,10 @@ impl Clock {
 
 // Conversion helpers
 
-/// Convert samples to nanoseconds at given sample rate.
 pub fn samples_to_ns(samples: u32, sample_rate: u32) -> u64 {
     (samples as u64 * 1_000_000_000) / sample_rate as u64
 }
 
-/// Convert nanoseconds to samples at given sample rate.
 pub fn ns_to_samples(ns: u64, sample_rate: u32) -> u32 {
     ((ns as u128 * sample_rate as u128) / 1_000_000_000) as u32
 }
@@ -138,7 +129,6 @@ pub fn unix_to_ntp(unix_ns: u64) -> u64 {
     (ntp_secs << 32) | (ntp_frac as u64)
 }
 
-/// Convert NTP timestamp to Unix nanoseconds.
 pub fn ntp_to_unix(ntp: u64) -> u64 {
     let ntp_secs = ntp >> 32;
     let ntp_frac = ntp & 0xFFFFFFFF;
@@ -189,7 +179,6 @@ mod tests {
         #[test]
         fn new_captures_start_time() {
             let clock = Clock::new(44100);
-            // Immediately after creation, monotonic time should be very small
             assert!(clock.now_mono_ns() < 1_000_000_000); // Less than 1 second
         }
 
@@ -274,7 +263,6 @@ mod tests {
                 .unwrap()
                 .as_nanos() as u64;
 
-            // Test several values
             for offset_ms in [0, 100, 500, 1000, 5000] {
                 let original_wall = start_ns + (offset_ms * 1_000_000);
                 let rtp = clock.wall_to_rtp(original_wall);
@@ -448,7 +436,6 @@ mod tests {
             // NTP time before Unix epoch should saturate to 0
             let ntp = (NTP_EPOCH_OFFSET - 1) << 32; // 1 second before Unix epoch
             let unix = ntp_to_unix(ntp);
-            // This should underflow protection kick in
             assert_eq!(unix, 0);
         }
     }

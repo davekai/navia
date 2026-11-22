@@ -100,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let anchors = [anchor];
             let recent = HashSet::new();
             let day = m.before.last().map_or(0, |e| e.started_ms.div_euclid(86_400_000));
-            let inputs = plan::Inputs { anchors: &anchors, similar: &similar, deezer: found.as_ref(), recent: &recent, fatigue: &Default::default(), day, provisional: false };
+            let inputs = plan::Inputs { anchors: &anchors, similar: &similar, deezer: found.as_ref(), listenbrainz: &[], recent: &recent, fatigue: &Default::default(), day, provisional: false };
             let picks = plan::build(Some(&db), &inputs, &|s, _| heard.contains(s.id.as_str()) || filter.leaves_out(s), &history);
             picks.into_iter().take(TOP).map(|p| p.song.id).collect()
         });

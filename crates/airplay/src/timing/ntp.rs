@@ -29,7 +29,6 @@ pub const TIMING_RESPONSE_PT: u8 = 83;
 /// - Bytes 24-31: Transmit timestamp = T1 (requester's send time)
 #[derive(Debug, Clone, Copy)]
 pub struct NtpRequest {
-    /// Sequence number.
     pub sequence: u16,
     /// Reference timestamp (our send time as NTP).
     pub reference_time: u64,
@@ -44,13 +43,11 @@ impl NtpRequest {
         }
     }
 
-    /// Create with specific sequence number.
     pub fn with_sequence(mut self, seq: u16) -> Self {
         self.sequence = seq;
         self
     }
 
-    /// Serialize to 32 bytes.
     pub fn serialize(&self) -> [u8; 32] {
         let mut buf = [0u8; 32];
 
@@ -69,7 +66,6 @@ impl NtpRequest {
         buf
     }
 
-    /// Parse from bytes.
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 32 {
             return Err(Error::Parse(
@@ -79,7 +75,6 @@ impl NtpRequest {
             ));
         }
 
-        // Verify RTP header
         let pt = data[1] & 0x7F;
         if pt != TIMING_REQUEST_PT {
             return Err(Error::Parse(
@@ -120,7 +115,6 @@ impl Default for NtpRequest {
 /// - Bytes 24-31: Send time (when receiver sent response)
 #[derive(Debug, Clone, Copy)]
 pub struct NtpResponse {
-    /// Sequence number.
     pub sequence: u16,
     /// Reference time (echoed from our request).
     pub reference_time: u64,
@@ -131,7 +125,6 @@ pub struct NtpResponse {
 }
 
 impl NtpResponse {
-    /// Create response from incoming request.
     pub fn from_request(request: &NtpRequest, receive_time: u64, send_time: u64) -> Self {
         Self {
             sequence: request.sequence,
@@ -141,7 +134,6 @@ impl NtpResponse {
         }
     }
 
-    /// Serialize to 32-byte NTP response packet.
     pub fn serialize(&self) -> [u8; 32] {
         let mut buf = [0u8; 32];
         buf[0] = 0x80; // V=2
@@ -154,7 +146,6 @@ impl NtpResponse {
         buf
     }
 
-    /// Parse from bytes.
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 32 {
             return Err(Error::Parse(
@@ -164,7 +155,6 @@ impl NtpResponse {
             ));
         }
 
-        // Verify RTP header
         let pt = data[1] & 0x7F;
         if pt != TIMING_RESPONSE_PT {
             return Err(Error::Parse(
@@ -229,7 +219,6 @@ pub struct NtpTimingClient {
 }
 
 impl NtpTimingClient {
-    /// Create new client.
     pub fn new(remote_addr: SocketAddr, sample_rate: u32) -> Self {
         Self {
             remote_addr,
@@ -250,17 +239,16 @@ impl NtpTimingClient {
         Ok(port)
     }
 
-    /// Get local port.
     pub fn local_port(&self) -> Option<u16> {
         self.socket.as_ref().and_then(|s| s.local_addr().ok().map(|a| a.port()))
     }
 
-    /// Get clock offset in nanoseconds.
+    /// clock offset in nanoseconds.
     pub fn offset_ns(&self) -> i64 {
         self.offset.offset_ns
     }
 
-    /// Get last round-trip time in nanoseconds.
+    /// Last round-trip time in nanoseconds.
     pub fn rtt_ns(&self) -> u64 {
         self.offset.rtt_ns
     }
@@ -287,21 +275,18 @@ impl TimingProtocol for NtpTimingClient {
                 crate::base::error::RtspError::NoSession
             ))?;
 
-        // Build and send request
         let request = NtpRequest::new(&self.clock)
             .with_sequence(self.sequence);
         self.sequence = self.sequence.wrapping_add(1);
 
         socket.send_to(&request.serialize(), self.remote_addr)?;
 
-        // Receive response
         let mut buf = [0u8; 64];
         let (len, _) = socket.recv_from(&mut buf)?;
         let recv_time = self.clock.now_ntp();
 
         let response = NtpResponse::parse(&buf[..len])?;
 
-        // Calculate offset
         let offset_ns = response.clock_offset(recv_time);
         let rtt_ns = response.round_trip_time(recv_time);
 
@@ -355,10 +340,7 @@ pub async fn timing_sync_loop(
     Ok(())
 }
 
-/// NTP timing server that responds to incoming timing requests.
-///
-/// The AirPlay receiver sends NTP timing requests to verify clock synchronization.
-/// This server listens on a UDP port and responds with accurate timestamps.
+/// answers the receiver's NTP timing requests.
 pub struct NtpTimingServer {
     socket: Arc<TokioUdpSocket>,
     port: u16,
@@ -370,8 +352,7 @@ pub struct NtpTimingServer {
     served_notify: Arc<Notify>,
 }
 
-/// Navia: dropped without `stop` (a connect that timed out), the listener must still end, or
-/// its socket keeps the fixed port and the next session lands on a random one.
+/// dropped without `stop` (a timed-out connect), the listener must still end, or the fixed port stays taken.
 impl Drop for NtpTimingServer {
     fn drop(&mut self) {
         let _ = self.shutdown_tx.send(true);
@@ -387,8 +368,7 @@ impl NtpTimingServer {
         Self::start_on(sample_rate, 0).await
     }
 
-    /// Bind to `port` (0 for any) and start the background listener. Navia: a fixed port lets a
-    /// single firewall rule cover the receiver's timing requests.
+    /// bind to `port` (0 for any) and start the listener. a fixed port lets one firewall rule cover it.
     pub async fn start_on(sample_rate: u32, port: u16) -> Result<Self> {
         let socket = TokioUdpSocket::bind(("0.0.0.0", port)).await?;
         let port = socket.local_addr()?.port();
@@ -417,17 +397,13 @@ impl NtpTimingServer {
         })
     }
 
-    /// Wait until at least `min_requests` timing requests have been answered,
-    /// or `timeout` elapses. Returns whether the threshold was reached.
-    ///
-    /// Receivers such as Apple TV start their NTP exchange right after SETUP
-    /// phase 1 and answer an early SETUP phase 2 with `400 Bad Request` if
-    /// it overtakes that exchange, so callers should wait here first.
-    /// Timing requests answered so far (Navia: 0 after SETUP usually means a firewall).
+    /// timing requests answered so far; 0 after SETUP usually means a firewall.
     pub fn requests_served(&self) -> u64 {
         self.served.load(Ordering::Acquire)
     }
 
+    /// waits for `min_requests` answered requests or `timeout`. Apple TV rejects a SETUP phase 2
+    /// that overtakes its timing exchange with 400, so callers wait here first.
     pub async fn wait_for_requests(&self, min_requests: u64, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -444,12 +420,10 @@ impl NtpTimingServer {
         }
     }
 
-    /// Get the local port number.
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// Stop the timing server.
     pub async fn stop(&mut self) {
         let _ = self.shutdown_tx.send(true);
         if let Some(handle) = self.task_handle.take() {
@@ -502,7 +476,6 @@ mod tests {
         fn new_sets_reference_time() {
             let clock = Clock::new(44100);
             let request = NtpRequest::new(&clock);
-            // Reference time should be non-zero
             assert_ne!(request.reference_time, 0);
         }
 
@@ -524,7 +497,6 @@ mod tests {
             };
             let bytes = request.serialize();
 
-            // Check RTP header
             assert_eq!(bytes[0], 0x80); // V=2
             assert_eq!(bytes[1], 0xD2); // PT=82 with marker
             assert_eq!(&bytes[2..4], &[0x12, 0x34]); // Sequence
@@ -718,14 +690,11 @@ mod tests {
 
         #[tokio::test]
         async fn responds_to_timing_request() {
-            // Start server
             let mut server = NtpTimingServer::start(44100).await.unwrap();
             let port = server.port();
 
-            // Create a client socket to send a request
             let client_socket = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-            // Build and send a timing request
             let request = NtpRequest {
                 sequence: 42,
                 reference_time: unix_to_ntp(1_000_000_000),
@@ -735,7 +704,6 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Receive response with timeout
             let mut buf = [0u8; 64];
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
@@ -746,7 +714,6 @@ mod tests {
             let (len, _addr) = result.expect("Timeout waiting for response").unwrap();
             let response = NtpResponse::parse(&buf[..len]).unwrap();
 
-            // Verify response echoes request data
             assert_eq!(response.sequence, 42);
             assert_eq!(response.reference_time, request.reference_time);
             // Receive and send times should be valid NTP timestamps
@@ -756,10 +723,7 @@ mod tests {
             server.stop().await;
         }
 
-        /// Regression test: dropping an NtpTimingServer without calling
-        /// `stop()` must end its background task. Before the fix,
-        /// `shutdown_rx.changed()` kept returning `Err` once the sender was
-        /// dropped, and `run_loop` busy-spun at 100% of a CPU core.
+        /// dropping an NtpTimingServer without `stop()` must end its background task, not busy-spin.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn run_loop_exits_when_server_is_dropped() {
             let mut server = NtpTimingServer::start(44100).await.unwrap();
@@ -857,8 +821,7 @@ mod tests {
 mod navia_drop_tests {
     use super::*;
 
-    /// Navia: a server dropped without `stop` (a timed-out connect) lets go of its port, so the
-    /// next session can bind the same fixed port.
+    /// a server dropped without `stop` frees its port, so the next session can bind the same fixed port.
     #[tokio::test]
     async fn dropping_the_server_frees_its_port() {
         let server = NtpTimingServer::start_on(44_100, 0).await.unwrap();

@@ -8,9 +8,11 @@ pub mod deezer_src;
 pub mod eval;
 pub mod fatigue;
 pub mod junk;
+pub mod lb_src;
 pub mod plan;
 pub mod playlog;
 pub mod sequence;
+pub mod server_src;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -123,6 +125,8 @@ pub struct Shared {
     current: Mutex<Vec<String>>,
     /// Autoplay's picks skipped early in a row in this context, and the artists held back for it.
     skips: Mutex<SkipRun>,
+    /// the server's cleaned similar songs per anchor for this session (`server_src`), oldest first.
+    cleaned: Mutex<Vec<(String, Vec<Song>)>>,
 }
 
 /// After [`SKIP_RUN`] early skips of Autoplay's picks in a row, their artists are held back for
@@ -169,6 +173,20 @@ impl Shared {
         *self.current.lock().expect("current") == anchors
     }
 
+    /// the server's cleaned similar songs for this anchor, when known this session.
+    pub fn cleaned(&self, anchor: &str) -> Option<Vec<Song>> {
+        self.cleaned.lock().expect("cleaned").iter().find(|(a, _)| a == anchor).map(|(_, s)| s.clone())
+    }
+
+    /// keeps the server's cleaned similar songs for this anchor for the session.
+    pub fn keep_cleaned(&self, anchor: &str, songs: Vec<Song>) {
+        let mut kept = self.cleaned.lock().expect("cleaned");
+        kept.retain(|(a, _)| a != anchor);
+        kept.push((anchor.to_string(), songs));
+        let over = kept.len().saturating_sub(server_src::KEEP_ANCHORS);
+        kept.drain(..over);
+    }
+
     /// Songs Autoplay is offering now, in `mode`.
     pub fn note_offered<'a>(&self, ids: impl Iterator<Item = &'a str>, mode: AutoplayMode) {
         let now = Instant::now();
@@ -187,11 +205,12 @@ impl Shared {
     }
 }
 
-/// Deezer is only asked once a context has played this long, so quick changes cost nothing.
-pub const DEEZER_DEBOUNCE: Duration = Duration::from_secs(10);
-/// How long Deezer's part may take before the plan is sealed without the rest.
-pub const DEEZER_TIMEOUT: Duration = Duration::from_secs(6);
-/// How many of a started list's last songs anchor its context.
+/// Deezer and ListenBrainz are asked only once the context has played this long, so quick changes
+/// ask nothing.
+pub const EXTERNAL_DEBOUNCE: Duration = Duration::from_secs(10);
+/// how long their part may take before the plan is sealed without the rest.
+pub const EXTERNAL_TIMEOUT: Duration = Duration::from_secs(6);
+/// A started list's last songs that anchor its context.
 pub const ANCHORS: usize = 3;
 
 /// A song's genre tag, or "".
@@ -210,6 +229,8 @@ pub struct Navia {
     similar: HashMap<String, Vec<Song>>,
     /// Deezer's answer once the ask finished. `Some(None)` when it's off or timed out.
     deezer: Option<Option<DeezerAnswers>>,
+    /// ListenBrainz's similar recordings per anchor as library songs, with Deezer's answer.
+    listenbrainz: Vec<(String, Vec<Song>)>,
     asking: Option<Vec<String>>,
     plan: Option<Plan>,
     /// Artists held back after early skips, as applied to the plan.
@@ -267,6 +288,7 @@ impl Navia {
         self.context += 1;
         self.anchors = anchors;
         self.deezer = None;
+        self.listenbrainz.clear();
         self.asking = None;
         self.plan = None;
         self.held.clear();
@@ -303,17 +325,19 @@ impl Navia {
         self.asking = Some(seeds.to_vec());
     }
 
-    /// Takes in the answers for `seeds`. The server's are cached for later contexts. Answers for
-    /// the current anchors complete the context so the next [`Navia::songs`] seals the plan.
-    pub fn finish(&mut self, seeds: Vec<String>, similar: Vec<Vec<Song>>, deezer: Option<DeezerAnswers>) {
+    /// What an ask for `seeds` brought. The server's answers are kept for later contexts; for
+    /// this context's anchors it completes the context, so the next [`Navia::songs`] seals the
+    /// plan. Answers for an older context only fill the cache.
+    pub fn finish(&mut self, seeds: Vec<String>, answers: crate::autoplay::Answers) {
         if self.asking.as_ref() == Some(&seeds) {
             self.asking = None;
         }
-        for (seed, songs) in seeds.iter().zip(similar) {
+        for (seed, songs) in seeds.iter().zip(answers.similar) {
             self.similar.insert(seed.clone(), songs);
         }
         if seeds == self.anchors && self.deezer.is_none() {
-            self.deezer = Some(deezer);
+            self.deezer = Some(answers.deezer);
+            self.listenbrainz = answers.listenbrainz;
             if self.plan.as_ref().is_some_and(|p| !p.sealed) {
                 self.plan = None;
             }
@@ -377,7 +401,7 @@ impl Navia {
         let lead = self.anchors[0].as_str();
         let recent = db.map(|db| recent_offers(db, lead, day)).unwrap_or_default();
         let fatigue = db.map(|db| fatigue::multipliers(db, playlog::now_ms())).unwrap_or_default();
-        let inputs = plan::Inputs { anchors: &anchors, similar: &similar, deezer: self.deezer.as_ref().and_then(Option::as_ref), recent: &recent, fatigue: &fatigue, day, provisional: !sealed };
+        let inputs = plan::Inputs { anchors: &anchors, similar: &similar, deezer: self.deezer.as_ref().and_then(Option::as_ref), listenbrainz: &self.listenbrainz, recent: &recent, fatigue: &fatigue, day, provisional: !sealed };
         let history = history(db, queue);
         let songs: Vec<Song> = plan::build(db, &inputs, &|s, v| skip.skips(s, v) || queue.contains(&s.id), &history).into_iter().map(|p| p.song).collect();
         if sealed && let Some(db) = db {
@@ -402,7 +426,7 @@ pub fn list_from(db: Option<&Library>, anchors: &[Song], answers: crate::autopla
     let day = now.div_euclid(86_400_000);
     let fatigue = db.map(|db| fatigue::multipliers(db, now)).unwrap_or_default();
     let recent = HashSet::new();
-    let inputs = plan::Inputs { anchors, similar: &answers.similar, deezer: answers.deezer.as_ref(), recent: &recent, fatigue: &fatigue, day, provisional: false };
+    let inputs = plan::Inputs { anchors, similar: &answers.similar, deezer: answers.deezer.as_ref(), listenbrainz: &answers.listenbrainz, recent: &recent, fatigue: &fatigue, day, provisional: false };
     let ids: HashSet<&str> = anchors.iter().map(|a| a.id.as_str()).collect();
     let versions: HashSet<String> = anchors.iter().map(crate::autoplay::song_version).collect();
     let junk = junk::Filter::after(anchors);
@@ -505,7 +529,7 @@ mod tests {
         let mut again = song("a2", "Lead");
         again.title = "a (Live)".into();
         similar.splice(0..0, [short, karaoke, again]);
-        let answers = crate::autoplay::Answers { similar: vec![similar], deezer: None };
+        let answers = crate::autoplay::Answers { similar: vec![similar], ..Default::default() };
         let list = list_from(Some(&db), std::slice::from_ref(&anchor), answers, 20);
         assert_eq!(list.len(), 20);
         assert!(list.iter().all(|s| !["a", "a2", "short", "k"].contains(&s.id.as_str())), "{:?}", list.iter().map(|s| &s.id).collect::<Vec<_>>());
@@ -517,7 +541,7 @@ mod tests {
         n.set_context(Some(db), vec![anchor.to_string()]);
         let seeds = n.wanted_fetch().unwrap();
         n.begin_fetch(&seeds);
-        n.finish(seeds, vec![answer()], None);
+        n.finish(seeds, crate::autoplay::Answers { similar: vec![answer()], ..Default::default() });
         n
     }
 

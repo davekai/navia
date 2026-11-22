@@ -202,7 +202,21 @@ fn migrations() -> Vec<String> {
         used_ms INTEGER NOT NULL,
         value TEXT NOT NULL
     ) WITHOUT ROWID;
-    CREATE INDEX idx_deezer_cache_used ON deezer_cache(used_ms);".to_string()]
+    CREATE INDEX idx_deezer_cache_used ON deezer_cache(used_ms);".to_string(),
+    // Smart transitions: each played song's measured start and end (`audio::edges`), as JSON,
+    // with the analysis version and the file size it was measured from.
+    "CREATE TABLE song_edges (
+        song_id TEXT PRIMARY KEY,
+        version INTEGER NOT NULL,
+        size INTEGER,
+        data TEXT NOT NULL
+    ) WITHOUT ROWID;".to_string(),
+    // an artist's top song ids as the server answered them, kept for the local day they were asked on.
+    "CREATE TABLE top_songs (
+        artist_id TEXT PRIMARY KEY,
+        day INTEGER NOT NULL,
+        ids TEXT NOT NULL
+    ) WITHOUT ROWID;".to_string()]
 }
 
 /// Apply any migrations that haven't run. Each runs in its own transaction with its version

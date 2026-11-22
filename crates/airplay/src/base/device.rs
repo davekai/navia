@@ -117,9 +117,7 @@ impl DeviceId {
 
         let s = s.trim();
 
-        // Try to parse based on separator
         let bytes: Vec<u8> = if s.contains(':') {
-            // Colon-separated format
             s.split(':')
                 .map(|part| {
                     u8::from_str_radix(part, 16)
@@ -127,7 +125,6 @@ impl DeviceId {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         } else if s.contains('-') {
-            // Hyphen-separated format
             s.split('-')
                 .map(|part| {
                     u8::from_str_radix(part, 16)
@@ -135,7 +132,6 @@ impl DeviceId {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         } else {
-            // Bare hex format (no separators)
             if s.len() != 12 {
                 return Err(ParseError::InvalidFormat(format!(
                     "MAC address must be 12 hex characters, got {}",
@@ -264,18 +260,13 @@ impl Device {
         self.features.supports_ptp() && self.source_version >= MIN_PTP_VERSION
     }
 
-    /// Get preferred socket address (prefers IPv4).
-    ///
-    /// Returns the first IPv4 address if available, otherwise the first IPv6.
-    /// Returns None if no addresses are available.
+    /// preferred socket address: the first IPv4, else the first IPv6.
     pub fn socket_addr(&self) -> Option<SocketAddr> {
-        // Prefer IPv4
         for addr in &self.addresses {
             if addr.is_ipv4() {
                 return Some(SocketAddr::new(*addr, self.port));
             }
         }
-        // Fall back to IPv6
         self.addresses
             .first()
             .map(|addr| SocketAddr::new(*addr, self.port))
@@ -399,7 +390,6 @@ mod tests {
             assert!(v4 < v5);
             assert!(v1 < v5);
 
-            // Equal versions
             assert!(Version::new(366, 0, 0) == Version::new(366, 0, 0));
         }
 

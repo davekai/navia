@@ -4,6 +4,7 @@
 //! [`WritePolicy`] first, so a [`WritePolicy::ReadOnly`] client can't change the server.
 
 mod auth;
+mod form;
 pub mod models;
 pub mod native;
 
@@ -16,6 +17,7 @@ use serde_json::Value;
 use url::Url;
 
 pub use auth::Credentials;
+pub use form::FormPost;
 pub use models::*;
 
 use crate::error::{Error, Result};
@@ -30,8 +32,32 @@ pub enum WritePolicy {
     ReadOnly,
 }
 
-/// The client name sent as the `c` parameter. Matching it is case-insensitive
-/// ([`is_navia_client`]) because some builds sent "navia".
+/// the offline switch: while it's on, nothing goes to the server. every request and server URL
+/// fails as if the server couldn't be reached, before anything is sent. shared by a client, its
+/// copies and the streams and downloads made from it.
+#[derive(Clone, Debug, Default)]
+pub struct OfflineSwitch(Arc<AtomicBool>);
+
+impl OfflineSwitch {
+    pub fn set(&self, on: bool) {
+        self.0.store(on, Ordering::Release);
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// the error a request gets while the switch is on: the same as an unreachable server.
+    pub fn check(&self) -> Result<()> {
+        if self.is_on() { Err(Error::Network(OFFLINE.to_string())) } else { Ok(()) }
+    }
+}
+
+/// the network error's text while the offline switch is on.
+pub const OFFLINE: &str = "offline";
+
+/// the client name Navia reports to the server (the `c` parameter). older builds sent "navia", so
+/// recognise it case-insensitively ([`is_navia_client`]).
 pub const CLIENT_NAME: &str = "Navia";
 /// The app's name wherever people read it. Only the wordmark is lowercase.
 pub const APP_DISPLAY_NAME: &str = "Navia";
@@ -41,8 +67,7 @@ pub const APP_ID: &str = "com.davekai.Navia";
 
 /// A client name without the listen-along marks Navia appends while sharing.
 fn bare_client_name(name: &str) -> &str {
-    use crate::listen_along::{CONTROL_MARK, FOLLOW_MARK, SHARE_MARK};
-    name.trim_end_matches([SHARE_MARK, CONTROL_MARK, FOLLOW_MARK]).trim()
+    name.trim_end_matches(crate::listen_along::MARKS).trim()
 }
 
 /// Whether a client name is Navia's, in any casing and with or without the listen-along marks.
@@ -181,14 +206,31 @@ struct Inner {
     /// While sharing, whether listeners may control this player.
     control: AtomicBool,
     following: AtomicBool,
-    /// The native API session, kept so pages don't log in on every visit.
-    native: std::sync::Mutex<native::NativeSession>,
-    /// The public web configuration once read. `Some(None)` when the page had none.
+    queued: AtomicBool,
+    /// Navidrome's native API session, kept so pages that read it don't log in on every visit,
+    /// and shared with the copies made by [`Client::copy_with_policy`].
+    native: Arc<native::NativeShared>,
+    /// The server's public web configuration (`window.__APP_CONFIG__` on `/app/`) once read:
+    /// `Some(None)` when the page answered without one. Unset until a read got an answer.
     public_config: std::sync::Mutex<Option<Option<Arc<Value>>>>,
+    offline: OfflineSwitch,
+    form: FormPost,
 }
 
 impl Client {
     pub fn new(config: ClientConfig) -> Result<Self> {
+        Self::with_native(config, Default::default(), OfflineSwitch::default(), None)
+    }
+
+    /// a copy for the same account with its own write policy and playback marks, sharing this
+    /// client's native session, so it neither logs in again nor ignores a wait the server asked for.
+    pub fn copy_with_policy(&self, policy: WritePolicy) -> Result<Self> {
+        let mut config = self.config().clone();
+        config.write_policy = policy;
+        Self::with_native(config, self.inner.native.clone(), self.inner.offline.clone(), Some(self.inner.form.clone()))
+    }
+
+    fn with_native(config: ClientConfig, native: Arc<native::NativeShared>, offline: OfflineSwitch, form: Option<FormPost>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(config.timeout)
             .user_agent(user_agent())
@@ -197,15 +239,37 @@ impl Client {
         base.push_str("/rest/");
         let rest_base = Url::parse(&base).map_err(|e| Error::InvalidUrl(e.to_string()))?;
         let writes_allowed = AtomicBool::new(config.write_policy == WritePolicy::Allowed);
-        Ok(Self { inner: Arc::new(Inner { http, rest_base, config, writes_allowed, sharing: AtomicBool::new(false), control: AtomicBool::new(false), following: AtomicBool::new(false), native: Default::default(), public_config: Default::default() }) })
+        let form = form.unwrap_or_else(|| FormPost::new(rest_base.to_string(), offline.clone()));
+        Ok(Self { inner: Arc::new(Inner { http, rest_base, config, writes_allowed, sharing: AtomicBool::new(false), control: AtomicBool::new(false), following: AtomicBool::new(false), queued: AtomicBool::new(false), native, public_config: Default::default(), offline, form }) })
+    }
+
+    /// turns the offline switch on or off for this client and every copy of it.
+    pub fn set_offline(&self, on: bool) {
+        self.inner.offline.set(on);
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.inner.offline.is_on()
+    }
+
+    /// the switch itself, for HTTP clients outside this one that talk to the same server.
+    pub fn offline_switch(&self) -> OfflineSwitch {
+        self.inner.offline.clone()
+    }
+
+    /// how requests carry their parameters, for HTTP clients outside this one that fetch this
+    /// client's URLs.
+    pub fn form_post(&self) -> FormPost {
+        self.inner.form.clone()
+    }
+
+    /// a request for one of this client's URLs (cover art, a stream) with its own HTTP client.
+    pub(crate) async fn fetch(&self, url: &str) -> reqwest::RequestBuilder {
+        self.inner.form.request(&self.inner.http, url).await
     }
 
     pub fn credentials(&self) -> &Credentials {
         &self.inner.config.credentials
-    }
-
-    pub(crate) fn http(&self) -> &reqwest::Client {
-        &self.inner.http
     }
 
     pub fn base_url(&self) -> &str {
@@ -239,15 +303,18 @@ impl Client {
         self.inner.sharing.load(Ordering::Acquire)
     }
 
-    /// Sets the control and following marks, which only apply while sharing.
-    pub fn set_listen_marks(&self, control: bool, following: bool) {
+    /// "Let listeners control playback", whether this player follows someone now, and whether it
+    /// has a song queued for the listening session: the reports' client name says so to the other
+    /// side (only while sharing).
+    pub fn set_listen_marks(&self, control: bool, following: bool, queued: bool) {
         self.inner.control.store(control, Ordering::Release);
         self.inner.following.store(following, Ordering::Release);
+        self.inner.queued.store(queued, Ordering::Release);
     }
 
     /// The client name playback reports carry, with the listen-along marks that apply.
     pub fn report_client_name(&self) -> String {
-        use crate::listen_along::{CONTROL_MARK, FOLLOW_MARK, SHARE_MARK};
+        use crate::listen_along::{CONTROL_MARK, FOLLOW_MARK, QUEUE_MARK, SHARE_MARK};
         let mut name = self.inner.config.client_name.clone();
         if self.sharing() {
             name.push(SHARE_MARK);
@@ -257,17 +324,23 @@ impl Client {
             if self.inner.following.load(Ordering::Acquire) {
                 name.push(FOLLOW_MARK);
             }
+            if self.inner.queued.load(Ordering::Acquire) {
+                name.push(QUEUE_MARK);
+            }
         }
         name
     }
 
-    /// Full URL for an endpoint with auth parameters. Never log it.
+    /// full URL for an endpoint with every parameter, credentials included, in the query. never
+    /// log it. requests Navia sends go through [`FormPost`]; only a URL handed to something
+    /// outside Navia is fetched as it is.
     fn endpoint_url(&self, endpoint: &str, params: &[(&str, String)]) -> Result<Url> {
         self.endpoint_url_as(endpoint, params, &self.inner.config.client_name)
     }
 
     /// [`Self::endpoint_url`] with another client name (`c`).
     fn endpoint_url_as(&self, endpoint: &str, params: &[(&str, String)], client_name: &str) -> Result<Url> {
+        self.inner.offline.check()?;
         let cfg = &self.inner.config;
         let (token, salt) = cfg.credentials.token();
         let mut url = self
@@ -296,7 +369,7 @@ impl Client {
 
     async fn request_as(&self, endpoint: &'static str, params: &[(&str, String)], client_name: &str) -> Result<Value> {
         let url = self.endpoint_url_as(endpoint, params, client_name)?;
-        let response = self.inner.http.get(url).send().await?;
+        let response = self.fetch(url.as_str()).await.send().await?;
         let status = response.status();
         if !status.is_success() {
             return Err(Error::HttpStatus { status: status.as_u16(), endpoint: endpoint.to_string() });
@@ -307,6 +380,8 @@ impl Client {
 
     /// A read. Retries transient failures with a short backoff.
     async fn read(&self, endpoint: &'static str, params: &[(&str, String)]) -> Result<Value> {
+        // not retried: waiting wouldn't turn the switch off
+        self.inner.offline.check()?;
         let mut last = None;
         for attempt in 0..READ_ATTEMPTS {
             if attempt > 0 {
@@ -342,6 +417,7 @@ impl Client {
         if self.write_policy() == WritePolicy::ReadOnly {
             return Err(Error::WritesDisabled { endpoint: endpoint.to_string() });
         }
+        let whole = self.endpoint_url(endpoint, params)?;
         let url = self.endpoint_url(endpoint, &[])?;
         // Own scope because the serializer isn't Send and can't live across an await.
         let body = {
@@ -351,7 +427,7 @@ impl Client {
             }
             form.finish()
         };
-        let response = self.inner.http.post(url).header("content-type", "application/x-www-form-urlencoded").body(body).send().await?;
+        let response = self.inner.form.post_form(&self.inner.http, whole.as_str(), (url.as_str(), body)).await.send().await?;
         let status = response.status();
         if !status.is_success() {
             return Err(Error::HttpStatus { status: status.as_u16(), endpoint: endpoint.to_string() });
@@ -366,8 +442,9 @@ impl Client {
     }
 
     /// A `ping` request with no retries or error mapping, for the sign-in check in [`crate::connect`].
-    pub(crate) fn ping_request(&self) -> Result<reqwest::RequestBuilder> {
-        Ok(self.inner.http.get(self.endpoint_url("ping", &[])?))
+    pub(crate) async fn ping_request(&self) -> Result<reqwest::RequestBuilder> {
+        let url = self.endpoint_url("ping", &[])?;
+        Ok(self.fetch(url.as_str()).await)
     }
 
     // ---- reads --------------------------------------------------------------------------
@@ -382,9 +459,12 @@ impl Client {
     pub async fn open_subsonic_extensions(&self) -> Result<Vec<Extension>> {
         let value = self.read("getOpenSubsonicExtensions", &[]).await?;
         if value.get("openSubsonicExtensions").is_none() {
+            self.inner.form.set(false);
             return Ok(Vec::new());
         }
-        field("getOpenSubsonicExtensions", &value, "openSubsonicExtensions")
+        let list: Vec<Extension> = field("getOpenSubsonicExtensions", &value, "openSubsonicExtensions")?;
+        self.inner.form.set(list.iter().any(|e| e.name == "formPost"));
+        Ok(list)
     }
 
     pub async fn music_folders(&self) -> Result<Vec<MusicFolder>> {
@@ -902,6 +982,11 @@ impl Client {
     /// `reportPlayback` for the server's now-playing view. Always sent with `ignoreScrobble=true`
     /// because plays are counted through `scrobble`.
     pub async fn report_playback(&self, id: &str, state: PlaybackState, position_ms: u64) -> Result<()> {
+        self.report_playback_as(&self.report_client_name(), id, state, position_ms).await
+    }
+
+    /// [`Self::report_playback`] under a given client name: an earlier one, to end its session.
+    pub async fn report_playback_as(&self, client_name: &str, id: &str, state: PlaybackState, position_ms: u64) -> Result<()> {
         let params = [
             ("mediaId", id.to_string()),
             ("mediaType", "song".to_string()),
@@ -910,7 +995,10 @@ impl Client {
             ("playbackRate", "1.0".to_string()),
             ("ignoreScrobble", "true".to_string()),
         ];
-        self.write_report("reportPlayback", &params).await.map(|_| ())
+        if self.write_policy() == WritePolicy::ReadOnly {
+            return Err(Error::WritesDisabled { endpoint: "reportPlayback".to_string() });
+        }
+        self.request_as("reportPlayback", &params, client_name).await.map(|_| ())
     }
 }
 
@@ -974,7 +1062,7 @@ mod display_name_tests {
             assert!(is_navia_client(name), "{name:?}");
             assert_eq!(client_display_name(name), "Navia");
         }
-        for name in ["navia-fork", "Navi", "feishin", "", "Navia Player"] {
+        for name in ["navia-fork", "Navi", "other-client", "", "Navia Player"] {
             assert!(!is_navia_client(name), "{name:?}");
         }
     }
@@ -991,8 +1079,8 @@ mod display_name_tests {
         assert_eq!(client_display_name("navia"), "Navia");
         assert_eq!(client_display_name("NAVIA\u{200B}"), "Navia");
         assert_eq!(client_display_name(" Navia "), "Navia");
-        assert_eq!(client_display_name("feishin"), "feishin");
-        assert_eq!(client_display_name("Symfonium\u{200B}"), "Symfonium");
+        assert_eq!(client_display_name("other-client"), "other-client");
+        assert_eq!(client_display_name("Phone\u{200B}"), "Phone");
         assert_eq!(client_display_name("navia-fork"), "navia-fork");
         assert_eq!(client_display_name(""), "");
     }

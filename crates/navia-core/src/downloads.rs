@@ -887,7 +887,7 @@ fn fetch(inner: &Inner, request: &DownloadRequest, cancel: &AtomicBool, single: 
         fs::create_dir_all(parent)?;
     }
     let part = path.with_extension(format!("{suffix}.part"));
-    let mut resp = inner.http.get(url).send().map_err(|e| Error::Network(e.without_url().to_string()))?;
+    let mut resp = inner.client.form_post().request_blocking(&inner.http, &url).send().map_err(|e| Error::Network(e.without_url().to_string()))?;
     let status = resp.status();
     if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
         return Err(Error::HttpStatus { status: status.as_u16(), endpoint: "stream".to_string() });

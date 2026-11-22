@@ -56,15 +56,16 @@ struct Run {
     heard: Arc<Mutex<Vec<String>>>,
 }
 
-fn start(crossfade_ms: u32, dir: &std::path::Path) -> Run {
-    // A 44.1 kHz song, as on the receiver, and a 48 kHz one.
+fn start(crossfade_ms: u32, policy: OutputPolicy, dir: &std::path::Path) -> Run {
+    // a 44.1 kHz song, as on the receiver, a 48 kHz one and a 96 kHz one.
     write_wav(&dir.join("a.wav"), &synth(44_100 * 6, 44_100, 0.1), 44_100);
     write_wav(&dir.join("b.wav"), &synth(48_000 * 6, 48_000, 0.7), 48_000);
-    let files = [("a".to_string(), dir.join("a.wav")), ("b".to_string(), dir.join("b.wav"))].into();
+    write_wav(&dir.join("c.wav"), &synth(96_000 * 6, 96_000, 0.4), 96_000);
+    let files = [("a".to_string(), dir.join("a.wav")), ("b".to_string(), dir.join("b.wav")), ("c".to_string(), dir.join("c.wav"))].into();
     let opens = Arc::new(Mutex::new(Vec::new()));
     // Real time, so the songs are still playing while the steps run.
     let backend = TwoDevices { capture: CaptureBackend { speed: 1.0, rates: (8_000, 384_000), default_rate: 48_000, ..Default::default() }, opens: opens.clone() };
-    let config = PlayerConfig { policy: OutputPolicy::DeviceDefault, ..Default::default() };
+    let config = PlayerConfig { policy, ..Default::default() };
     let player = Player::with_backend(Arc::new(FileResolver(files)), Box::new(backend), config).unwrap();
     let events = Arc::new(Mutex::new(Vec::new()));
     let heard = Arc::new(Mutex::new(Vec::new()));
@@ -98,7 +99,7 @@ fn tempdir(name: &str) -> std::path::PathBuf {
 /// Each open on the default asks for 48 kHz without error, with and without a crossfade.
 fn back_to_the_default_opens_at_its_rate(crossfade_ms: u32) {
     let dir = tempdir(&format!("back{crossfade_ms}"));
-    let run = start(crossfade_ms, &dir);
+    let run = start(crossfade_ms, OutputPolicy::DeviceDefault, &dir);
     run.player.set_output_device(Some(RECEIVER.into()));
     run.player.set_queue(vec![QueueItem::new("a".into(), None), QueueItem::new("b".into(), None)], 0, 1_000, false);
     assert!(wait_for(Duration::from_secs(5), || run.opens.lock().unwrap().iter().any(|(d, _)| d.is_some())), "the receiver never opened");
@@ -141,7 +142,7 @@ fn a_device_change_takes_the_new_devices_rate_without_a_crossfade() {
 #[test]
 fn a_device_that_cannot_start_is_its_own_error() {
     let dir = tempdir("refuse");
-    let run = start(0, &dir);
+    let run = start(0, OutputPolicy::DeviceDefault, &dir);
     // A fixed 44.1 kHz policy asks the default for a rate it refuses.
     run.player.set_output_policy(OutputPolicy::Fixed(44_100));
     run.player.set_queue(vec![QueueItem::new("a".into(), None)], 0, 0, false);
@@ -156,4 +157,38 @@ fn a_device_that_cannot_start_is_its_own_error() {
     }
     assert!(!events.iter().any(|e| matches!(e, PlayerEvent::Error(_))), "{events:?}");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// following the song's rate on a device that takes 48 and 96 kHz: a click on a 96 kHz song while
+/// a 48 kHz one plays reopens the output at 96 kHz, and a click back on the 48 kHz song returns to
+/// 48 kHz, with and without a crossfade (a crossfade only holds the rate while it mixes two songs).
+fn a_click_follows_the_songs_rate(crossfade_ms: u32) {
+    let dir = tempdir(&format!("follow{crossfade_ms}"));
+    let run = start(crossfade_ms, OutputPolicy::FollowTrack, &dir);
+    let play = |id: &str, rate: u32| {
+        run.heard.lock().unwrap().clear();
+        run.player.set_queue(vec![QueueItem::new(id.into(), None)], 0, 0, false);
+        assert!(wait_for(Duration::from_secs(5), || run.heard.lock().unwrap().iter().any(|h| h == id)), "{id} was never heard");
+        assert!(wait_for(Duration::from_secs(2), || run.player.snapshot().position_ms > 300), "{id} didn't play");
+        run.player.sync();
+        assert_eq!(run.player.snapshot().output_rate, rate, "crossfade {crossfade_ms} ms, {id}: {:?}", run.opens.lock().unwrap());
+    };
+    play("b", 48_000);
+    play("c", 96_000);
+    play("b", 48_000);
+    let opens: Vec<u32> = run.opens.lock().unwrap().iter().map(|(_, r)| *r).collect();
+    assert_eq!(opens, [48_000, 96_000, 48_000], "crossfade {crossfade_ms} ms");
+    let events = run.events.lock().unwrap().clone();
+    assert!(events.is_empty(), "crossfade {crossfade_ms} ms: {events:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_click_follows_the_songs_rate_with_a_crossfade() {
+    a_click_follows_the_songs_rate(5_000);
+}
+
+#[test]
+fn a_click_follows_the_songs_rate_without_a_crossfade() {
+    a_click_follows_the_songs_rate(0);
 }

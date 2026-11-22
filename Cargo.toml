@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/navia-gpui", "crates/airplay", "crates/navia-core", "crates/navia-integrations"]
+members = ["apps/navia-gpui", "crates/airplay", "crates/navia-aubio", "crates/navia-core", "crates/navia-integrations"]
 exclude = ["vendor"]
 
 [workspace.package]

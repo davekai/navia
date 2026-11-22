@@ -105,6 +105,8 @@ pub struct HttpFetcher {
     ranged: Client,
     sequential: Client,
     status: Arc<NetworkStatus>,
+    offline: crate::client::OfflineSwitch,
+    form: Option<crate::client::FormPost>,
 }
 
 impl HttpFetcher {
@@ -113,7 +115,26 @@ impl HttpFetcher {
         let ranged = Client::builder().user_agent(ua.clone()).connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(60)).build()?;
         // Live transcodes can legitimately take the whole track's length.
         let sequential = Client::builder().user_agent(ua).connect_timeout(Duration::from_secs(10)).timeout(None::<Duration>).build()?;
-        Ok(Self { ranged, sequential, status: Arc::default() })
+        Ok(Self { ranged, sequential, status: Arc::default(), offline: Default::default(), form: None })
+    }
+
+    /// streams hold their URL, so a switch turned on mid-song stops the next request too.
+    pub fn with_offline(mut self, offline: crate::client::OfflineSwitch) -> Self {
+        self.offline = offline;
+        self
+    }
+
+    /// the server's own URLs go as POST forms when it takes them.
+    pub fn with_form_post(mut self, form: crate::client::FormPost) -> Self {
+        self.form = Some(form);
+        self
+    }
+
+    fn get(&self, http: &Client, url: &str) -> reqwest::blocking::RequestBuilder {
+        match &self.form {
+            Some(form) => form.request_blocking(http, url),
+            None => http.get(url),
+        }
     }
 
     pub fn status(&self) -> Arc<NetworkStatus> {
@@ -353,7 +374,8 @@ impl Drop for HttpStream {
 fn open_with_retries(fetcher: &HttpFetcher, url: &str, config: &StreamConfig) -> Result<Response> {
     let mut failures = 0u32;
     loop {
-        let result = fetcher.sequential.get(url).header(RANGE, format!("bytes=0-{}", config.initial_chunk - 1)).send().map_err(net_err).and_then(|resp| {
+        fetcher.offline.check()?;
+        let result = fetcher.get(&fetcher.sequential, url).header(RANGE, format!("bytes=0-{}", config.initial_chunk - 1)).send().map_err(net_err).and_then(|resp| {
             let status = resp.status();
             if status == StatusCode::OK || status == StatusCode::PARTIAL_CONTENT {
                 Ok(resp)
@@ -532,6 +554,10 @@ fn wait_for_work(shared: &Shared) -> Work {
     let total = shared.total.expect("ranged streams know their length");
     let mut st = shared.state.lock().expect("stream state");
     loop {
+        // a reader that let go after the last byte still leaves a whole file to keep
+        if st.buffered.first_gap(0).0 >= total {
+            return Work::Complete;
+        }
         if st.cancelled {
             return Work::Cancelled;
         }
@@ -542,9 +568,6 @@ fn wait_for_work(shared: &Shared) -> Work {
         // The reader has what it needs. Stop when the whole file is here, or fill a hole behind
         // the reader when the sink wants the whole file.
         let (hole, hole_end) = st.buffered.first_gap(0);
-        if hole >= total {
-            return Work::Complete;
-        }
         if hole < st.want && shared.fill_gaps() {
             return Work::Fetch { start: hole, end: hole_end.unwrap_or(total).min(total), fill: true };
         }
@@ -616,7 +639,10 @@ fn worker(shared: Arc<Shared>, fetcher: HttpFetcher, url: String, first: Respons
                 Work::Cancelled => return,
             };
             let end = gap_end.min(gap + chunk);
-            let result = fetcher.ranged.get(&url).header(RANGE, format!("bytes={gap}-{}", end - 1)).send();
+            let result = match fetcher.offline.check() {
+                Ok(()) => fetcher.get(&fetcher.ranged, &url).header(RANGE, format!("bytes={gap}-{}", end - 1)).send().map_err(|e| e.without_url().to_string()),
+                Err(e) => Err(e.to_string()),
+            };
             shared.state.lock().expect("stream state").requests += 1;
             (gap, end, fill, result)
         };
@@ -632,11 +658,11 @@ fn worker(shared: Arc<Shared>, fetcher: HttpFetcher, url: String, first: Respons
             }
             Err(e) => {
                 outage = true;
-                Err(io_err(e.without_url().to_string()))
+                Err(io_err(e))
             }
         };
         match outcome {
-            Ok(_) if shared.cancelled() => return,
+            Ok(_) if shared.cancelled() => continue,
             Ok(finished) => {
                 waiting.leave();
                 delay = RETRY_MIN;
@@ -692,7 +718,12 @@ fn sequential(shared: &Shared, resp: Response) {
             st.eof = Some(offset);
             drop(st);
             shared.cond.notify_all();
-            if completed && !shared.cancelled() && expected.is_none_or(|n| n == offset) {
+            // a reader that let go after the last byte of a sized body still leaves a whole file
+            let whole = match expected {
+                Some(n) => offset == n,
+                None => completed,
+            };
+            if whole {
                 shared.complete(offset);
             }
         }

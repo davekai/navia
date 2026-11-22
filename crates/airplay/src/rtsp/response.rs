@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use crate::base::error::{RtspError, Result};
 use crate::rtsp::plist_codec;
 
-/// Parsed RTSP response.
 #[derive(Debug, Clone)]
 pub struct RtspResponse {
     pub status_code: u16,
@@ -36,20 +35,17 @@ impl RtspResponse {
         let header_bytes = &data[..header_end];
         let body_start = header_end + 4;
 
-        // Parse headers as UTF-8
         let header_str = std::str::from_utf8(header_bytes)
             .map_err(|_| RtspError::InvalidResponse("invalid UTF-8 in headers".to_string()))?;
 
         let mut lines = header_str.lines();
 
-        // Parse status line: "RTSP/1.0 200 OK"
         let status_line = lines
             .next()
             .ok_or_else(|| RtspError::InvalidResponse("missing status line".to_string()))?;
 
         let (status_code, status_text) = parse_status_line(status_line)?;
 
-        // Parse headers
         let mut headers = HashMap::new();
         for line in lines {
             if let Some((key, value)) = line.split_once(':') {
@@ -57,14 +53,12 @@ impl RtspResponse {
             }
         }
 
-        // Get Content-Length to determine body size
         let content_length = headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
             .and_then(|(_, v)| v.parse::<usize>().ok())
             .unwrap_or(0);
 
-        // Extract body
         let body = if content_length > 0 && data.len() >= body_start + content_length {
             Some(data[body_start..body_start + content_length].to_vec())
         } else if content_length > 0 {
@@ -99,12 +93,10 @@ impl RtspResponse {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Get CSeq from response.
     pub fn cseq(&self) -> Option<u32> {
         self.header("CSeq").and_then(|v| v.parse().ok())
     }
 
-    /// Get Content-Length.
     pub fn content_length(&self) -> Option<usize> {
         self.header("Content-Length").and_then(|v| v.parse().ok())
     }
@@ -119,7 +111,6 @@ impl RtspResponse {
         plist_codec::decode(body)
     }
 
-    /// Ensure success, returning error if not.
     pub fn ensure_success(&self) -> Result<()> {
         if self.is_success() {
             Ok(())
@@ -129,7 +120,6 @@ impl RtspResponse {
     }
 }
 
-/// Parse status line: "RTSP/1.0 200 OK"
 fn parse_status_line(line: &str) -> Result<(u16, String)> {
     let parts: Vec<&str> = line.splitn(3, ' ').collect();
 
@@ -137,14 +127,12 @@ fn parse_status_line(line: &str) -> Result<(u16, String)> {
         return Err(RtspError::InvalidResponse(format!("malformed status line: {}", line)).into());
     }
 
-    // Verify RTSP version
     if !parts[0].starts_with("RTSP/") {
         return Err(
             RtspError::InvalidResponse(format!("not an RTSP response: {}", parts[0])).into(),
         );
     }
 
-    // Parse status code
     let code = parts[1]
         .parse()
         .map_err(|_| RtspError::InvalidResponse(format!("invalid status code: {}", parts[1])))?;
@@ -352,7 +340,6 @@ mod tests {
 
         #[test]
         fn body_as_plist_parses_valid_plist() {
-            // Create a binary plist
             let plist_data = plist_codec::encode(&TestPlist {
                 name: "test".to_string(),
                 value: 42,

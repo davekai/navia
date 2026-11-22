@@ -6,9 +6,6 @@
 //! # M1 Format Selection Guide
 //!
 //! Multiple M1 formats exist because different AirPlay devices expect different formats.
-//! Use this guide to select the appropriate format:
-//!
-//! ## Recommended Usage
 //!
 //! | Scenario | Method | Format |
 //! |----------|--------|--------|
@@ -17,21 +14,7 @@
 //! | Transient fallback | `generate_m1_transient_prefix()` | Raw, 68 bytes, flags at start |
 //! | Transient with TLV8 | `generate_m1_transient_tlv()` | TLV8, 74 bytes |
 //!
-//! ## Troubleshooting
-//!
-//! If the recommended format doesn't work, try these in order:
-//! 1. `generate_m1_transient()` - Primary transient format
-//! 2. `generate_m1_transient_prefix()` - Flags-first variant
-//! 3. `generate_m1_transient_tlv()` - TLV8 encoded transient
-//! 4. `generate_m1()` - Standard HomeKit (may work for some transient devices)
-//!
-//! Use `reset()` between attempts to try a different format.
-//!
-//! ## Experimental Formats (avoid unless needed)
-//!
-//! - `generate_m1_transient_no_flags()` - 64 bytes, no flags
-//! - `generate_m1_transient_signed()` - 68 bytes with truncated signature
-//! - `generate_m1_transient_full_sig()` - 100 bytes with full signature
+//! other `generate_m1_transient_*` variants are experimental.
 
 use crate::base::error::{CryptoError, PairingError, Result};
 use crate::crypto::{
@@ -45,7 +28,6 @@ use crate::crypto::{
 
 use crate::pairing::controller::ControllerIdentity;
 
-/// Pair-verify state machine.
 pub struct PairVerify {
     state: PairVerifyState,
     identity: IdentityKeyPair,
@@ -56,8 +38,7 @@ pub struct PairVerify {
     server_public: Option<[u8; 32]>,
     shared_secret: Option<[u8; 32]>,
     session_key: Option<[u8; 32]>,
-    /// Server's Ed25519 long-term public key (for transient mode signature verification).
-    /// Set via `set_server_ltpk()` before processing M2 if known from /info response.
+    /// Server's Ed25519 long-term public key from /info; verifies M2 in transient mode.
     server_ltpk: Option<[u8; 32]>,
     signature_order: SignatureOrder,
 }
@@ -144,7 +125,6 @@ fn hex_prefix(bytes: &[u8], len: usize) -> String {
 }
 
 impl PairVerify {
-    /// Create new pair-verify with our identity key pair.
     pub fn new(identity: IdentityKeyPair) -> Self {
         Self {
             state: PairVerifyState::Initial,
@@ -160,11 +140,7 @@ impl PairVerify {
         }
     }
 
-    /// Create new pair-verify with a ControllerIdentity.
-    ///
-    /// This is the recommended constructor when using the same identity
-    /// that was registered during pair-setup. The controller's stable UUID
-    /// is used in M3 to match what was sent in pair-setup M5.
+    /// uses the controller's stable UUID in M3 to match what pair-setup M5 sent.
     pub fn new_with_controller(controller: &ControllerIdentity) -> Self {
         Self {
             state: PairVerifyState::Initial,
@@ -180,27 +156,18 @@ impl PairVerify {
         }
     }
 
-    /// Set the server's Ed25519 long-term public key (from /info response).
-    ///
-    /// In transient mode, the server's LTPK is used to verify the M2 signature.
-    /// Call this before `process_m2_transient()` if you have the server's public key.
+    /// Server's LTPK from /info; verifies the M2 signature in transient mode.
     pub fn set_server_ltpk(&mut self, ltpk: [u8; 32]) {
         self.server_ltpk = Some(ltpk);
     }
 
-    /// Generate M1 request with ephemeral ECDH public key (standard HomeKit format).
-    ///
-    /// **When to use:** This is the recommended default format for standard HomeKit
-    /// pair-verify after a full pair-setup (M1-M6) has been completed. Use this
-    /// for devices that have already established a pairing relationship.
+    /// standard HomeKit M1, for use after a full M1-M6 pair-setup.
     ///
     /// **Format (TLV8 encoded, ~37 bytes):**
     /// ```text
     /// State     = 0x01 (3 bytes: tag + len + value)
     /// PublicKey = ECDH ephemeral public key (34 bytes: tag + len + 32 bytes)
     /// ```
-    ///
-    /// **Devices:** Apple TV, HomePod, AirPlay speakers after successful pair-setup.
     pub fn generate_m1(&mut self) -> Result<Vec<u8>> {
         if self.state != PairVerifyState::Initial {
             return Err(PairingError::StateMismatch {
@@ -210,15 +177,12 @@ impl PairVerify {
             .into());
         }
 
-        // Generate ephemeral ECDH key pair
         let ecdh = EcdhKeyPair::generate();
         let public_key = ecdh.public_key();
 
-        // Store for later use
         self.ecdh_public = Some(public_key);
         self.ecdh_keypair = Some(ecdh);
 
-        // Build M1 TLV - standard HomeKit format
         let mut tlv = Tlv8::new();
         tlv.set(TlvType::State, vec![0x01]);
         tlv.set(TlvType::PublicKey, public_key.to_vec());
@@ -227,11 +191,7 @@ impl PairVerify {
         Ok(tlv.encode())
     }
 
-    /// Generate M1 request for AirPlay 2 transient pairing (raw binary format, flags at end).
-    ///
-    /// **When to use:** Primary format for transient pair-verify after completing
-    /// transient pair-setup (M1-M4 with PIN "3939"). Try this format first when
-    /// connecting to AirPlay 2 devices that support transient mode.
+    /// transient M1, raw with flags last; the primary format after transient pair-setup (PIN 3939).
     ///
     /// **Format (68 bytes raw binary, NOT TLV8):**
     /// ```text
@@ -240,7 +200,6 @@ impl PairVerify {
     /// Bytes 64-67: Flags (0x01, 0x00, 0x00, 0x00) - little-endian
     /// ```
     ///
-    /// **Devices:** HomePod, newer Apple TV models with transient support.
     /// Use `process_m2_transient()` to handle the corresponding M2 response.
     pub fn generate_m1_transient(&mut self) -> Result<Vec<u8>> {
         if self.state != PairVerifyState::Initial {
@@ -251,15 +210,12 @@ impl PairVerify {
             .into());
         }
 
-        // Generate ephemeral ECDH key pair
         let ecdh = EcdhKeyPair::generate();
         let ecdh_public = ecdh.public_key();
 
-        // Store for later use
         self.ecdh_public = Some(ecdh_public);
         self.ecdh_keypair = Some(ecdh);
 
-        // Build 68-byte raw binary M1 for transient pairing (flags at end)
         let mut m1 = Vec::with_capacity(68);
         m1.extend_from_slice(&ecdh_public);           // 32 bytes ECDH public key
         m1.extend_from_slice(&self.identity.public_key()); // 32 bytes Ed25519 public key
@@ -269,11 +225,7 @@ impl PairVerify {
         Ok(m1)
     }
 
-    /// Generate M1 request for AirPlay 2 transient pairing (raw binary format, flags at start).
-    ///
-    /// **When to use:** Alternative transient format with flags as prefix. Try this
-    /// if `generate_m1_transient()` (flags at end) doesn't work with your device.
-    /// Some AirPlay implementations expect flags first.
+    /// transient M1, raw with flags first, for receivers that expect the flags as a prefix.
     ///
     /// **Format (68 bytes raw binary, NOT TLV8):**
     /// ```text
@@ -281,8 +233,6 @@ impl PairVerify {
     /// Bytes 4-35:  ECDH ephemeral public key
     /// Bytes 36-67: Ed25519 identity public key
     /// ```
-    ///
-    /// **Devices:** Some older AirPlay receivers, certain third-party implementations.
     pub fn generate_m1_transient_prefix(&mut self) -> Result<Vec<u8>> {
         if self.state != PairVerifyState::Initial {
             return Err(PairingError::StateMismatch {
@@ -292,15 +242,12 @@ impl PairVerify {
             .into());
         }
 
-        // Generate ephemeral ECDH key pair
         let ecdh = EcdhKeyPair::generate();
         let ecdh_public = ecdh.public_key();
 
-        // Store for later use
         self.ecdh_public = Some(ecdh_public);
         self.ecdh_keypair = Some(ecdh);
 
-        // Build 68-byte raw binary M1 for transient pairing (flags at start)
         let mut m1 = Vec::with_capacity(68);
         m1.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // 4 bytes flags (little-endian 0x01)
         m1.extend_from_slice(&ecdh_public);           // 32 bytes ECDH public key
@@ -310,18 +257,13 @@ impl PairVerify {
         Ok(m1)
     }
 
-    /// Generate M1 with just 64 bytes (ECDH + Ed25519, no flags).
-    ///
-    /// **When to use:** Experimental format for devices that may not expect flags.
-    /// Try this if other formats fail and the device is rejecting the connection.
+    /// experimental transient M1 without flags.
     ///
     /// **Format (64 bytes raw binary, NOT TLV8):**
     /// ```text
     /// Bytes 0-31:  ECDH ephemeral public key
     /// Bytes 32-63: Ed25519 identity public key
     /// ```
-    ///
-    /// **Devices:** Unknown - this is an experimental format for troubleshooting.
     pub fn generate_m1_transient_no_flags(&mut self) -> Result<Vec<u8>> {
         if self.state != PairVerifyState::Initial {
             return Err(PairingError::StateMismatch {
@@ -331,15 +273,12 @@ impl PairVerify {
             .into());
         }
 
-        // Generate ephemeral ECDH key pair
         let ecdh = EcdhKeyPair::generate();
         let ecdh_public = ecdh.public_key();
 
-        // Store for later use
         self.ecdh_public = Some(ecdh_public);
         self.ecdh_keypair = Some(ecdh);
 
-        // Build 64-byte raw binary M1 (no flags)
         let mut m1 = Vec::with_capacity(64);
         m1.extend_from_slice(&ecdh_public);           // 32 bytes ECDH public key
         m1.extend_from_slice(&self.identity.public_key()); // 32 bytes Ed25519 public key
@@ -348,12 +287,7 @@ impl PairVerify {
         Ok(m1)
     }
 
-    /// Generate M1 with ECDH key and truncated signature (68 bytes).
-    ///
-    /// **When to use:** Experimental format that includes a signature over the ECDH
-    /// public key. The signature is truncated to 32 bytes to fit the 68-byte format.
-    /// This is an interpretation of the spec where the second 32 bytes might be
-    /// a truncated signature rather than an Ed25519 identity key.
+    /// experimental transient M1 with a signature over the ECDH key, truncated to 32 bytes.
     ///
     /// **Format (68 bytes raw binary, NOT TLV8):**
     /// ```text
@@ -361,9 +295,6 @@ impl PairVerify {
     /// Bytes 4-35:  ECDH ephemeral public key
     /// Bytes 36-67: First 32 bytes of Ed25519 signature over ECDH key
     /// ```
-    ///
-    /// **Devices:** Unknown - this is an experimental format for troubleshooting.
-    /// The truncated signature may not verify on the server side.
     pub fn generate_m1_transient_signed(&mut self) -> Result<Vec<u8>> {
         if self.state != PairVerifyState::Initial {
             return Err(PairingError::StateMismatch {
@@ -373,18 +304,14 @@ impl PairVerify {
             .into());
         }
 
-        // Generate ephemeral ECDH key pair
         let ecdh = EcdhKeyPair::generate();
         let ecdh_public = ecdh.public_key();
 
-        // Store for later use
         self.ecdh_public = Some(ecdh_public);
         self.ecdh_keypair = Some(ecdh);
 
-        // Sign our ECDH public key
         let signature = self.identity.sign(&ecdh_public);
 
-        // Build 68-byte: flag(4) + ECDH(32) + signature_first_half(32)
         let mut m1 = Vec::with_capacity(68);
         m1.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // Flag = 0x01
         m1.extend_from_slice(&ecdh_public);              // 32 bytes ECDH
@@ -394,11 +321,7 @@ impl PairVerify {
         Ok(m1)
     }
 
-    /// Generate M1 with ECDH + full signature (100 bytes).
-    ///
-    /// **When to use:** Experimental format that includes the full Ed25519 signature
-    /// over the ECDH public key. Use this if the device expects signed ECDH keys
-    /// for authentication.
+    /// experimental transient M1 with the full signature over the ECDH key.
     ///
     /// **Format (100 bytes raw binary, NOT TLV8):**
     /// ```text
@@ -407,8 +330,7 @@ impl PairVerify {
     /// Bytes 36-99: Full Ed25519 signature (64 bytes) over ECDH key
     /// ```
     ///
-    /// **Devices:** Unknown - this is an experimental format for troubleshooting.
-    /// Server must have our Ed25519 public key from pair-setup to verify.
+    /// the server needs our Ed25519 public key from pair-setup to verify it.
     pub fn generate_m1_transient_full_sig(&mut self) -> Result<Vec<u8>> {
         if self.state != PairVerifyState::Initial {
             return Err(PairingError::StateMismatch {
@@ -418,18 +340,14 @@ impl PairVerify {
             .into());
         }
 
-        // Generate ephemeral ECDH key pair
         let ecdh = EcdhKeyPair::generate();
         let ecdh_public = ecdh.public_key();
 
-        // Store for later use
         self.ecdh_public = Some(ecdh_public);
         self.ecdh_keypair = Some(ecdh);
 
-        // Sign our ECDH public key
         let signature = self.identity.sign(&ecdh_public);
 
-        // Build: flag(4) + ECDH(32) + signature(64) = 100 bytes
         let mut m1 = Vec::with_capacity(100);
         m1.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // Flag = 0x01
         m1.extend_from_slice(&ecdh_public);              // 32 bytes ECDH
@@ -439,11 +357,7 @@ impl PairVerify {
         Ok(m1)
     }
 
-    /// Generate M1 request with full TLV8 encoding for AirPlay 2 transient pairing.
-    ///
-    /// **When to use:** Alternative transient format using TLV8 encoding instead of
-    /// raw binary. Try this if raw binary formats are rejected but the device
-    /// clearly expects transient-style data (both ECDH and identity keys).
+    /// transient M1 in TLV8, for devices that reject the raw formats.
     ///
     /// **Format (TLV8 encoded, ~74 bytes):**
     /// ```text
@@ -453,7 +367,6 @@ impl PairVerify {
     /// Flags      = 0x01 (3 bytes)
     /// ```
     ///
-    /// **Devices:** Some devices may prefer TLV8 encoding even for transient mode.
     /// The server response should still use `process_m2()` (TLV8 format).
     pub fn generate_m1_transient_tlv(&mut self) -> Result<Vec<u8>> {
         if self.state != PairVerifyState::Initial {
@@ -464,15 +377,12 @@ impl PairVerify {
             .into());
         }
 
-        // Generate ephemeral ECDH key pair
         let ecdh = EcdhKeyPair::generate();
         let ecdh_public = ecdh.public_key();
 
-        // Store for later use
         self.ecdh_public = Some(ecdh_public);
         self.ecdh_keypair = Some(ecdh);
 
-        // Build M1 TLV with all transient pairing fields
         let mut tlv = Tlv8::new();
         tlv.set(TlvType::State, vec![0x01]);
         tlv.set(TlvType::PublicKey, ecdh_public.to_vec());
@@ -491,7 +401,7 @@ impl PairVerify {
         self.server_public = None;
         self.shared_secret = None;
         self.session_key = None;
-        // Note: server_ltpk is NOT reset - it comes from /info and persists across retries
+        // server_ltpk is not reset: it comes from /info and holds across retries.
     }
 
     /// Process M2 response in raw binary format (for transient pairing).
@@ -513,7 +423,6 @@ impl PairVerify {
             .into());
         }
 
-        // Check response length - should be 96 bytes for transient mode
         if response.len() < 96 {
             self.state = PairVerifyState::Failed;
             return Err(PairingError::TlvParse(format!(
@@ -523,18 +432,15 @@ impl PairVerify {
             .into());
         }
 
-        // Extract server's ECDH public key (first 32 bytes)
         let mut server_public_arr = [0u8; 32];
         server_public_arr.copy_from_slice(&response[0..32]);
         self.server_public = Some(server_public_arr);
 
-        // Get our client ECDH public key (needed for signature verification)
         let client_public = self.ecdh_public.ok_or_else(|| {
             self.state = PairVerifyState::Failed;
             PairingError::SrpVerificationFailed
         })?;
 
-        // Perform ECDH to get shared secret
         let ecdh = self.ecdh_keypair.take().ok_or_else(|| {
             self.state = PairVerifyState::Failed;
             PairingError::SrpVerificationFailed
@@ -547,7 +453,6 @@ impl PairVerify {
 
         self.shared_secret = Some(shared_secret);
 
-        // Derive session key for encryption
         let session_key = hkdf::derive_pair_verify_key(&shared_secret).map_err(|e| {
             self.state = PairVerifyState::Failed;
             e
@@ -555,10 +460,8 @@ impl PairVerify {
 
         self.session_key = Some(session_key);
 
-        // Extract encrypted data (remaining 64 bytes)
         let encrypted_data = &response[32..];
 
-        // Try to decrypt the encrypted data
         let nonce = nonce_from_string(PV_MSG02_NONCE);
         let decrypted = decrypt_with_nonce(&session_key, &nonce, encrypted_data).map_err(|e| {
             self.state = PairVerifyState::Failed;
@@ -570,19 +473,17 @@ impl PairVerify {
         // - Raw signature (64 bytes) - transient format
         // - Raw: Ed25519 pubkey (32) + Signature (64) = 96 bytes
 
-        // Try parsing as TLV8 first
         if let Ok(inner_tlv) = Tlv8::parse(&decrypted) {
             if let (Some(server_identifier), Some(server_signature)) = (
                 inner_tlv.get(TlvType::Identifier),
                 inner_tlv.get(TlvType::Signature),
             ) {
-                // Got TLV format - identifier IS the Ed25519 LTPK
-                // Server signs: server_ecdh || server_identifier || client_ecdh
+                // TLV form: the identifier is the server's Ed25519 LTPK.
                 if server_identifier.len() == 32 && server_signature.len() == 64 {
                     let mut server_ltpk = [0u8; 32];
                     server_ltpk.copy_from_slice(server_identifier);
 
-                    // Build signed message: server_ecdh || server_identifier || client_ecdh
+                    // signed message: server_ecdh || server_identifier || client_ecdh.
                     let mut signed_message = Vec::with_capacity(96);
                     signed_message.extend_from_slice(&server_public_arr);
                     signed_message.extend_from_slice(server_identifier);
@@ -602,11 +503,9 @@ impl PairVerify {
             }
         }
 
-        // If TLV parsing failed, try raw format with 64-byte signature
         if decrypted.len() == 64 {
-            // Just a signature - use server_ltpk if set via set_server_ltpk()
+            // signature only: needs the LTPK from set_server_ltpk().
             if let Some(server_ltpk) = self.server_ltpk {
-                // Server signs: server_ecdh || server_identifier || client_ecdh
                 let mut signed_message = Vec::with_capacity(96);
                 signed_message.extend_from_slice(&server_public_arr);
                 signed_message.extend_from_slice(&server_ltpk);
@@ -632,7 +531,7 @@ impl PairVerify {
             }
         }
 
-        // Try raw format: Ed25519 pubkey (32) + Signature (64) = 96 bytes
+        // raw: Ed25519 pubkey (32) + signature (64).
         if decrypted.len() == 96 {
             let mut server_ltpk = [0u8; 32];
             server_ltpk.copy_from_slice(&decrypted[0..32]);
@@ -640,7 +539,6 @@ impl PairVerify {
             let mut sig_arr = [0u8; 64];
             sig_arr.copy_from_slice(&decrypted[32..96]);
 
-            // Server signs: server_ecdh || server_identifier || client_ecdh
             let mut signed_message = Vec::with_capacity(96);
             signed_message.extend_from_slice(&server_public_arr);
             signed_message.extend_from_slice(&server_ltpk);
@@ -678,13 +576,11 @@ impl PairVerify {
             PairingError::TlvParse(e.to_string())
         })?;
 
-        // Check for error
         if let Some(_error_code) = tlv.error() {
             self.state = PairVerifyState::Failed;
             return Err(PairingError::Rejected.into());
         }
 
-        // Verify state
         if tlv.state() != Some(0x02) {
             self.state = PairVerifyState::Failed;
             return Err(PairingError::StateMismatch {
@@ -694,7 +590,6 @@ impl PairVerify {
             .into());
         }
 
-        // Extract server's ECDH public key
         let server_public = tlv.get(TlvType::PublicKey).ok_or_else(|| {
             self.state = PairVerifyState::Failed;
             PairingError::MissingTlv(TlvType::PublicKey as u8)
@@ -713,13 +608,11 @@ impl PairVerify {
         server_public_arr.copy_from_slice(server_public);
         self.server_public = Some(server_public_arr);
 
-        // Extract encrypted data
         let encrypted_data = tlv.get(TlvType::EncryptedData).ok_or_else(|| {
             self.state = PairVerifyState::Failed;
             PairingError::MissingTlv(TlvType::EncryptedData as u8)
         })?;
 
-        // Perform ECDH to get shared secret
         let ecdh = self.ecdh_keypair.take().ok_or_else(|| {
             self.state = PairVerifyState::Failed;
             PairingError::SrpVerificationFailed
@@ -732,7 +625,6 @@ impl PairVerify {
 
         self.shared_secret = Some(shared_secret);
 
-        // Derive session key for encryption
         let session_key = hkdf::derive_pair_verify_key(&shared_secret).map_err(|e| {
             self.state = PairVerifyState::Failed;
             e
@@ -740,7 +632,6 @@ impl PairVerify {
 
         self.session_key = Some(session_key);
 
-        // Decrypt the encrypted data
         let nonce = nonce_from_string(PV_MSG02_NONCE);
         let decrypted = decrypt_with_nonce(&session_key, &nonce, encrypted_data).map_err(|e| {
             tracing::debug!(
@@ -753,20 +644,17 @@ impl PairVerify {
             e
         })?;
 
-        // Debug: print decrypted data
         eprintln!(
             "  DEBUG: Decrypted M2 data ({} bytes): {}",
             decrypted.len(),
             decrypted.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
         );
 
-        // Parse decrypted TLV: should contain Identifier + Signature
         let inner_tlv = Tlv8::parse(&decrypted).map_err(|e| {
             self.state = PairVerifyState::Failed;
             PairingError::TlvParse(e.to_string())
         })?;
 
-        // Debug: print what we extracted from TLV
         if let Some(id) = inner_tlv.get(TlvType::Identifier) {
             eprintln!("  DEBUG: TLV Identifier: {} bytes", id.len());
             if let Ok(s) = std::str::from_utf8(id) {
@@ -798,7 +686,6 @@ impl PairVerify {
             return Err(PairingError::SignatureInvalid.into());
         }
 
-        // Get client public key for signature verification
         let client_public = self.ecdh_public.ok_or_else(|| {
             self.state = PairVerifyState::Failed;
             PairingError::SrpVerificationFailed
@@ -806,14 +693,12 @@ impl PairVerify {
 
         // Determine if identifier is an Ed25519 public key (32 bytes, non-UTF8) or UUID string
         let server_ltpk: Option<[u8; 32]> = if server_identifier.len() == 32 {
-            // Check if it's a valid Ed25519 public key (binary, non-UTF8)
             if std::str::from_utf8(server_identifier).is_err() {
-                // It's binary - treat as Ed25519 public key
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(server_identifier);
                 Some(arr)
             } else {
-                // It's a 32-byte UTF-8 string - look for PublicKey field
+                // A 32-byte UTF-8 string is a UUID; the key is in a separate PublicKey field.
                 inner_tlv.get(TlvType::PublicKey).and_then(|pk| {
                     if pk.len() == 32 {
                         let mut arr = [0u8; 32];
@@ -840,7 +725,6 @@ impl PairVerify {
         // If M2 didn't include the server LTPK, fall back to the one we already know.
         let server_ltpk = server_ltpk.or(self.server_ltpk);
 
-        // Verify signature if we have the server's LTPK
         if let Some(server_ltpk_arr) = server_ltpk {
             eprintln!(
                 "  DEBUG: LTPK={}.. server_ecdh={}.. client_ecdh={}.. id_len={}",
@@ -877,7 +761,7 @@ impl PairVerify {
 
             eprintln!("  DEBUG: Server signature verified with order: {:?}", self.signature_order);
         } else {
-            // No LTPK available - skip signature verification (transient mode fallback)
+            // no LTPK: skip signature verification (transient fallback).
             eprintln!("  DEBUG: No server LTPK, skipping signature verification (transient mode)");
         }
 
@@ -885,20 +769,14 @@ impl PairVerify {
         Ok(())
     }
 
-    /// Generate M3 request with our encrypted signature.
-    ///
-    /// If created with `new_with_controller()`, uses the controller's stable
-    /// identifier. Otherwise, derives identifier from Ed25519 public key.
+    /// uses the controller's stable identifier from `new_with_controller()`, else one derived from the Ed25519 key.
     pub fn generate_m3(&mut self) -> Result<Vec<u8>> {
         // Clone to avoid borrow conflict with &mut self
         let custom_id = self.custom_identifier.clone();
         self.generate_m3_with_identifier(custom_id.as_deref())
     }
 
-    /// Generate M3 request with a custom identifier.
-    ///
-    /// The identifier is typically a UUID string. If not provided, we use
-    /// a UUID derived from our Ed25519 public key.
+    /// `identifier` is usually a UUID; defaults to one derived from our Ed25519 public key.
     pub fn generate_m3_with_identifier(&mut self, identifier: Option<&str>) -> Result<Vec<u8>> {
         if self.state != PairVerifyState::M2Received {
             return Err(PairingError::StateMismatch {
@@ -936,23 +814,19 @@ impl PairVerify {
 
         eprintln!("  DEBUG: M3 signed_message: {} bytes (ecdh + id + ecdh)", signed_message.len());
 
-        // Sign with our Ed25519 identity key
         let signature = self.identity.sign(&signed_message);
 
-        // Build inner TLV: Identifier + PublicKey + Signature
-        // Server extracts PublicKey (Tag 0x03) to verify the Signature
+        // the server verifies the signature with the PublicKey (0x03).
         let mut inner_tlv = Tlv8::new();
         inner_tlv.set(TlvType::Identifier, id_bytes.clone());
-        inner_tlv.set(TlvType::PublicKey, pk.to_vec());  // Ed25519 public key - REQUIRED
+        inner_tlv.set(TlvType::PublicKey, pk.to_vec());  // required
         inner_tlv.set(TlvType::Signature, signature.to_vec());
 
         eprintln!("  DEBUG: M3 inner TLV: id={}B, pk=32B, sig=64B", id_bytes.len());
 
-        // Encrypt the inner TLV
         let nonce = nonce_from_string(PV_MSG03_NONCE);
         let encrypted = encrypt_with_nonce(&session_key, &nonce, &inner_tlv.encode())?;
 
-        // Build M3 TLV
         let mut tlv = Tlv8::new();
         tlv.set(TlvType::State, vec![0x03]);
         tlv.set(TlvType::EncryptedData, encrypted);
@@ -984,16 +858,13 @@ impl PairVerify {
         let server_public = self.server_public.ok_or(PairingError::SrpVerificationFailed)?;
         let session_key = self.session_key.ok_or(PairingError::SrpVerificationFailed)?;
 
-        // Build message to sign: client_ecdh || server_ecdh (64 bytes, NO identifier!)
-        // This is the transient mode format - differs from standard HomeKit!
+        // transient signs client_ecdh || server_ecdh, without the identifier.
         let mut signed_message = Vec::with_capacity(64);
         signed_message.extend_from_slice(&client_public);
         signed_message.extend_from_slice(&server_public);
 
-        // Sign with our Ed25519 identity key
         let signature = self.identity.sign(&signed_message);
 
-        // Encrypt the raw signature (64 bytes) with PV-Msg03 nonce
         let nonce = nonce_from_string(PV_MSG03_NONCE);
         let encrypted = encrypt_with_nonce(&session_key, &nonce, &signature)?;
         // encrypted = signature(64) + auth_tag(16) = 80 bytes
@@ -1030,14 +901,12 @@ impl PairVerify {
         eprintln!("  DEBUG: M4 state: {:?}", tlv.state());
         eprintln!("  DEBUG: M4 error: {:?}", tlv.error());
 
-        // Check for error
         if let Some(error_code) = tlv.error() {
             self.state = PairVerifyState::Failed;
             eprintln!("  DEBUG: M4 rejected with error code: {}", error_code);
             return Err(PairingError::Rejected.into());
         }
 
-        // Verify state
         if tlv.state() != Some(0x04) {
             self.state = PairVerifyState::Failed;
             return Err(PairingError::StateMismatch {
@@ -1047,7 +916,6 @@ impl PairVerify {
             .into());
         }
 
-        // Derive session keys from shared secret
         let shared_secret = self.shared_secret.ok_or_else(|| {
             self.state = PairVerifyState::Failed;
             PairingError::SrpVerificationFailed
@@ -1070,8 +938,6 @@ impl PairVerify {
     /// In transient mode, M4 can be:
     /// - Raw binary: 4 bytes of zeros (success) or error flags
     /// - TLV8: State = 0x04 (success) or Error field
-    ///
-    /// This method handles both formats gracefully.
     pub fn process_m4_transient(&mut self, response: &[u8]) -> Result<SessionKeys> {
         if self.state != PairVerifyState::M3Sent {
             return Err(PairingError::StateMismatch {
@@ -1081,7 +947,6 @@ impl PairVerify {
             .into());
         }
 
-        // Try TLV8 first
         if let Ok(tlv) = Tlv8::parse(response) {
             if let Some(error_code) = tlv.error() {
                 self.state = PairVerifyState::Failed;
@@ -1093,15 +958,13 @@ impl PairVerify {
             }
         }
 
-        // Check for raw success (4 bytes of zeros)
         if response.len() == 4 && response == [0x00, 0x00, 0x00, 0x00] {
             return self.derive_session_keys();
         }
 
-        // Short response (<=8 bytes) without error indicator - assume success
-        // Some devices send minimal responses
+        // some devices send a short response with no error indicator; treat it as success.
         if response.len() <= 8 {
-            // Check if it looks like an error (non-zero first byte often means error)
+            // a non-zero first byte usually means an error.
             if response.is_empty() || response[0] == 0x00 {
                 return self.derive_session_keys();
             }
@@ -1116,7 +979,6 @@ impl PairVerify {
         Err(PairingError::Rejected.into())
     }
 
-    /// Derive session keys from shared secret (internal helper).
     fn derive_session_keys(&mut self) -> Result<SessionKeys> {
         let shared_secret = self.shared_secret.ok_or_else(|| {
             self.state = PairVerifyState::Failed;
@@ -1135,7 +997,6 @@ impl PairVerify {
         Ok(keys)
     }
 
-    /// Get current state.
     pub fn state(&self) -> &'static str {
         match self.state {
             PairVerifyState::Initial => "initial",
@@ -1147,25 +1008,20 @@ impl PairVerify {
         }
     }
 
-    /// Get the raw state enum.
     pub fn raw_state(&self) -> PairVerifyState {
         self.state
     }
 
-    /// Check if verification completed successfully.
     pub fn is_complete(&self) -> bool {
         self.state == PairVerifyState::Complete
     }
 
-    /// Get the ECDH shared secret (available after M2 processing).
-    ///
-    /// This can be used to derive additional keys like the stream encryption key (shk).
+    /// available after M2; used to derive the stream key (shk).
     pub fn shared_secret(&self) -> Option<[u8; 32]> {
         self.shared_secret
     }
 }
 
-/// Mock server for testing pair-verify.
 #[cfg(test)]
 pub(crate) struct MockVerifyServer {
     identity: IdentityKeyPair,
@@ -1177,7 +1033,6 @@ pub(crate) struct MockVerifyServer {
 
 #[cfg(test)]
 impl MockVerifyServer {
-    /// Create a new mock server with a generated identity.
     pub(crate) fn new() -> Self {
         Self {
             identity: IdentityKeyPair::generate(),
@@ -1188,7 +1043,6 @@ impl MockVerifyServer {
         }
     }
 
-    /// Create a new mock server with a specific identity.
     pub(crate) fn with_identity(identity: IdentityKeyPair) -> Self {
         Self {
             identity,
@@ -1203,7 +1057,6 @@ impl MockVerifyServer {
     pub(crate) fn process_m1(&mut self, m1: &[u8]) -> Result<Vec<u8>> {
         let tlv = Tlv8::parse(m1)?;
 
-        // Extract client's ECDH public key
         let client_public = tlv
             .get(TlvType::PublicKey)
             .ok_or(PairingError::MissingTlv(TlvType::PublicKey as u8))?;
@@ -1220,15 +1073,12 @@ impl MockVerifyServer {
         client_public_arr.copy_from_slice(client_public);
         self.client_public = Some(client_public_arr);
 
-        // Generate server's ECDH key pair
         let ecdh = EcdhKeyPair::generate();
         let server_public = ecdh.public_key();
 
-        // Compute shared secret
         let shared_secret = ecdh.diffie_hellman(&client_public_arr)?;
         self.shared_secret = Some(shared_secret);
 
-        // Derive session key
         let session_key = hkdf::derive_pair_verify_key(&shared_secret)?;
         self.session_key = Some(session_key);
 
@@ -1239,19 +1089,15 @@ impl MockVerifyServer {
         signed_message.extend_from_slice(&server_ltpk);
         signed_message.extend_from_slice(&client_public_arr);
 
-        // Sign with server's identity key
         let signature = self.identity.sign(&signed_message);
 
-        // Build inner TLV: Identifier (server's public key) + Signature
         let mut inner_tlv = Tlv8::new();
         inner_tlv.set(TlvType::Identifier, server_ltpk.to_vec());
         inner_tlv.set(TlvType::Signature, signature.to_vec());
 
-        // Encrypt inner TLV
         let nonce = nonce_from_string(PV_MSG02_NONCE);
         let encrypted = encrypt_with_nonce(&session_key, &nonce, &inner_tlv.encode())?;
 
-        // Build M2 response
         let mut tlv = Tlv8::new();
         tlv.set(TlvType::State, vec![0x02]);
         tlv.set(TlvType::PublicKey, server_public.to_vec());
@@ -1266,7 +1112,6 @@ impl MockVerifyServer {
 
         let session_key = self.session_key.ok_or(PairingError::SrpVerificationFailed)?;
 
-        // Extract and decrypt encrypted data
         let encrypted = tlv
             .get(TlvType::EncryptedData)
             .ok_or(PairingError::MissingTlv(TlvType::EncryptedData as u8))?;
@@ -1274,7 +1119,6 @@ impl MockVerifyServer {
         let nonce = nonce_from_string(PV_MSG03_NONCE);
         let decrypted = decrypt_with_nonce(&session_key, &nonce, encrypted)?;
 
-        // Parse inner TLV
         let inner_tlv = Tlv8::parse(&decrypted)?;
 
         let client_identifier = inner_tlv
@@ -1285,10 +1129,8 @@ impl MockVerifyServer {
             .get(TlvType::Signature)
             .ok_or(PairingError::MissingTlv(TlvType::Signature as u8))?;
 
-        // Verify signature (in real server, would verify against known client key)
-        // For testing, we just accept any valid signature format
+        // accepts any signature; a real server would check it against a known client key.
 
-        // Return M4 (success)
         let mut response = Tlv8::new();
         response.set(TlvType::State, vec![0x04]);
 
@@ -1361,9 +1203,8 @@ mod tests {
 
             let _ = pv.generate_m1();
 
-            // Process invalid M2 (wrong state value)
             let mut bad_m2 = Tlv8::new();
-            bad_m2.set(TlvType::State, vec![0x99]); // Invalid state
+            bad_m2.set(TlvType::State, vec![0x99]);
             let result = pv.process_m2(&bad_m2.encode());
 
             assert!(result.is_err());
@@ -1570,7 +1411,7 @@ mod tests {
             let mut bad_m2 = Tlv8::new();
             bad_m2.set(TlvType::State, vec![0x02]);
             bad_m2.set(TlvType::PublicKey, vec![0x42u8; 32]);
-            bad_m2.set(TlvType::EncryptedData, vec![0xABu8; 64]); // Invalid encrypted data
+            bad_m2.set(TlvType::EncryptedData, vec![0xABu8; 64]);
 
             let result = client.process_m2(&bad_m2.encode());
             assert!(result.is_err());
@@ -1696,7 +1537,6 @@ mod tests {
             client.process_m2(&m2).unwrap();
             let _ = client.generate_m3().unwrap();
 
-            // Build error response
             let mut bad_m4 = Tlv8::new();
             bad_m4.set(TlvType::State, vec![0x04]);
             bad_m4.set(TlvType::Error, vec![0x02]); // Auth error
@@ -1725,7 +1565,6 @@ mod tests {
 
             let keys = client.process_m4(&m4).unwrap();
 
-            // Keys should be 32 bytes
             assert_eq!(keys.write_key.as_bytes().len(), 32);
             assert_eq!(keys.read_key.as_bytes().len(), 32);
         }
@@ -1761,33 +1600,26 @@ mod tests {
             let mut client = PairVerify::new(client_identity);
             let mut server = MockVerifyServer::with_identity(server_identity);
 
-            // M1
             let m1 = client.generate_m1().unwrap();
             assert_eq!(client.state(), "m1_sent");
 
-            // M2
             let m2 = server.process_m1(&m1).unwrap();
             client.process_m2(&m2).unwrap();
             assert_eq!(client.state(), "m2_received");
 
-            // M3
             let m3 = client.generate_m3().unwrap();
             assert_eq!(client.state(), "m3_sent");
 
-            // M4
             let m4 = server.process_m3(&m3).unwrap();
             let keys = client.process_m4(&m4).unwrap();
             assert_eq!(client.state(), "complete");
 
-            // Verify we got valid keys
             assert_eq!(keys.write_key.as_bytes().len(), 32);
         }
 
         #[test]
         fn verify_with_wrong_identity_fails() {
-            // In a real scenario, the server would verify the client's identity
-            // against a known list. Our mock server accepts any identity,
-            // so we just verify the protocol completes.
+            // the mock server accepts any identity, so this only checks the protocol completes.
         }
     }
 }

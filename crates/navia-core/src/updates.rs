@@ -11,7 +11,7 @@ use crate::{Error, Result};
 pub const LATEST_RELEASE_API: &str = "https://api.github.com/repos/davekai/navia/releases/latest";
 /// Opened when a release's own page link is missing or not https.
 pub const RELEASES_PAGE: &str = "https://github.com/davekai/navia/releases/latest";
-/// The automatic check runs at launch and then this often.
+/// The automatic check runs at launch and then this often while Navia runs.
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// Forces the automatic check in runs that otherwise skip it (`NAVIA_CHECK_UPDATES=1`).
 pub const FORCE_ENV: &str = "NAVIA_CHECK_UPDATES";

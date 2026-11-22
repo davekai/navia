@@ -8,25 +8,18 @@ use crate::timing::ClockOffset;
 #[async_trait]
 #[cfg_attr(test, mockall::automock)]
 pub trait TimingProtocol: Send + Sync {
-    /// Start the timing protocol.
     async fn start(&mut self) -> Result<()>;
 
-    /// Stop the timing protocol.
     async fn stop(&mut self) -> Result<()>;
 
-    /// Perform a timing sync and return the calculated offset.
     async fn sync(&mut self) -> Result<ClockOffset>;
 
-    /// Get current clock offset.
     fn offset(&self) -> ClockOffset;
 
-    /// Check if synchronized.
     fn is_synchronized(&self) -> bool;
 
-    /// Convert local timestamp to remote.
     fn local_to_remote(&self, local_ns: u64) -> u64;
 
-    /// Convert remote timestamp to local.
     fn remote_to_local(&self, remote_ns: u64) -> u64;
 }
 
@@ -79,7 +72,6 @@ mod tests {
             .times(1)
             .returning(|| Box::pin(async { Ok(()) }));
 
-        // Test the mock
         mock.start().await.unwrap();
 
         let offset = mock.sync().await.unwrap();

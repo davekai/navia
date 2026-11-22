@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::{FakeServer, FakeSong, State, song};
-use navia_core::autoplay::{Autoplay, fetch_answers_with};
+use navia_core::autoplay::{Autoplay, Externals, fetch_answers_with};
 use navia_core::deezer::{self, Deezer};
 use navia_core::engine::AutoplayMode;
 use navia_core::library::sync::{SyncOptions, Syncer};
@@ -51,6 +51,13 @@ async fn setup(opted_in: bool) -> Setup {
     Setup { server, deezer, library, _dir: dir }
 }
 
+/// ListenBrainz shares the switch; here it's unreachable, so only Deezer answers.
+static NO_LISTENBRAINZ: std::sync::LazyLock<navia_core::listenbrainz::ListenBrainz> = std::sync::LazyLock::new(|| navia_core::listenbrainz::ListenBrainz::new("http://127.0.0.1:9"));
+
+fn ext(deezer: &Deezer) -> Externals<'_> {
+    Externals { deezer, listenbrainz: &NO_LISTENBRAINZ }
+}
+
 fn fast(deezer: &MockServer) -> Deezer {
     Deezer::new(deezer.uri()).with_timing(Duration::from_millis(1), Duration::from_secs(5))
 }
@@ -64,7 +71,7 @@ async fn deezer_radio_songs_join_the_offer_when_the_gate_is_open() {
     a.set_chosen(["seed"].into_iter());
     let seeds = a.wanted_fetch().unwrap();
     a.begin_fetch(&seeds);
-    let answers = fetch_answers_with(&s.server.read_only_client(), &s.library, &dz, &seeds, AutoplayMode::Navia).await;
+    let answers = fetch_answers_with(&s.server.read_only_client(), &s.library, ext(&dz), &seeds, AutoplayMode::Navia).await;
     let found = answers.deezer.clone().expect("Deezer was asked");
     assert_eq!(found.radio[0].1.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["dz"]);
     assert_eq!(found.related.values().next().unwrap(), &vec!["ar-Other Act".to_string()]);
@@ -80,11 +87,11 @@ async fn deezer_is_never_asked_with_the_gate_closed_or_in_server_mode() {
     let s = setup(false).await;
     let dz = fast(&s.deezer);
     let client = s.server.read_only_client();
-    let answers = fetch_answers_with(&client, &s.library, &dz, &["seed".to_string()], AutoplayMode::Navia).await;
+    let answers = fetch_answers_with(&client, &s.library, ext(&dz), &["seed".to_string()], AutoplayMode::Navia).await;
     assert!(answers.deezer.is_none());
     assert_eq!(answers.similar[0].len(), 1);
     deezer::set_setting(&s.library, Some(true)).unwrap();
-    let server_mode = fetch_answers_with(&client, &s.library, &dz, &["seed".to_string()], AutoplayMode::Server).await;
+    let server_mode = fetch_answers_with(&client, &s.library, ext(&dz), &["seed".to_string()], AutoplayMode::Server).await;
     assert!(server_mode.deezer.is_none());
     assert!(s.deezer.received_requests().await.unwrap().is_empty());
 }

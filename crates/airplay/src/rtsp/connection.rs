@@ -37,7 +37,6 @@ impl RtspConnection {
         }
     }
 
-    /// Connect to the receiver.
     pub async fn connect(&mut self) -> Result<()> {
         let stream = TcpStream::connect(self.addr)
             .await
@@ -46,7 +45,6 @@ impl RtspConnection {
         Ok(())
     }
 
-    /// Get local socket address if connected.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.stream.as_ref().and_then(|s| s.local_addr().ok())
     }
@@ -56,12 +54,10 @@ impl RtspConnection {
         self.cipher = Some(cipher);
     }
 
-    /// Clear the encryption cipher.
     pub fn clear_cipher(&mut self) {
         self.cipher = None;
     }
 
-    /// Check if encryption is enabled.
     pub fn has_cipher(&self) -> bool {
         self.cipher.is_some()
     }
@@ -71,26 +67,21 @@ impl RtspConnection {
         self.session_headers.insert(key.into(), value.into());
     }
 
-    /// Clear session headers.
     pub fn clear_session_headers(&mut self) {
         self.session_headers.clear();
     }
 
-    /// Send request and receive response.
     pub async fn send(&mut self, mut request: RtspRequest) -> Result<RtspResponse> {
         if self.stream.is_none() {
             return Err(RtspError::ConnectionRefused.into());
         }
 
-        // Add session headers
         for (key, value) in &self.session_headers {
             request = request.header(key.clone(), value.clone());
         }
 
-        // Get next CSeq
         let cseq = self.next_cseq();
 
-        // Serialize request
         let request_data = request.serialize(cseq);
         tracing::debug!(
             "RTSP -> {} {} (cseq={}, encrypted={}, body_len={})",
@@ -105,14 +96,12 @@ impl RtspConnection {
         if request.method == crate::rtsp::request::RtspMethod::Setup
             || request.method == crate::rtsp::request::RtspMethod::Record {
             let request_str = String::from_utf8_lossy(&request_data);
-            // Find the header/body boundary
             if let Some(boundary) = request_str.find("\r\n\r\n") {
                 let headers = &request_str[..boundary];
                 tracing::debug!("{} request headers:\n{}", request.method.as_str(), headers);
             }
         }
 
-        // Encrypt if cipher is set
         let wire_data = if let Some(ref mut cipher) = self.cipher {
             let encrypted = cipher.encrypt(&request_data)?;
             tracing::debug!(
@@ -125,14 +114,12 @@ impl RtspConnection {
             request_data
         };
 
-        // Send request
         tracing::debug!(wire_len = wire_data.len(), "Sending wire data");
         let stream = self.stream.as_mut().unwrap();
         stream.write_all(&wire_data).await?;
         stream.flush().await?;
         tracing::debug!("Wire data sent and flushed");
 
-        // Read response
         let response_data = if self.cipher.is_some() {
             timeout(std::time::Duration::from_secs(10), self.read_encrypted_response())
                 .await
@@ -143,7 +130,6 @@ impl RtspConnection {
                 .map_err(|_| CoreError::Timeout)??
         };
 
-        // Parse response
         let response = RtspResponse::parse(&response_data)?;
         tracing::debug!(
             "RTSP <- {} {} (cseq={:?})",
@@ -170,7 +156,6 @@ impl RtspConnection {
         let mut reader = BufReader::new(stream);
         let mut response_data = Vec::new();
 
-        // Read headers until we see \r\n\r\n
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).await?;
@@ -181,7 +166,6 @@ impl RtspConnection {
             }
         }
 
-        // Parse Content-Length from headers
         let header_str = String::from_utf8_lossy(&response_data);
         let content_length = header_str
             .lines()
@@ -195,7 +179,6 @@ impl RtspConnection {
             })
             .unwrap_or(0);
 
-        // Read body if present
         if content_length > 0 {
             let mut body = vec![0u8; content_length];
             reader.read_exact(&mut body).await?;
@@ -256,7 +239,6 @@ impl RtspConnection {
         }
     }
 
-    /// Get next CSeq number.
     pub fn next_cseq(&mut self) -> u32 {
         self.cseq += 1;
         self.cseq
@@ -267,7 +249,6 @@ impl RtspConnection {
         self.cseq
     }
 
-    /// Close the connection.
     pub async fn close(&mut self) -> Result<()> {
         if let Some(stream) = self.stream.take() {
             drop(stream);
@@ -275,12 +256,10 @@ impl RtspConnection {
         Ok(())
     }
 
-    /// Check if connected.
     pub fn is_connected(&self) -> bool {
         self.stream.is_some()
     }
 
-    /// Get the remote address.
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }

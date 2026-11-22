@@ -3,6 +3,7 @@
 //! No album shows in two rows or in a row Home already shows.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,12 @@ pub const STALE_MIN_PLAYS: u32 = 3;
 const HOME_SHELF: u32 = 16;
 const DAY: i64 = 86_400;
 const META_MIXES: &str = "for_you_mixes";
+/// mixes made at once. each asks the server for similar songs for all its anchors at once (up to
+/// [`GENRE_SEEDS`]), and those answers can take seconds on the server's side, so this stays low on
+/// a shared server.
+pub const MIXES_AT_ONCE: usize = 3;
+/// how often [`keep_mixes_daily`] looks whether the local day turned.
+const DAY_CHECK: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MixKind {
@@ -71,7 +78,26 @@ pub struct MixRows {
 #[derive(Serialize, Deserialize)]
 struct StoredMixes {
     day: i64,
+    /// what the page shows: the mixes made so far, ranked.
     mixes: Vec<Mix>,
+    /// false while the day's mixes are still being made.
+    #[serde(default = "complete_before")]
+    complete: bool,
+    /// while not complete: each mix made so far with its score, so a build that was cut short
+    /// picks up where it stopped.
+    #[serde(default)]
+    built: Vec<Built>,
+}
+
+/// stored before this field existed, which was only ever a finished day.
+fn complete_before() -> bool {
+    true
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Built {
+    mix: Mix,
+    score: f64,
 }
 
 /// The page's rows: album rows for album rows, song rows for songs.
@@ -83,8 +109,10 @@ pub struct ForYou {
     pub forgotten: Vec<u32>,
     pub on_this_day: Vec<u32>,
     pub not_played_recently: Vec<u32>,
-    /// Today's mixes and similar artists haven't been asked for yet ([`refresh_for_you`]).
+    /// today's mixes and similar artists haven't all been asked for yet ([`refresh_for_you`]).
     pub needs_refresh: bool,
+    /// today's mixes are being made right now; more may land.
+    pub building: bool,
 }
 
 /// A string hash: `h * 31 + code unit`, then murmur3's finalizer so a new day reorders the whole
@@ -268,7 +296,7 @@ impl Library {
         let taste = self.taste()?;
         let mut out = ForYou { mixes: self.mixes(local_day)?, ..Default::default() };
         let top: Vec<&taste::Scored> = taste.artists.iter().take(TOP_ARTISTS).collect();
-        let stored_mixes = self.stored_mixes()?.is_some_and(|s| s.day == local_day);
+        let stored_mixes = self.stored_mixes()?.is_some_and(|s| s.day == local_day && s.complete);
         let mut similar_known = !top.is_empty();
         let mut used = self.home_album_rowids(local_day, &taste)?;
 
@@ -302,6 +330,7 @@ impl Library {
         out.not_played_recently = round_robin(&[stale], &mut used, ROW_LIMIT);
 
         out.needs_refresh = !top.is_empty() && (!stored_mixes || !similar_known);
+        out.building = self.for_you_building();
         Ok(out)
     }
 
@@ -337,9 +366,13 @@ impl Library {
         Ok(self.meta(META_MIXES)?.and_then(|v| serde_json::from_str(&v).ok()))
     }
 
-    /// Keeps the day's mixes. Nothing is derived from them, so the taste cache stays.
+    /// keeps the day's mixes, all made. nothing is derived from them, so the taste cache stays.
     pub fn store_mixes(&self, local_day: i64, mixes: &[Mix]) -> Result<()> {
-        let json = serde_json::to_string(&StoredMixes { day: local_day, mixes: mixes.to_vec() }).unwrap_or_default();
+        self.put_mixes(&StoredMixes { day: local_day, mixes: mixes.to_vec(), complete: true, built: Vec::new() })
+    }
+
+    fn put_mixes(&self, stored: &StoredMixes) -> Result<()> {
+        let json = serde_json::to_string(stored).unwrap_or_default();
         self.write_quiet(|tx| {
             tx.execute("INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![META_MIXES, json])?;
             Ok(())
@@ -457,7 +490,15 @@ impl Library {
 /// Asks the server, read-only, for what today's page still needs: the top artists' similar
 /// artists and today's mixes. A failed ask counts as nothing found, so it waits until tomorrow.
 pub async fn refresh_for_you(client: &Client, library: &Library, local_day: i64) -> Result<()> {
+    refresh_for_you_with(client, library, local_day, &|| {}).await
+}
+
+/// [`refresh_for_you`], calling `changed` each time something new is stored for the page (the
+/// similar artists, then each mix as it lands).
+pub async fn refresh_for_you_with(client: &Client, library: &Library, local_day: i64, changed: &(dyn Fn() + Send + Sync)) -> Result<()> {
+    let _gate = library.for_you_gate().await;
     let taste = library.taste()?;
+    let mut asked = false;
     for a in taste.artists.iter().take(TOP_ARTISTS) {
         if library.similar_for_day(&a.id, local_day)?.is_some() {
             continue;
@@ -470,6 +511,7 @@ pub async fn refresh_for_you(client: &Client, library: &Library, local_day: i64)
             }
         };
         library.store_similar(&a.id, local_day, &ids)?;
+        asked = true;
     }
     // Deezer's related artists for New to You, while the listener has Deezer on. They're cached
     // for a week, so most are already there.
@@ -478,73 +520,164 @@ pub async fn refresh_for_you(client: &Client, library: &Library, local_day: i64)
             crate::similar_artists::deezer_similar(library, crate::deezer::Deezer::shared(), &artist.name).await;
         }
     }
-    if library.stored_mixes()?.is_some_and(|s| s.day == local_day) {
+    if asked {
+        changed();
+    }
+    let stored = library.stored_mixes()?.filter(|s| s.day == local_day);
+    if stored.as_ref().is_some_and(|s| s.complete) {
         return Ok(());
     }
-    let mixes = make_mixes(client, library, &taste, local_day).await?;
-    library.store_mixes(local_day, &mixes)
+    let earlier: HashMap<String, Built> = stored.map(|s| s.built.into_iter().map(|b| (b.mix.id.clone(), b)).collect()).unwrap_or_default();
+    make_mixes(client, library, &taste, local_day, &earlier, changed).await
+}
+
+/// makes today's mixes in the background: now, then again whenever the local day turns. runs
+/// until dropped; `changed` is called as in [`refresh_for_you_with`].
+pub async fn keep_mixes_daily(client: Client, library: Library, changed: std::sync::Arc<dyn Fn() + Send + Sync>) {
+    let mut made: Option<i64> = None;
+    loop {
+        let day = taste::local_day(taste::now_unix());
+        if made != Some(day) {
+            match refresh_for_you_with(&client, &library, day, &*changed).await {
+                Ok(()) => made = Some(day),
+                Err(e) => tracing::warn!("For You: {e}"),
+            }
+        }
+        tokio::time::sleep(DAY_CHECK).await;
+    }
 }
 
 /// The engine's list around `anchors`: the server's similar songs and, with Deezer on, Deezer's
 /// sources.
 async fn engine_plan(client: &Client, library: &Library, anchors: &[Song]) -> Vec<Song> {
     let ids: Vec<String> = anchors.iter().map(|s| s.id.clone()).collect();
-    let answers = crate::autoplay::fetch_answers_with(client, library, crate::deezer::Deezer::shared(), &ids, crate::engine::AutoplayMode::Navia).await;
+    let answers = crate::autoplay::fetch_answers_with(client, library, crate::autoplay::Externals::shared(), &ids, crate::engine::AutoplayMode::Navia).await;
     crate::engine::list_from(Some(library), anchors, answers, PLAN_LEN)
 }
 
-async fn make_mixes(client: &Client, library: &Library, taste: &Taste, day: i64) -> Result<Vec<Mix>> {
-    let mut artists: Vec<(Mix, f64)> = Vec::new();
-    for a in taste.artists.iter().take(ARTIST_MIXES * 3) {
-        if artists.len() == ARTIST_MIXES {
-            break;
+/// a mix that could be made today, in the order they're tried.
+enum Candidate {
+    Artist { id: String, name: String, anchors: Vec<Song>, score: f64 },
+    Genre { name: String, seeds: Vec<Song>, score: f64 },
+}
+
+impl Candidate {
+    fn id(&self) -> String {
+        match self {
+            Candidate::Artist { id, .. } => format!("artist:{id}"),
+            Candidate::Genre { name, .. } => format!("genre:{name}"),
         }
+    }
+
+    fn kind(&self) -> MixKind {
+        match self {
+            Candidate::Artist { .. } => MixKind::Artist,
+            Candidate::Genre { .. } => MixKind::Genre,
+        }
+    }
+
+    async fn make(&self, client: &Client, library: &Library, day: i64) -> Option<Built> {
+        let (mix, score) = match self {
+            Candidate::Artist { id, name, anchors, score } => {
+                let plan = engine_plan(client, library, anchors).await;
+                (artist_mix(day, id, name, anchors, &plan)?, *score)
+            }
+            Candidate::Genre { name, seeds, score } => {
+                let (plan, fill) = tokio::join!(engine_plan(client, library, seeds), client.random_songs(GENRE_FILL, Some(name)));
+                (genre_mix(day, name, seeds, &plan, &fill.unwrap_or_default())?, *score)
+            }
+        };
+        library_only(library, mix).ok().flatten().map(|mix| Built { mix, score })
+    }
+}
+
+/// the mix with only songs the library has, so the stored list is what the page shows; `None`
+/// when that leaves it too short.
+fn library_only(library: &Library, mut mix: Mix) -> Result<Option<Mix>> {
+    let rows = library.song_rowids_in_order(&mix.songs)?;
+    let have: HashSet<String> = library.songs_by_rowid(&rows)?.into_iter().map(|(_, s)| s.id).collect();
+    mix.songs.retain(|id| have.contains(id));
+    Ok((mix.songs.len() >= MIX_MIN).then_some(mix))
+}
+
+fn candidates(library: &Library, taste: &Taste) -> Result<Vec<Candidate>> {
+    let mut out = Vec::new();
+    for a in taste.artists.iter().take(ARTIST_MIXES * 3) {
         let Some(artist) = library.artist(&a.id)? else { continue };
         let anchors = library.artist_anchors(taste, &a.id)?;
-        if anchors.is_empty() {
-            continue;
-        }
-        let plan = engine_plan(client, library, &anchors).await;
-        if let Some(mix) = artist_mix(day, &a.id, &artist.name, &anchors, &plan) {
-            artists.push((mix, a.score.max(a.fallback)));
+        if !anchors.is_empty() {
+            out.push(Candidate::Artist { id: a.id.clone(), name: artist.name, anchors, score: a.score.max(a.fallback) });
         }
     }
-    let mut genres: Vec<(Mix, f64)> = Vec::new();
-    let overview = library.genre_overview()?;
-    for g in overview.iter().filter(|g| g.played).take(GENRE_MIXES * 3) {
-        if genres.len() == GENRE_MIXES {
-            break;
-        }
+    for g in library.genre_overview()?.iter().filter(|g| g.played).take(GENRE_MIXES * 3) {
         let seeds = library.genre_seeds(taste, &g.name)?;
-        if seeds.is_empty() {
-            continue;
-        }
-        let plan = engine_plan(client, library, &seeds).await;
-        let fill = client.random_songs(GENRE_FILL, Some(&g.name)).await.unwrap_or_default();
-        if let Some(mix) = genre_mix(day, &g.name, &seeds, &plan, &fill) {
-            genres.push((mix, if g.taste > 0.0 { g.taste } else { g.taste_fallback }));
+        if !seeds.is_empty() {
+            out.push(Candidate::Genre { name: g.name.clone(), seeds, score: if g.taste > 0.0 { g.taste } else { g.taste_fallback } });
         }
     }
-    // Only songs the library has, so the stored list is what the page shows.
-    let keep = |mixes: Vec<(Mix, f64)>| -> Result<Vec<(Mix, f64)>> {
-        let mut out = Vec::new();
-        for (mut m, s) in mixes {
-            let rows = library.song_rowids_in_order(&m.songs)?;
-            let have: HashSet<String> = library.songs_by_rowid(&rows)?.into_iter().map(|(_, s)| s.id).collect();
-            m.songs.retain(|id| have.contains(id));
-            if m.songs.len() >= MIX_MIN {
-                out.push((m, s));
-            }
-        }
-        Ok(out)
-    };
-    let ranked = rank_mixes(keep(artists)?, keep(genres)?);
+    Ok(out)
+}
+
+/// the page's order for the mixes made so far: ranked, with fresh covers.
+fn ranked(library: &Library, artists: &[Built], genres: &[Built]) -> Result<Vec<Mix>> {
+    let pairs = |list: &[Built]| list.iter().map(|b| (b.mix.clone(), b.score)).collect::<Vec<_>>();
+    let ranked = rank_mixes(pairs(artists), pairs(genres));
     let album_of: HashMap<String, String> = {
         let ids: Vec<String> = ranked.iter().flat_map(|m| m.songs.clone()).collect();
         let rows = library.song_rowids(&ids)?;
         library.songs_by_rowid(&rows)?.into_iter().filter_map(|(_, s)| Some((s.id.clone(), s.album_id.clone()?))).collect()
     };
     Ok(fresh_covers(ranked, |id| album_of.get(id).cloned()))
+}
+
+fn wanted(kind: MixKind) -> usize {
+    if kind == MixKind::Artist { ARTIST_MIXES } else { GENRE_MIXES }
+}
+
+fn kept_of(kept: &[AtomicUsize; 2], kind: MixKind) -> &AtomicUsize {
+    &kept[usize::from(kind == MixKind::Genre)]
+}
+
+async fn try_candidate(c: &Candidate, kept: &[AtomicUsize; 2], earlier: &HashMap<String, Built>, client: &Client, library: &Library, day: i64) -> Option<Built> {
+    if kept_of(kept, c.kind()).load(Ordering::SeqCst) >= wanted(c.kind()) {
+        return None;
+    }
+    match earlier.get(&c.id()) {
+        Some(b) => Some(b.clone()),
+        None => c.make(client, library, day).await,
+    }
+}
+
+/// makes the day's mixes, [`MIXES_AT_ONCE`] at a time, keeping the first [`ARTIST_MIXES`] and
+/// [`GENRE_MIXES`] that work out in the candidates' order (the same ones as one at a time). each is
+/// stored as it lands; mixes in `earlier` (from a build cut short today) aren't asked again.
+async fn make_mixes(client: &Client, library: &Library, taste: &Taste, day: i64, earlier: &HashMap<String, Built>, changed: &(dyn Fn() + Send + Sync)) -> Result<()> {
+    use futures_util::StreamExt;
+
+    let list = candidates(library, taste)?;
+    // kept so far by kind. answers come back in the candidates' order, so a candidate whose kind is
+    // already full when it starts would never be kept, and isn't asked for.
+    let kept = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    let futures: Vec<_> = list.iter().map(|c| try_candidate(c, &kept, earlier, client, library, day)).collect();
+    let mut answers = futures_util::stream::iter(futures).buffered(MIXES_AT_ONCE);
+    let (mut artists, mut genres): (Vec<Built>, Vec<Built>) = (Vec::new(), Vec::new());
+    let mut next = list.iter();
+    while let Some(made) = answers.next().await {
+        let Some(kind) = next.next().map(Candidate::kind) else { break };
+        let Some(b) = made else { continue };
+        if kept_of(&kept, kind).load(Ordering::SeqCst) >= wanted(kind) {
+            continue;
+        }
+        kept_of(&kept, kind).fetch_add(1, Ordering::SeqCst);
+        if kind == MixKind::Artist { artists.push(b) } else { genres.push(b) }
+        let built: Vec<Built> = artists.iter().chain(&genres).cloned().collect();
+        library.put_mixes(&StoredMixes { day, mixes: ranked(library, &artists, &genres)?, complete: false, built })?;
+        changed();
+    }
+    drop(answers);
+    library.put_mixes(&StoredMixes { day, mixes: ranked(library, &artists, &genres)?, complete: true, built: Vec::new() })?;
+    changed();
+    Ok(())
 }
 
 #[cfg(test)]

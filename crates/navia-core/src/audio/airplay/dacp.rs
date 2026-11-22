@@ -1,7 +1,6 @@
 //! The receiver's remote control (DACP). The receiver finds us as `iTunes_Ctrl_<DACP-ID>` over mDNS
 //! and sends `GET /ctrl-int/1/<command>` with our `Active-Remote` token. Other tokens are refused.
 
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -9,8 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use mdns_sd::{ServiceDaemon, ServiceInfo};
-
+use super::discovery::{Announcement, Discovery};
 use crate::error::{Error, Result};
 
 /// A press on the receiver's remote.
@@ -55,13 +53,12 @@ impl RemoteIds {
 pub struct Dacp {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    fullname: String,
-    daemon: ServiceDaemon,
+    announcement: Option<Announcement>,
 }
 
 impl Dacp {
-    /// Listen on `port` (0 for any) and announce it on `daemon`.
-    pub fn start(daemon: ServiceDaemon, port: u16, ids: &RemoteIds, handler: RequestHandler) -> Result<Self> {
+    /// listen on `port` (0 for any) and announce it through `discovery`.
+    pub fn start(discovery: &Discovery, port: u16, ids: &RemoteIds, handler: RequestHandler) -> Result<Self> {
         let listener = match TcpListener::bind(("0.0.0.0", port)) {
             Ok(l) => l,
             Err(e) if port != 0 => {
@@ -72,11 +69,9 @@ impl Dacp {
         };
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
-        let props: HashMap<String, String> = [("txtvers", "1"), ("Ver", "131075"), ("DbId", ids.dacp_id.as_str()), ("OSsi", "0x1F5")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        let host = format!("navia-{}.local.", ids.dacp_id.to_lowercase());
-        let info = ServiceInfo::new("_dacp._tcp.local.", &format!("iTunes_Ctrl_{}", ids.dacp_id), &host, "", port, props).map_err(|e| Error::AirPlay(format!("mDNS: {e}")))?.enable_addr_auto();
-        let fullname = info.get_fullname().to_string();
-        daemon.register(info).map_err(|e| Error::AirPlay(format!("mDNS register: {e}")))?;
+        let txt = [("txtvers", "1"), ("Ver", "131075"), ("DbId", ids.dacp_id.as_str()), ("OSsi", "0x1F5")];
+        let host = format!("navia-{}", ids.dacp_id.to_lowercase());
+        let announcement = discovery.announce(&format!("iTunes_Ctrl_{}", ids.dacp_id), "_dacp._tcp", &host, port, &txt)?;
         let stop = Arc::new(AtomicBool::new(false));
         let (flag, token) = (stop.clone(), ids.active_remote.clone());
         let thread = thread::Builder::new()
@@ -91,13 +86,13 @@ impl Dacp {
                 }
             })
             .map_err(Error::Io)?;
-        Ok(Self { stop, thread: Some(thread), fullname, daemon })
+        Ok(Self { stop, thread: Some(thread), announcement: Some(announcement) })
     }
 }
 
 impl Drop for Dacp {
     fn drop(&mut self) {
-        let _ = self.daemon.unregister(&self.fullname);
+        self.announcement.take();
         self.stop.store(true, Ordering::Release);
         if let Some(t) = self.thread.take() {
             let _ = t.join();

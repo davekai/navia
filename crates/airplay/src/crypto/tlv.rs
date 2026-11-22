@@ -36,7 +36,6 @@ pub struct Tlv8 {
 }
 
 impl Tlv8 {
-    /// Create empty TLV8 message.
     pub fn new() -> Self {
         Self::default()
     }
@@ -51,7 +50,6 @@ impl Tlv8 {
         let mut last_type: Option<u8> = None;
 
         while i < data.len() {
-            // Need at least 2 bytes for type and length
             if i + 2 > data.len() {
                 return Err(ParseError::InvalidFormat(
                     "TLV8: truncated header".to_string(),
@@ -62,7 +60,6 @@ impl Tlv8 {
             let len = data[i + 1] as usize;
             i += 2;
 
-            // Check if we have enough bytes for the value
             if i + len > data.len() {
                 return Err(ParseError::InvalidFormat(format!(
                     "TLV8: truncated value (expected {} bytes, got {})",
@@ -80,7 +77,6 @@ impl Tlv8 {
                     existing.extend_from_slice(value);
                 }
             } else {
-                // New type or first occurrence
                 items
                     .entry(typ)
                     .or_insert_with(Vec::new)
@@ -107,11 +103,9 @@ impl Tlv8 {
             let value = &self.items[typ];
 
             if value.is_empty() {
-                // Zero-length value
                 result.push(*typ);
                 result.push(0);
             } else {
-                // Fragment if necessary
                 for chunk in value.chunks(255) {
                     result.push(*typ);
                     result.push(chunk.len() as u8);
@@ -123,27 +117,22 @@ impl Tlv8 {
         result
     }
 
-    /// Get value for type.
     pub fn get(&self, typ: TlvType) -> Option<&[u8]> {
         self.items.get(&(typ as u8)).map(|v| v.as_slice())
     }
 
-    /// Get value for raw type.
     pub fn get_raw(&self, typ: u8) -> Option<&[u8]> {
         self.items.get(&typ).map(|v| v.as_slice())
     }
 
-    /// Set value for type.
     pub fn set(&mut self, typ: TlvType, value: impl Into<Vec<u8>>) {
         self.items.insert(typ as u8, value.into());
     }
 
-    /// Set value for raw type.
     pub fn set_raw(&mut self, typ: u8, value: impl Into<Vec<u8>>) {
         self.items.insert(typ, value.into());
     }
 
-    /// Check if type is present.
     pub fn contains(&self, typ: TlvType) -> bool {
         self.items.contains_key(&(typ as u8))
     }
@@ -170,7 +159,6 @@ impl Tlv8 {
         })
     }
 
-    /// Get error description string.
     pub fn error_description(&self) -> Option<String> {
         let error_code = self.error()?;
         let error_name = match error_code {
@@ -226,7 +214,6 @@ impl Tlv8 {
 }
 
 impl TlvType {
-    /// Convert from raw byte.
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             0x00 => Some(Self::Method),

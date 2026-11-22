@@ -3,7 +3,6 @@
 use crate::base::error::{RtspError, Result};
 use serde::{Deserialize, Serialize};
 
-/// Encode value to binary plist.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     plist::to_writer_binary(std::io::Cursor::new(&mut buf), value)
@@ -11,7 +10,6 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Decode binary plist to value.
 pub fn decode<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T> {
     plist::from_bytes(data)
         .map_err(|e| RtspError::PlistError(e.to_string()).into())
@@ -26,7 +24,7 @@ pub struct InfoResponse {
     pub model: Option<String>,
     #[serde(rename = "sourceVersion")]
     pub source_version: Option<String>,
-    /// Ed25519 public key - stored as plist Data
+    /// Ed25519 public key, as plist data
     #[serde(default, deserialize_with = "deserialize_data_option")]
     pub pk: Option<Vec<u8>>,
     pub pi: Option<String>,
@@ -39,14 +37,12 @@ pub struct InfoResponse {
     pub audio_formats: Vec<AudioFormatInfo>,
 }
 
-/// Deserializer for optional plist Data to Vec<u8>
 fn deserialize_data_option<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<u8>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::{Deserialize, Error};
 
-    // Try to deserialize as plist::Value first
     let value: Option<plist::Value> = Option::deserialize(deserializer)?;
 
     match value {
@@ -79,16 +75,9 @@ pub struct TimingPeerInfo {
     pub supports_clock_port_matching_override: bool,
 }
 
-/// SETUP phase 1 request body (minimal, owntone-style).
-///
-/// Note: We use the minimal 4-field format that owntone uses:
-/// - deviceID
-/// - sessionUUID
-/// - timingPort (actual UDP port, not 0)
-/// - timingProtocol ("NTP" or "PTP")
-///
-/// The encryption keys (eiv, ekey, et) are NOT sent in phase 1;
-/// the stream key (shk) is sent in phase 2 with the streams array.
+/// SETUP phase 1 body in its minimal form: deviceID, sessionUUID, timingPort (the real UDP
+/// port, not 0) and timingProtocol ("NTP" or "PTP"). the keys (eiv, ekey, et) aren't sent in phase
+/// 1; the stream key (shk) goes in phase 2 with the streams array.
 #[derive(Debug, Clone, Serialize)]
 pub struct SetupPhase1Request {
     #[serde(rename = "deviceID")]
@@ -99,10 +88,10 @@ pub struct SetupPhase1Request {
     pub timing_port: u16,
     #[serde(rename = "timingProtocol")]
     pub timing_protocol: String,
-    /// Optional PTP peer info (only for PTP timing protocol).
+    /// only for the PTP timing protocol.
     #[serde(rename = "timingPeerInfo", skip_serializing_if = "Option::is_none")]
     pub timing_peer_info: Option<TimingPeerInfo>,
-    /// Optional PTP peer list (array form of timingPeerInfo, required by some receivers).
+    /// the array form of timingPeerInfo, which some receivers require.
     #[serde(rename = "timingPeerList", skip_serializing_if = "Option::is_none")]
     pub timing_peer_list: Option<Vec<TimingPeerInfo>>,
 }
@@ -165,7 +154,7 @@ pub struct StreamResponse {
     pub data_port: u16,
     #[serde(rename = "controlPort")]
     pub control_port: u16,
-    /// Stream ID - may be very large (use i64 to handle plist signed encoding)
+    /// can be very large: i64 for plist's signed encoding.
     #[serde(rename = "streamID", default)]
     pub stream_id: i64,
 }
@@ -181,7 +170,6 @@ mod tests {
     use super::*;
     use plist::Dictionary;
 
-    /// Helper to encode a plist directly (like old to_vec_binary)
     fn encode_raw<T: Serialize>(value: &T) -> std::result::Result<Vec<u8>, plist::Error> {
         let mut buf = Vec::new();
         plist::to_writer_binary(std::io::Cursor::new(&mut buf), value)?;
@@ -224,7 +212,6 @@ mod tests {
 
         #[test]
         fn decode_minimal_info() {
-            // Create a minimal plist with just a few fields
             let mut dict = Dictionary::new();
             dict.insert("model".to_string(), plist::Value::String("AppleTV5,3".to_string()));
 
@@ -267,7 +254,6 @@ mod tests {
 
         #[test]
         fn setup_phase1_serializes_minimal_fields() {
-            // Test the minimal owntone-style SETUP phase 1 request
             let request = SetupPhase1Request {
                 device_id: "AA:BB:CC:DD:EE:FF".to_string(),
                 session_uuid: "session-456".to_string(),
@@ -279,7 +265,6 @@ mod tests {
 
             let encoded = encode(&request).unwrap();
 
-            // Decode as dictionary to verify fields
             let dict: Dictionary = decode(&encoded).unwrap();
 
             assert_eq!(

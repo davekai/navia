@@ -5,7 +5,9 @@
 pub mod browse;
 pub mod for_you;
 pub mod collections;
+pub mod copyright;
 pub mod discography;
+pub mod essentials;
 mod downloads;
 mod extras;
 pub use extras::StarTable;
@@ -34,6 +36,17 @@ use crate::error::{Error, Result};
 
 use search::{album_fields, song_fields};
 use text::normalize;
+
+/// an album a change pass fetched again: its new list entry when the entry changed, and the songs
+/// `getAlbum` listed.
+pub(crate) struct RefetchedAlbum {
+    pub id: String,
+    pub row: Option<Album>,
+    pub song_ids: Vec<String>,
+}
+
+/// fewer missing rows than this never count as a mass shrink, whatever the library's size.
+const MASS_SHRINK_MIN: i64 = 50;
 
 /// Where the database file lives, injectable for tests.
 #[derive(Clone, Debug)]
@@ -101,6 +114,9 @@ struct Inner {
     reader: Mutex<Connection>,
     /// Only one sync may run at a time.
     sync_gate: tokio::sync::Mutex<()>,
+    /// only one build of For You's mixes, and one change check, at a time; a second caller waits.
+    for_you_gate: tokio::sync::Mutex<()>,
+    check_gate: tokio::sync::Mutex<()>,
     /// Moves on every write, so derived caches such as the taste scores know they're stale.
     version: AtomicU64,
     taste: Mutex<Option<Arc<taste::Taste>>>,
@@ -152,6 +168,8 @@ impl Library {
                 writer: Mutex::new(writer),
                 reader: Mutex::new(reader),
                 sync_gate: tokio::sync::Mutex::new(()),
+                for_you_gate: tokio::sync::Mutex::new(()),
+                check_gate: tokio::sync::Mutex::new(()),
                 version: AtomicU64::new(0),
                 taste: Mutex::new(None),
                 song_filters: Mutex::new(None),
@@ -361,32 +379,7 @@ impl Library {
     pub(crate) fn apply_artists(&self, library_id: &str, cursor: &sync::SyncCursor, next_offset: u32, artists: &[Artist]) -> Result<()> {
         self.write(|tx| {
             for a in artists.iter().filter(|a| !a.id.is_empty()) {
-                let data = serde_json::to_string(a).map_err(|e| Error::Sync(e.to_string()))?;
-                let hash = format!("{:x}", md5::compute(&data));
-                let sort = a.sort_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.name.to_lowercase());
-                let existing: Option<(i64, String)> = tx
-                    .prepare_cached("SELECT rowid, content_hash FROM artist WHERE id = ?1")?
-                    .query_row([&a.id], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .optional()?;
-                let rowid = match existing {
-                    Some((rowid, old_hash)) if old_hash == hash => rowid,
-                    Some((rowid, _)) => {
-                        tx.prepare_cached("UPDATE artist SET name=?2, sort_name=?3, album_count=?4, starred=?5, content_hash=?6, data=?7 WHERE rowid=?1")?
-                            .execute(params![rowid, a.name, sort, a.album_count.unwrap_or(0), a.starred, hash, data])?;
-                        tx.prepare_cached("DELETE FROM fts_artist WHERE rowid=?1")?.execute([rowid])?;
-                        tx.prepare_cached("INSERT INTO fts_artist(rowid, name) VALUES (?1, ?2)")?.execute(params![rowid, normalize(&a.name)])?;
-                        rowid
-                    }
-                    None => {
-                        tx.prepare_cached("INSERT INTO artist(id, name, sort_name, album_count, starred, content_hash, data) VALUES (?1,?2,?3,?4,?5,?6,?7)")?
-                            .execute(params![a.id, a.name, sort, a.album_count.unwrap_or(0), a.starred, hash, data])?;
-                        let rowid = tx.last_insert_rowid();
-                        tx.prepare_cached("INSERT INTO fts_artist(rowid, name) VALUES (?1, ?2)")?.execute(params![rowid, normalize(&a.name)])?;
-                        rowid
-                    }
-                };
-                tx.prepare_cached("INSERT INTO artist_library(artist_rowid, library_id, generation) VALUES (?1,?2,?3) ON CONFLICT(artist_rowid, library_id) DO UPDATE SET generation=excluded.generation")?
-                    .execute(params![rowid, library_id, cursor.generation])?;
+                upsert_artist(tx, library_id, cursor.generation, a)?;
             }
             write_progress(tx, library_id, sync::SyncPhase::Artists, next_offset)
         })
@@ -396,36 +389,7 @@ impl Library {
         crate::display::remember_versions(albums.iter().map(|a| (a.id.as_str(), a.version.as_deref())));
         self.write(|tx| {
             for a in albums.iter().filter(|a| !a.id.is_empty()) {
-                let data = serde_json::to_string(a).map_err(|e| Error::Sync(e.to_string()))?;
-                let hash = format!("{:x}", md5::compute(&data));
-                let sort = a.sort_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.name.to_lowercase());
-                let existing: Option<(i64, String)> = tx
-                    .prepare_cached("SELECT rowid, content_hash FROM album WHERE id = ?1")?
-                    .query_row([&a.id], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .optional()?;
-                let index_text = |a: &Album| {
-                    let [name, artist] = album_fields(a);
-                    (normalize(&name), normalize(&artist))
-                };
-                match existing {
-                    Some((rowid, old_hash)) if old_hash == hash => {
-                        tx.prepare_cached("UPDATE album SET generation=?2, library_id=?3 WHERE rowid=?1")?.execute(params![rowid, cursor.generation, library_id])?;
-                    }
-                    Some((rowid, _)) => {
-                        tx.prepare_cached("UPDATE album SET library_id=?2, name=?3, sort_name=?4, artist=?5, artist_id=?6, year=?7, created=?8, play_count=?9, played=?10, starred=?11, generation=?12, content_hash=?13, data=?14 WHERE rowid=?1")?
-                            .execute(params![rowid, library_id, a.name, sort, a.artist, a.artist_id, a.year, a.created, a.play_count.unwrap_or(0), a.played, a.starred, cursor.generation, hash, data])?;
-                        tx.prepare_cached("DELETE FROM fts_album WHERE rowid=?1")?.execute([rowid])?;
-                        let (n, ar) = index_text(a);
-                        tx.prepare_cached("INSERT INTO fts_album(rowid, name, artist) VALUES (?1,?2,?3)")?.execute(params![rowid, n, ar])?;
-                    }
-                    None => {
-                        tx.prepare_cached("INSERT INTO album(id, library_id, name, sort_name, artist, artist_id, year, created, play_count, played, starred, generation, content_hash, data) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)")?
-                            .execute(params![a.id, library_id, a.name, sort, a.artist, a.artist_id, a.year, a.created, a.play_count.unwrap_or(0), a.played, a.starred, cursor.generation, hash, data])?;
-                        let rowid = tx.last_insert_rowid();
-                        let (n, ar) = index_text(a);
-                        tx.prepare_cached("INSERT INTO fts_album(rowid, name, artist) VALUES (?1,?2,?3)")?.execute(params![rowid, n, ar])?;
-                    }
-                }
+                upsert_album(tx, library_id, cursor.generation, a)?;
             }
             write_progress(tx, library_id, sync::SyncPhase::Albums, next_offset)
         })
@@ -434,36 +398,7 @@ impl Library {
     pub(crate) fn apply_songs(&self, library_id: &str, cursor: &sync::SyncCursor, next_offset: u32, songs: &[Song]) -> Result<()> {
         self.write(|tx| {
             for s in songs.iter().filter(|s| !s.id.is_empty()) {
-                let data = serde_json::to_string(s).map_err(|e| Error::Sync(e.to_string()))?;
-                let hash = format!("{:x}", md5::compute(&data));
-                let sort = s.sort_name.clone().filter(|v| !v.is_empty()).unwrap_or_else(|| s.title.to_lowercase());
-                let existing: Option<(i64, String)> = tx
-                    .prepare_cached("SELECT rowid, content_hash FROM song WHERE id = ?1")?
-                    .query_row([&s.id], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .optional()?;
-                let index_text = |s: &Song| {
-                    let [title, artist, album, album_artist] = song_fields(s);
-                    (normalize(&title), normalize(&artist), normalize(&album), normalize(&album_artist))
-                };
-                match existing {
-                    Some((rowid, old_hash)) if old_hash == hash => {
-                        tx.prepare_cached("UPDATE song SET generation=?2, library_id=?3 WHERE rowid=?1")?.execute(params![rowid, cursor.generation, library_id])?;
-                    }
-                    Some((rowid, _)) => {
-                        tx.prepare_cached("UPDATE song SET library_id=?2, title=?3, sort_name=?4, album_id=?5, artist_id=?6, track=?7, disc=?8, year=?9, duration=?10, created=?11, play_count=?12, played=?13, starred=?14, generation=?15, content_hash=?16, data=?17 WHERE rowid=?1")?
-                            .execute(params![rowid, library_id, s.title, sort, s.album_id, s.artist_id, s.track, s.disc_number, s.year, s.duration, s.created, s.play_count.unwrap_or(0), s.played, s.starred, cursor.generation, hash, data])?;
-                        tx.prepare_cached("DELETE FROM fts_song WHERE rowid=?1")?.execute([rowid])?;
-                        let (t, ar, al, aa) = index_text(s);
-                        tx.prepare_cached("INSERT INTO fts_song(rowid, title, artist, album, album_artist) VALUES (?1,?2,?3,?4,?5)")?.execute(params![rowid, t, ar, al, aa])?;
-                    }
-                    None => {
-                        tx.prepare_cached("INSERT INTO song(id, library_id, title, sort_name, album_id, artist_id, track, disc, year, duration, created, play_count, played, starred, generation, content_hash, data) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
-                            .execute(params![s.id, library_id, s.title, sort, s.album_id, s.artist_id, s.track, s.disc_number, s.year, s.duration, s.created, s.play_count.unwrap_or(0), s.played, s.starred, cursor.generation, hash, data])?;
-                        let rowid = tx.last_insert_rowid();
-                        let (t, ar, al, aa) = index_text(s);
-                        tx.prepare_cached("INSERT INTO fts_song(rowid, title, artist, album, album_artist) VALUES (?1,?2,?3,?4,?5)")?.execute(params![rowid, t, ar, al, aa])?;
-                    }
-                }
+                upsert_song(tx, library_id, cursor.generation, s)?;
             }
             write_progress(tx, library_id, sync::SyncPhase::Songs, next_offset)
         })
@@ -485,9 +420,8 @@ impl Library {
             let generation = cursor.generation;
             let stale: i64 = tx.query_row("SELECT COUNT(*) FROM song WHERE library_id=?1 AND generation<?2", params![library_id, generation], |r| r.get(0))?;
             let seen: i64 = tx.query_row("SELECT COUNT(*) FROM song WHERE library_id=?1 AND generation=?2", params![library_id, generation], |r| r.get(0))?;
-            // A library that suddenly looks mostly gone is more likely a server problem, such as a
-            // detached music folder. Require a second sync to confirm before removing anything.
-            let shrinks = (seen == 0 && stale > 0) || (stale >= 50 && stale > seen);
+            // require a second sync to confirm, so one bad scan can't wipe the local copy.
+            let shrinks = looks_like_mass_shrink(stale, seen);
             let mut hold = hold_because;
             if hold.is_none() && shrinks && !cursor.pending_shrink {
                 hold = Some(format!("{stale} songs would be removed against {seen} found; waiting for a second sync to confirm"));
@@ -503,6 +437,111 @@ impl Library {
             )?;
             Ok(sync::LibraryFinish { removed, held: hold })
         })
+    }
+
+    /// the generation of this library's last finished sync, or `None` when none has finished or one
+    /// was interrupted and has to resume.
+    pub(crate) fn settled_generation(&self, library_id: &str) -> Result<Option<i64>> {
+        self.read(|c| Ok(read_cursor(c, library_id)?.filter(|cur| !cur.active).map(|cur| cur.generation)))
+    }
+
+    /// one page of a change pass's album list. albums whose catalog entry is unchanged are stored
+    /// (so their plays and stars stay current); the rest come back, each with whether it's new here.
+    pub(crate) fn apply_album_page(&self, library_id: &str, generation: i64, albums: &[Album]) -> Result<Vec<(Album, bool)>> {
+        crate::display::remember_versions(albums.iter().map(|a| (a.id.as_str(), a.version.as_deref())));
+        self.write(|tx| {
+            let mut changed = Vec::new();
+            for a in albums.iter().filter(|a| !a.id.is_empty()) {
+                let stored: Option<String> = tx.prepare_cached("SELECT data FROM album WHERE id = ?1")?.query_row([&a.id], |r| r.get(0)).optional()?;
+                let stored: Option<Album> = stored.and_then(|d| serde_json::from_str(&d).ok());
+                match stored {
+                    Some(old) if catalog_entry(&old) == catalog_entry(a) => upsert_album(tx, library_id, generation, a)?,
+                    Some(_) => changed.push((a.clone(), false)),
+                    None => changed.push((a.clone(), true)),
+                }
+            }
+            Ok(changed)
+        })
+    }
+
+    /// one page of a change pass's artist list.
+    pub(crate) fn apply_artist_page(&self, library_id: &str, generation: i64, artists: &[Artist]) -> Result<()> {
+        self.write(|tx| {
+            for a in artists.iter().filter(|a| !a.id.is_empty()) {
+                upsert_artist(tx, library_id, generation, a)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// stores the songs `getAlbum` gave for an album a change pass refetched, with `new_row` when the
+    /// album is new here. a changed album's row waits for [`Self::finish_changes`], so a pass cut
+    /// short finds it changed again and fetches it next time.
+    pub(crate) fn apply_album_songs(&self, library_id: &str, generation: i64, new_row: Option<&Album>, songs: &[Song]) -> Result<()> {
+        self.write(|tx| {
+            for s in songs.iter().filter(|s| !s.id.is_empty()) {
+                upsert_song(tx, library_id, generation, s)?;
+            }
+            if let Some(album) = new_row {
+                upsert_album(tx, library_id, generation, album)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// this library's stored albums missing from `seen`, the album list a change pass just read.
+    pub(crate) fn albums_not_in(&self, library_id: &str, seen: &std::collections::HashSet<String>) -> Result<Vec<String>> {
+        self.read(|c| {
+            let ids: Vec<String> = c.prepare("SELECT id FROM album WHERE library_id=?1")?.query_map([library_id], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+            Ok(ids.into_iter().filter(|id| !seen.contains(id)).collect())
+        })
+    }
+
+    /// ends a change pass for one library: stores the changed albums' rows, then, unless removal is
+    /// held, drops the songs those albums no longer list, the albums that left the list with their
+    /// songs, and the library's links to artists it no longer lists (`seen_artists`, when they were
+    /// read). songs that moved to another album were already re-pointed by that album's songs, so
+    /// they stay. a list that suddenly lost most of its albums holds removal, as a full sync does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_changes(&self, library_id: &str, generation: i64, changed: &[RefetchedAlbum], vanished: &[String], seen_albums: usize, seen_artists: Option<&std::collections::HashSet<String>>, hold_because: Option<String>) -> Result<sync::LibraryFinish> {
+        let finish = self.write(|tx| {
+            for album in changed.iter().filter_map(|c| c.row.as_ref()) {
+                upsert_album(tx, library_id, generation, album)?;
+            }
+            let mut hold = hold_because;
+            if hold.is_none() && looks_like_mass_shrink(vanished.len() as i64, seen_albums as i64) {
+                hold = Some(format!("{} albums would be removed against {seen_albums} listed; waiting for a full sync to confirm", vanished.len()));
+            }
+            let mut removed = LibraryCounts::default();
+            if hold.is_some() {
+                return Ok(sync::LibraryFinish { removed, held: hold });
+            }
+            for album in changed {
+                let keep: std::collections::HashSet<&str> = album.song_ids.iter().map(String::as_str).collect();
+                let rows: Vec<(i64, String)> = tx.prepare_cached("SELECT rowid, id FROM song WHERE library_id=?1 AND album_id=?2")?.query_map(params![library_id, album.id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+                let dropped: Vec<i64> = rows.into_iter().filter(|(_, id)| !keep.contains(id.as_str())).map(|(rowid, _)| rowid).collect();
+                removed.songs += delete_rowids(tx, "song", "fts_song", &dropped)?;
+            }
+            for id in vanished {
+                let songs: Vec<i64> = tx.prepare_cached("SELECT rowid FROM song WHERE library_id=?1 AND album_id=?2")?.query_map(params![library_id, id], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+                removed.songs += delete_rowids(tx, "song", "fts_song", &songs)?;
+                let album: Vec<i64> = tx.prepare_cached("SELECT rowid FROM album WHERE library_id=?1 AND id=?2")?.query_map(params![library_id, id], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+                removed.albums += delete_rowids(tx, "album", "fts_album", &album)?;
+            }
+            if let Some(seen) = seen_artists {
+                let links: Vec<(i64, String)> = tx.prepare("SELECT l.artist_rowid, a.id FROM artist_library l JOIN artist a ON a.rowid = l.artist_rowid WHERE l.library_id=?1")?.query_map([library_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+                let mut unlinked = 0;
+                for (rowid, _) in links.iter().filter(|(_, id)| !seen.contains(id)) {
+                    unlinked += tx.prepare_cached("DELETE FROM artist_library WHERE artist_rowid=?1 AND library_id=?2")?.execute(params![rowid, library_id])?;
+                }
+                if unlinked > 0 {
+                    removed.artists = remove_orphan_artists_count(tx)?;
+                }
+            }
+            Ok(sync::LibraryFinish { removed, held: None })
+        });
+        self.contents_changed();
+        finish
     }
 
     pub(crate) fn set_meta(&self, key: &str, value: Option<&str>) -> Result<()> {
@@ -527,11 +566,125 @@ impl Library {
         self.inner.sync_gate.lock().await
     }
 
+    pub(crate) async fn for_you_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.for_you_gate.lock().await
+    }
+
+    /// whether today's mixes are being made right now.
+    pub fn for_you_building(&self) -> bool {
+        self.inner.for_you_gate.try_lock().is_err()
+    }
+
+    pub(crate) async fn check_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.check_gate.lock().await
+    }
+
     /// Run a blocking database call off the async runtime.
     pub(crate) async fn blocking<T: Send + 'static>(&self, f: impl FnOnce(Library) -> Result<T> + Send + 'static) -> Result<T> {
         let lib = self.clone();
         tokio::task::spawn_blocking(move || f(lib)).await.map_err(|e| Error::DatabaseTask(e.to_string()))?
     }
+}
+
+/// insert or update one artist and link it to the library at this generation.
+fn upsert_artist(tx: &Transaction, library_id: &str, generation: i64, a: &Artist) -> Result<()> {
+    let data = serde_json::to_string(a).map_err(|e| Error::Sync(e.to_string()))?;
+    let hash = format!("{:x}", md5::compute(&data));
+    let sort = a.sort_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.name.to_lowercase());
+    let existing: Option<(i64, String)> = tx
+        .prepare_cached("SELECT rowid, content_hash FROM artist WHERE id = ?1")?
+        .query_row([&a.id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let rowid = match existing {
+        Some((rowid, old_hash)) if old_hash == hash => rowid,
+        Some((rowid, _)) => {
+            tx.prepare_cached("UPDATE artist SET name=?2, sort_name=?3, album_count=?4, starred=?5, content_hash=?6, data=?7 WHERE rowid=?1")?
+                .execute(params![rowid, a.name, sort, a.album_count.unwrap_or(0), a.starred, hash, data])?;
+            tx.prepare_cached("DELETE FROM fts_artist WHERE rowid=?1")?.execute([rowid])?;
+            tx.prepare_cached("INSERT INTO fts_artist(rowid, name) VALUES (?1, ?2)")?.execute(params![rowid, normalize(&a.name)])?;
+            rowid
+        }
+        None => {
+            tx.prepare_cached("INSERT INTO artist(id, name, sort_name, album_count, starred, content_hash, data) VALUES (?1,?2,?3,?4,?5,?6,?7)")?
+                .execute(params![a.id, a.name, sort, a.album_count.unwrap_or(0), a.starred, hash, data])?;
+            let rowid = tx.last_insert_rowid();
+            tx.prepare_cached("INSERT INTO fts_artist(rowid, name) VALUES (?1, ?2)")?.execute(params![rowid, normalize(&a.name)])?;
+            rowid
+        }
+    };
+    tx.prepare_cached("INSERT INTO artist_library(artist_rowid, library_id, generation) VALUES (?1,?2,?3) ON CONFLICT(artist_rowid, library_id) DO UPDATE SET generation=excluded.generation")?
+        .execute(params![rowid, library_id, generation])?;
+    Ok(())
+}
+
+/// insert or update one album, stamped with this generation.
+fn upsert_album(tx: &Transaction, library_id: &str, generation: i64, a: &Album) -> Result<()> {
+    let data = serde_json::to_string(a).map_err(|e| Error::Sync(e.to_string()))?;
+    let hash = format!("{:x}", md5::compute(&data));
+    let sort = a.sort_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.name.to_lowercase());
+    let existing: Option<(i64, String)> = tx
+        .prepare_cached("SELECT rowid, content_hash FROM album WHERE id = ?1")?
+        .query_row([&a.id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let index_text = |a: &Album| {
+        let [name, artist] = album_fields(a);
+        (normalize(&name), normalize(&artist))
+    };
+    match existing {
+        Some((rowid, old_hash)) if old_hash == hash => {
+            tx.prepare_cached("UPDATE album SET generation=?2, library_id=?3 WHERE rowid=?1")?.execute(params![rowid, generation, library_id])?;
+        }
+        Some((rowid, _)) => {
+            tx.prepare_cached("UPDATE album SET library_id=?2, name=?3, sort_name=?4, artist=?5, artist_id=?6, year=?7, created=?8, play_count=?9, played=?10, starred=?11, generation=?12, content_hash=?13, data=?14 WHERE rowid=?1")?
+                .execute(params![rowid, library_id, a.name, sort, a.artist, a.artist_id, a.year, a.created, a.play_count.unwrap_or(0), a.played, a.starred, generation, hash, data])?;
+            tx.prepare_cached("DELETE FROM fts_album WHERE rowid=?1")?.execute([rowid])?;
+            let (n, ar) = index_text(a);
+            tx.prepare_cached("INSERT INTO fts_album(rowid, name, artist) VALUES (?1,?2,?3)")?.execute(params![rowid, n, ar])?;
+        }
+        None => {
+            tx.prepare_cached("INSERT INTO album(id, library_id, name, sort_name, artist, artist_id, year, created, play_count, played, starred, generation, content_hash, data) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)")?
+                .execute(params![a.id, library_id, a.name, sort, a.artist, a.artist_id, a.year, a.created, a.play_count.unwrap_or(0), a.played, a.starred, generation, hash, data])?;
+            let rowid = tx.last_insert_rowid();
+            let (n, ar) = index_text(a);
+            tx.prepare_cached("INSERT INTO fts_album(rowid, name, artist) VALUES (?1,?2,?3)")?.execute(params![rowid, n, ar])?;
+        }
+    }
+    Ok(())
+}
+
+/// insert or update one song, stamped with this generation. an unchanged song keeps its rowid.
+fn upsert_song(tx: &Transaction, library_id: &str, generation: i64, s: &Song) -> Result<()> {
+    let data = serde_json::to_string(s).map_err(|e| Error::Sync(e.to_string()))?;
+    let hash = format!("{:x}", md5::compute(&data));
+    let sort = s.sort_name.clone().filter(|v| !v.is_empty()).unwrap_or_else(|| s.title.to_lowercase());
+    let existing: Option<(i64, String)> = tx
+        .prepare_cached("SELECT rowid, content_hash FROM song WHERE id = ?1")?
+        .query_row([&s.id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let index_text = |s: &Song| {
+        let [title, artist, album, album_artist] = song_fields(s);
+        (normalize(&title), normalize(&artist), normalize(&album), normalize(&album_artist))
+    };
+    match existing {
+        Some((rowid, old_hash)) if old_hash == hash => {
+            tx.prepare_cached("UPDATE song SET generation=?2, library_id=?3 WHERE rowid=?1")?.execute(params![rowid, generation, library_id])?;
+        }
+        Some((rowid, _)) => {
+            tx.prepare_cached("UPDATE song SET library_id=?2, title=?3, sort_name=?4, album_id=?5, artist_id=?6, track=?7, disc=?8, year=?9, duration=?10, created=?11, play_count=?12, played=?13, starred=?14, generation=?15, content_hash=?16, data=?17 WHERE rowid=?1")?
+                .execute(params![rowid, library_id, s.title, sort, s.album_id, s.artist_id, s.track, s.disc_number, s.year, s.duration, s.created, s.play_count.unwrap_or(0), s.played, s.starred, generation, hash, data])?;
+            tx.prepare_cached("DELETE FROM fts_song WHERE rowid=?1")?.execute([rowid])?;
+            let (t, ar, al, aa) = index_text(s);
+            tx.prepare_cached("INSERT INTO fts_song(rowid, title, artist, album, album_artist) VALUES (?1,?2,?3,?4,?5)")?.execute(params![rowid, t, ar, al, aa])?;
+        }
+        None => {
+            tx.prepare_cached("INSERT INTO song(id, library_id, title, sort_name, album_id, artist_id, track, disc, year, duration, created, play_count, played, starred, generation, content_hash, data) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
+                .execute(params![s.id, library_id, s.title, sort, s.album_id, s.artist_id, s.track, s.disc_number, s.year, s.duration, s.created, s.play_count.unwrap_or(0), s.played, s.starred, generation, hash, data])?;
+            let rowid = tx.last_insert_rowid();
+            let (t, ar, al, aa) = index_text(s);
+            tx.prepare_cached("INSERT INTO fts_song(rowid, title, artist, album, album_artist) VALUES (?1,?2,?3,?4,?5)")?.execute(params![rowid, t, ar, al, aa])?;
+        }
+    }
+    Ok(())
 }
 
 fn write_progress(tx: &Transaction, library_id: &str, phase: sync::SyncPhase, offset: u32) -> Result<()> {
@@ -579,13 +732,28 @@ fn prune_library(tx: &Transaction, library_id: &str, generation: i64) -> Result<
 fn delete_stale(tx: &Transaction, table: &str, fts: &str, library_id: &str, generation: i64) -> Result<u64> {
     let sql = format!("SELECT rowid FROM {table} WHERE library_id=?1 AND generation<?2");
     let ids: Vec<i64> = tx.prepare(&sql)?.query_map(params![library_id, generation], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    delete_rowids(tx, table, fts, &ids)
+}
+
+fn delete_rowids(tx: &Transaction, table: &str, fts: &str, rowids: &[i64]) -> Result<u64> {
     let delete_fts = format!("DELETE FROM {fts} WHERE rowid=?1");
     let delete_row = format!("DELETE FROM {table} WHERE rowid=?1");
-    for id in &ids {
+    for id in rowids {
         tx.prepare_cached(&delete_fts)?.execute([id])?;
         tx.prepare_cached(&delete_row)?.execute([id])?;
     }
-    Ok(ids.len() as u64)
+    Ok(rowids.len() as u64)
+}
+
+/// a library that suddenly looks mostly gone is more likely a server problem, for example a
+/// detached music folder, than a real mass deletion.
+fn looks_like_mass_shrink(stale: i64, seen: i64) -> bool {
+    (seen == 0 && stale > 0) || (stale >= MASS_SHRINK_MIN && stale > seen)
+}
+
+/// the catalog part of an album entry: what a scan changes, without this user's plays, stars and rating.
+fn catalog_entry(a: &Album) -> Album {
+    Album { starred: None, played: None, play_count: None, user_rating: None, ..a.clone() }
 }
 
 fn delete_library_data(tx: &Transaction, library_id: &str) -> Result<()> {

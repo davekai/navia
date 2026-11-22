@@ -2,9 +2,11 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::{FakeServer, State, song};
 use navia_core::library::recent::{HISTORY_DAYS, PlayHistoryRefresh, refresh_play_history_at};
-use navia_core::library::sync::{SyncOptions, Syncer};
+use navia_core::library::sync::{BackgroundRefresh, SyncOptions, Syncer};
 use navia_core::library::{Library, LibraryConfig};
 use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param};
@@ -135,7 +137,79 @@ async fn refetches_only_after_the_wait_and_when_plays_moved() {
     library.record_play("s2", (NOW * 1000) as u64).unwrap();
     assert_eq!(refresh_play_history_at(&client, &library, NOW + 2 * HOUR).await.unwrap(), PlayHistoryRefresh::Skipped, "still too soon");
     assert_eq!(refresh_play_history_at(&client, &library, NOW + 13 * HOUR).await.unwrap(), PlayHistoryRefresh::Stored(1));
+    assert_eq!(count(&server, "/auth/login").await, 1, "the token is kept");
+}
+
+#[tokio::test]
+async fn a_limited_login_is_asked_again_after_the_wait_not_hours_later() {
+    let server = FakeServer::start(state()).await;
+    let (_d, library) = synced(&server).await;
+    Mock::given(method("POST")).and(path("/auth/login")).respond_with(ResponseTemplate::new(429)).up_to_n_times(1).with_priority(1).mount(&server.server).await;
+    mount_history(&server, json!([row(1, "s1", NOW - 10)])).await;
+    let client = server.client();
+    client.set_native_backoff(Duration::from_millis(200), Duration::from_secs(1));
+
+    assert!(refresh_play_history_at(&client, &library, NOW).await.is_err());
+    assert!(matches!(refresh_play_history_at(&client, &library, NOW + 60).await, Err(navia_core::Error::Waiting { .. })));
+    assert_eq!(count(&server, "/auth/login").await, 1, "nothing sent during the wait");
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(refresh_play_history_at(&client, &library, NOW + 120).await.unwrap(), PlayHistoryRefresh::Stored(1));
+    assert_eq!(top(&library), ["s1"]);
     assert_eq!(count(&server, "/auth/login").await, 2);
+}
+
+#[tokio::test]
+async fn a_server_without_history_stays_on_the_slow_schedule() {
+    let server = FakeServer::start(state()).await;
+    let (_d, library) = synced(&server).await;
+    Mock::given(path("/api/scrobble")).respond_with(ResponseTemplate::new(404)).mount(&server.server).await;
+    let client = server.client();
+    assert_eq!(refresh_play_history_at(&client, &library, NOW).await.unwrap(), PlayHistoryRefresh::Unsupported);
+    library.record_play("s2", (NOW * 1000) as u64).unwrap();
+    assert_eq!(refresh_play_history_at(&client, &library, NOW + 60).await.unwrap(), PlayHistoryRefresh::Skipped);
+    assert_eq!(refresh_play_history_at(&client, &library, NOW + HOUR).await.unwrap(), PlayHistoryRefresh::Skipped);
+    assert_eq!(count(&server, "/api/scrobble").await, 1);
+    assert_eq!(client.native_retry_in(), None);
+}
+
+#[tokio::test]
+async fn a_failing_probe_is_not_taken_for_a_server_without_history() {
+    let server = FakeServer::start(state()).await;
+    let (_d, library) = synced(&server).await;
+    Mock::given(path("/api/scrobble")).respond_with(ResponseTemplate::new(503)).up_to_n_times(1).with_priority(1).mount(&server.server).await;
+    mount_history(&server, json!([row(1, "s1", NOW - 10)])).await;
+    let client = server.client();
+    client.set_native_backoff(Duration::from_millis(100), Duration::from_secs(1));
+    assert!(refresh_play_history_at(&client, &library, NOW).await.is_err());
+    assert!(client.native_retry_in().is_some());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(refresh_play_history_at(&client, &library, NOW + 60).await.unwrap(), PlayHistoryRefresh::Stored(1), "left for the retry, not the slow schedule");
+}
+
+#[tokio::test]
+async fn the_background_refresh_asks_for_history_again_once_the_wait_is_over() {
+    let server = FakeServer::start(state()).await;
+    let (_d, library) = synced(&server).await;
+    no_annotations(&server);
+    Mock::given(method("POST")).and(path("/auth/login")).respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1")).up_to_n_times(1).with_priority(1).mount(&server.server).await;
+    mount_history(&server, json!([row(1, "s1", 4_000_000_000)])).await;
+    let client = server.client();
+    client.set_native_backoff(Duration::from_millis(100), Duration::from_secs(1));
+    let interval = Duration::from_secs(4);
+    let syncer = Syncer::new(client, library.clone(), SyncOptions { play_history: true, ..Default::default() });
+    let started = std::time::Instant::now();
+    let refresh = BackgroundRefresh::spawn_with(syncer, interval, None);
+
+    while count(&server, "/auth/login").await < 2 {
+        assert!(started.elapsed() < interval * 2, "no retry before the next tick");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let retried = started.elapsed();
+    assert!(retried >= interval + Duration::from_secs(1), "Retry-After kept: {retried:?}");
+    assert!(retried < interval * 2, "{retried:?}");
+    assert_eq!(server.calls("getStarred2"), 1, "only the history was asked again");
+    refresh.stop().await;
 }
 
 #[tokio::test]

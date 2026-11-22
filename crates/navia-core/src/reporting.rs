@@ -78,8 +78,17 @@ pub trait ReportSink: Send + Sync {
     }
     /// Marks the playback reports that follow as shared or not.
     fn set_shared(&self, _on: bool) {}
-    /// Sets the extra listen-along marks for control and following.
-    fn set_listen_marks(&self, _control: bool, _following: bool) {}
+    /// the further listen-along marks: listeners may control this player; it follows someone; it
+    /// has a song queued for the listening session.
+    fn set_listen_marks(&self, _control: bool, _following: bool, _queued: bool) {}
+    /// the client name live states go out under, where the sink has one.
+    fn report_name(&self) -> Option<String> {
+        None
+    }
+    /// a live state under an earlier client name (`None`: the current one).
+    async fn playback_as(&self, _name: Option<&str>, song_id: &str, state: PlaybackState, position_ms: u64) -> Result<()> {
+        self.playback(song_id, state, position_ms).await
+    }
 }
 
 #[async_trait]
@@ -100,8 +109,19 @@ impl ReportSink for Client {
         self.set_sharing(on);
     }
 
-    fn set_listen_marks(&self, control: bool, following: bool) {
-        Client::set_listen_marks(self, control, following);
+    fn set_listen_marks(&self, control: bool, following: bool, queued: bool) {
+        Client::set_listen_marks(self, control, following, queued);
+    }
+
+    fn report_name(&self) -> Option<String> {
+        Some(self.report_client_name())
+    }
+
+    async fn playback_as(&self, name: Option<&str>, song_id: &str, state: PlaybackState, position_ms: u64) -> Result<()> {
+        match name {
+            Some(name) => self.report_playback_as(name, song_id, state, position_ms).await,
+            None => self.report_playback(song_id, state, position_ms).await,
+        }
     }
 }
 
@@ -173,8 +193,9 @@ pub enum LiveEvent {
     Ended,
 }
 
-/// Seeks show up as a position this far from where playing would have taken it.
-const SEEK_JUMP_MS: u64 = 3000;
+/// seeks show up as a position this far from where playing would have taken it. under half the
+/// listen-along resync drift, so a song started mid-way is reported where it really is.
+const SEEK_JUMP_MS: u64 = 1000;
 
 /// Turns player events into `reportPlayback` states, one per change and after a seek.
 /// The server moves its own clock between reports. A song restored paused isn't reported until it plays.
@@ -345,24 +366,36 @@ impl PlayReporter {
         self.relabel(|sink| sink.set_shared(on)).await;
     }
 
-    /// Changes the listen-along marks. Like [`Self::set_sharing`], the session moves to the new name.
-    pub async fn set_listen_marks(&self, control: bool, following: bool) {
-        self.relabel(|sink| sink.set_listen_marks(control, following)).await;
+    /// the listen-along marks changed ("Let listeners control playback", following someone, a song
+    /// queued for the session): like [`Self::set_sharing`], the session moves to the new name.
+    pub async fn set_listen_marks(&self, control: bool, following: bool, queued: bool) {
+        self.relabel(|sink| sink.set_listen_marks(control, following, queued)).await;
     }
 
+    /// where the sink names its reports, the session starts under the new name before the old one
+    /// stops, so whoever follows this player never sees it gone in between.
     async fn relabel(&self, change: impl FnOnce(&dyn ReportSink)) {
+        let old = self.sink.report_name();
         let live = self.live_enabled.load(AtomicOrdering::Acquire) && !self.is_private();
         let ended = if live { self.live.lock().expect("live reports").stop() } else { None };
-        let was_live = ended.is_some();
-        if let Some((id, state, position)) = ended {
-            let _ = self.sink.playback(&id, state, position).await;
+        // a sink without names can only stop the old session before it changes
+        if old.is_none()
+            && let Some((id, state, position)) = &ended
+        {
+            let _ = self.sink.playback(id, *state, *position).await;
         }
         change(&*self.sink);
-        if was_live {
-            let again = self.live.lock().expect("live reports").restart();
-            for (id, state, position) in again {
-                let _ = self.sink.playback(&id, state, position).await;
-            }
+        let Some((id, state, position)) = ended else { return };
+        let renamed = old.is_none() || old != self.sink.report_name();
+        let again = self.live.lock().expect("live reports").restart();
+        if !renamed {
+            return;
+        }
+        for (id, state, position) in again {
+            let _ = self.sink.playback(&id, state, position).await;
+        }
+        if old.is_some() {
+            let _ = self.sink.playback_as(old.as_deref(), &id, state, position).await;
         }
     }
 
@@ -550,6 +583,49 @@ mod tests {
         fn set_shared(&self, on: bool) {
             self.shared.store(on, AtomicOrdering::Release);
         }
+    }
+
+    /// like [`LiveFake`], with names: the stop of the old session goes out under its old name.
+    #[derive(Default)]
+    struct NamedFake(LiveFake);
+
+    #[async_trait]
+    impl ReportSink for NamedFake {
+        async fn now_playing(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn submit(&self, _: &str, _: u64) -> Result<()> {
+            Ok(())
+        }
+        async fn playback(&self, id: &str, state: PlaybackState, at: u64) -> Result<()> {
+            self.0.playback(id, state, at).await
+        }
+        fn set_shared(&self, on: bool) {
+            self.0.set_shared(on);
+        }
+        fn report_name(&self) -> Option<String> {
+            Some(self.0.shared.load(AtomicOrdering::Acquire).to_string())
+        }
+        async fn playback_as(&self, name: Option<&str>, _: &str, state: PlaybackState, _: u64) -> Result<()> {
+            let shared = name.map_or(self.0.shared.load(AtomicOrdering::Acquire), |n| n == "true");
+            self.0.sent.lock().unwrap().push((shared, state));
+            Ok(())
+        }
+    }
+
+    /// the new session starts before the old one stops, so a follower never sees the player gone.
+    #[tokio::test]
+    async fn a_renamed_session_starts_before_the_old_one_stops() {
+        let sink = Arc::new(NamedFake::default());
+        let r = PlayReporter::new(sink.clone());
+        r.set_live_reports(true);
+        r.live_event(LiveEvent::Track(Some("s".into()))).await;
+        r.live_event(LiveEvent::Status(PlayerStatus::Playing)).await;
+        r.set_sharing(true).await;
+        // the same name again: nothing to send
+        r.set_sharing(true).await;
+        use PlaybackState::*;
+        assert_eq!(*sink.0.sent.lock().unwrap(), vec![(false, Starting), (false, Playing), (true, Starting), (true, Playing), (false, Stopped)]);
     }
 
     #[tokio::test]

@@ -112,8 +112,38 @@ impl Library {
         Ok(out)
     }
 
-    /// What the Songs filters read about every song, cached until the library is written to.
-    /// Reads in chunks, so other readers wait at most one chunk.
+    /// songs carrying any of these recording MBIDs (`musicBrainzId` on the stored song), most played
+    /// first, each with the MBID it matched in lowercase. one pass over the songs, like
+    /// [`Library::songs_with_isrc`].
+    pub fn songs_with_mbid(&self, mbids: &[String]) -> Result<Vec<(u32, Song, String)>> {
+        let wanted: Vec<String> = mbids.iter().map(|m| m.trim().to_ascii_lowercase()).filter(|m| !m.is_empty()).collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let found = self.read(|c| {
+            let holders = vec!["?"; wanted.len()].join(",");
+            let sql = format!(
+                "SELECT rowid, data, lower(json_extract(data, '$.musicBrainzId')) AS m FROM song \
+                 WHERE m IN ({holders}) ORDER BY play_count DESC, rowid"
+            );
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map(params_from_iter(wanted.iter()), |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?;
+        let mut out = Vec::with_capacity(found.len());
+        for (rowid, data, mbid) in found {
+            let song: Song = serde_json::from_str(&data).map_err(|e| Error::Sync(e.to_string()))?;
+            out.push((rowid, song, mbid));
+        }
+        Ok(out)
+    }
+
+    /// What the Songs filters read about every song, read once and kept until the library is written to again. Reads
+    /// in chunks, so other readers wait at most one chunk.
     pub fn song_filters(&self) -> Result<std::sync::Arc<crate::song_filters::FilterIndex>> {
         let version = self.version();
         if let Some((v, index)) = self.inner.song_filters.lock().expect("song filters cache").as_ref()

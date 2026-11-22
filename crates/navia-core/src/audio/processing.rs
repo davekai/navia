@@ -172,7 +172,7 @@ impl EqTarget {
 
 /// One biquad's coefficients, normalized so a0 is 1.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Coefs {
+pub(crate) struct Coefs {
     b0: f64,
     b1: f64,
     b2: f64,
@@ -181,13 +181,21 @@ struct Coefs {
 }
 
 impl Coefs {
-    fn identity() -> Self {
+    pub(crate) fn identity() -> Self {
         Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 }
+    }
+
+    /// one sample through transposed direct form II with state `z`.
+    pub(crate) fn run(&self, z: &mut [f64; 2], x: f64) -> f64 {
+        let y = self.b0 * x + z[0];
+        z[0] = self.b1 * x - self.a1 * y + z[1];
+        z[1] = self.b2 * x - self.a2 * y;
+        y
     }
 }
 
-/// The RBJ cookbook biquads, matching `filter_db` in the app's curve.
-fn design(shape: FilterShape, freq_hz: f64, gain_db: f64, q: f64, rate: f64) -> Coefs {
+/// The cookbook biquads, the same formulas as `filter_db` in the app's curve.
+pub(crate) fn design(shape: FilterShape, freq_hz: f64, gain_db: f64, q: f64, rate: f64) -> Coefs {
     // Above Nyquist a filter can't act on anything in the signal.
     if gain_db == 0.0 || freq_hz >= rate * 0.49 {
         return if gain_db == 0.0 { unity_at(freq_hz, q, rate) } else { Coefs::identity() };
