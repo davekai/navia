@@ -6,7 +6,7 @@
 Name:           navia
 Version:        0.1.2
 Release:        1%{?dist}
-Summary:        Music player for Navidrome
+Summary:        Music client for Navidrome
 License:        GPL-3.0-or-later
 URL:            https://github.com/davekai/navia
 Source0:        %{url}/archive/refs/tags/v%{version}/%{name}-%{version}.tar.gz
@@ -43,7 +43,7 @@ Recommends:     mesa-vulkan-drivers
 Requires:       hicolor-icon-theme
 
 %description
-A native music player for Navidrome. Navia keeps a copy of your library on
+A native music client for Navidrome. Navia keeps a copy of your library on
 your computer, so browsing and search stay fast. It plays gapless, can
 crossfade, and shows synced lyrics. Songs, albums and playlists can be
 downloaded for listening offline. Navia runs on Wayland only.

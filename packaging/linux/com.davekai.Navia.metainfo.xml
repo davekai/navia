@@ -6,13 +6,13 @@
   <project_license>GPL-3.0-or-later</project_license>
 
   <name>Navia</name>
-  <summary>Music player for Navidrome</summary>
+  <summary>Music client for Navidrome</summary>
   <developer id="com.davekai">
     <name>davekai</name>
   </developer>
 
   <description>
-    <p>A native music player for Navidrome.</p>
+    <p>A native music client for Navidrome.</p>
     <p>
       Navia keeps a copy of your library on your computer, so browsing and search stay fast.
       It plays gapless, can crossfade, and shows synced lyrics.

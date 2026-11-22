@@ -4,7 +4,7 @@
 
 <h3 align="center">Navia</h3>
 
-<p align="center">A native music player for <a href="https://www.navidrome.org/">Navidrome</a>.</p>
+<p align="center">A native music client for <a href="https://www.navidrome.org/">Navidrome</a>.</p>
 <p align="center">Linux, macOS and Windows.</p>
 
 <p align="center">

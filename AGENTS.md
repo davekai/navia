@@ -7,6 +7,7 @@
   - the Swift bindings: `apps/navia-apple/scripts/build-core.sh`
 - Change GPUI only through a patch in `vendor/gpui/patches/`. `vendor/gpui/zed` and `wgpu` are downloaded.
 - No useless comments. Comment only what the code can't say on its own (why, a unit, a platform quirk), in one short plain line. Never restate the code or narrate its history.
+- Code, comments, tests and commit messages never mention other music apps or clients, streaming services, or a chat with an assistant. Describe the behaviour itself. Services Navia actually talks to (the server, Deezer, Discord, AirPlay) are named where the code calls them.
 - Commit messages use Conventional Commits with a scope: see CONTRIBUTING.md, "Pull requests".
 
 ## Commands
@@ -46,7 +47,7 @@ Navia is a Navidrome client first, then OpenSubsonic, then plain Subsonic.
 - Detect what the server supports and work without it. Never assume a setting, plugin or library size.
 - Tests and tools never write to a server: playlists, favorites, ratings, scrobbles or the play queue. Run the app
   with `NAVIA_READ_ONLY=1` against a server other people use.
-- Scrobbling, Discord and Deezer stay off until the user turns them on.
+- Discord and Deezer stay off until the user turns them on. Scrobbling is on by default for a new account and follows Private mode.
 
 ## Audio
 
