@@ -4,7 +4,7 @@
 %global debug_package %{nil}
 
 Name:           navia
-Version:        0.1.2
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Music client for Navidrome
 License:        GPL-3.0-or-later
@@ -90,6 +90,9 @@ test "$(%{buildroot}%{_bindir}/%{name} --version)" = "%{name} %{version}"
 %{_datadir}/icons/hicolor/*/apps/%{app_id}.*
 
 %changelog
+* Sun Nov 22 2026 davekai - 0.2.0-1
+- Navia 0.2.0
+
 * Sun Nov 15 2026 davekai - 0.1.2-1
 - Navia 0.1.2
 

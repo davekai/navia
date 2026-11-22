@@ -2251,14 +2251,14 @@ dependencies = [
 
 [[package]]
 name = "navia-aubio"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "navia-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "audioadapter-buffers",
@@ -2302,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "navia-ffi"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "directories",
  "navia-core",
@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "navia-integrations"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "log",
  "reqwest",
